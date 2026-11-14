@@ -9,6 +9,7 @@ const SEED = [
 const KINDS = ['material', 'labour', 'equipment', 'sub', 'fixed'];
 const isPlain = o => o && typeof o === 'object' && !Array.isArray(o);
 const nonEmpty = v => typeof v === 'string' && v.trim() !== '';
+const MAX = 1e9;
 const text = v => v == null ? null : String(v).trim() || null;
 
 module.exports = ctx => {
@@ -30,15 +31,15 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
   const tx = fn => { db.exec('BEGIN'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 
   // ---- validation ----------------------------------------------------------------
-  const nonNeg = (v, what) => { if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) bad(`${what} must be a number ≥ 0`); return v; };
-  const posNum = (v, what) => { if (typeof v !== 'number' || !Number.isFinite(v) || !(v > 0)) bad(`${what} must be a number > 0`); return v; };
+  const nonNeg = (v, what, max = Infinity) => { if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > max) bad(`${what} must be a number ≥ 0` + (max < Infinity ? ' and ≤ ' + max : '')); return v; };
+  const posNum = (v, what) => { if (typeof v !== 'number' || !Number.isFinite(v) || !(v > 0) || v > MAX) bad(`${what} must be a number > 0`); return v; };
   function cleanPart(p, i) {
     if (!isPlain(p)) bad(`parts[${i}] must be an object`);
     const w = `parts[${i}]`;
     if (!KINDS.includes(p.kind)) bad(`${w}.kind must be one of ${KINDS.join(', ')}`);
     if (p.kind === 'material') {
       if (!Number.isInteger(p.material_id) || !db.prepare('SELECT 1 FROM materials WHERE id=?').get(p.material_id)) bad(`${w}.material_id: material not found`);
-      return { kind: 'material', material_id: p.material_id, qty: nonNeg(p.qty, w + '.qty'), waste_pct: nonNeg(p.waste_pct === undefined ? 0 : p.waste_pct, w + '.waste_pct') };
+      return { kind: 'material', material_id: p.material_id, qty: nonNeg(p.qty, w + '.qty', MAX), waste_pct: nonNeg(p.waste_pct === undefined ? 0 : p.waste_pct, w + '.waste_pct') };
     }
     if (p.kind === 'labour') {
       if (!Array.isArray(p.crew) || !p.crew.length) bad(`${w}.crew must be a non-empty list`);
@@ -53,20 +54,23 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
       if (!nonEmpty(p.equipment_id)) bad(`${w}.equipment_id is required`);
       return { kind: 'equipment', equipment_id: p.equipment_id, output_per_hour: posNum(p.output_per_hour, w + '.output_per_hour') };
     }
-    if (p.kind === 'sub') return { kind: 'sub', rate: nonNeg(p.rate, w + '.rate') };
-    return { kind: 'fixed', amount: nonNeg(p.amount, w + '.amount') };
+    if (p.kind === 'sub') return { kind: 'sub', rate: nonNeg(p.rate, w + '.rate', MAX) };
+    return { kind: 'fixed', amount: nonNeg(p.amount, w + '.amount', MAX) };
   }
   // version data from a body, falling back to `prev` (the current version's data) for omitted fields
-  function cleanData(b, prev) {
+  function cleanData(b, prev, head) {
     const d = {};
-    const rw = 'rework_pct' in b ? b.rework_pct : prev && prev.rework_pct;
-    if (rw !== undefined && rw !== null) d.rework_pct = nonNeg(rw, 'rework_pct');
+    // rework is frozen into the version: absent on PUT keeps the previous value; absent/null on POST (or null on PUT) takes the section default of this moment
+    let rw = 'rework_pct' in b ? b.rework_pct : prev && prev.rework_pct;
+    if (rw === undefined || rw === null) { const sec = sectionRow(head.section_id); rw = sec ? sec.default_rework_pct : 0; }
+    d.rework_pct = nonNeg(rw, 'rework_pct');
     const cf = 'condition_factor' in b ? b.condition_factor : prev && prev.condition_factor;
     d.condition_factor = cf === undefined || cf === null ? 1 : cf;
     if (typeof d.condition_factor !== 'number' || !Number.isFinite(d.condition_factor) || d.condition_factor < 1) bad('condition_factor must be a number ≥ 1');
     const parts = 'parts' in b ? b.parts : prev && prev.parts;
     if (!Array.isArray(parts) || !parts.length) bad('parts must be a non-empty list');
     d.parts = parts.map(cleanPart);
+    d.head = { code: head.code, uom: head.unit, name_ar: head.name_ar, name_en: head.name_en, section_id: head.section_id };
     return d;
   }
 
@@ -78,7 +82,7 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
       const vr = db.prepare('SELECT data FROM item_versions WHERE item_id=? AND version=?').get(it.id, it.current_version), data = JSON.parse(vr.data);
       const out = { id: it.id, code: it.code, section_id: it.section_id, uom: it.unit, name_ar: it.name_ar, name_en: it.name_en, version: it.current_version };
       if (!snap) return { ...out, unit: null, missing: ['snapshot'], parts: data.parts.map(p => ({ kind: p.kind, cost: null })) };
-      const sec = sectionRow(it.section_id), r = unitCost({ ...data, rework_pct: data.rework_pct !== undefined ? data.rework_pct : sec ? sec.default_rework_pct : 0 }, snap.data, cfg);
+      const r = unitCost(data, snap.data, cfg);
       const parts = r.parts.map((p, i) => {
         const src = data.parts[i];
         if (role !== 'admin' && src.kind === 'labour' && new Set(src.crew.map(c => c.trade)).size === 1) {
@@ -139,7 +143,7 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
     if (idStr === undefined && method === 'GET') return reply(res, 200, priceItems(db.prepare('SELECT * FROM items ORDER BY code').all(), me.role));
     if (idStr === undefined && method === 'POST') {
       need(me, 'admin', 'qs');
-      const b = await readBody(req), head = itemHead(b, null), data = cleanData(b, null);
+      const b = await readBody(req), head = itemHead(b, null), data = cleanData(b, null, head);
       const id = tx(() => {
         const iid = Number(db.prepare('INSERT INTO items(code,section_id,unit,name_ar,name_en,current_version) VALUES(?,?,?,?,?,1)').run(head.code, head.section_id, head.unit, head.name_ar, head.name_en).lastInsertRowid);
         db.prepare('INSERT INTO item_versions(item_id,version,created,created_by,data) VALUES(?,1,?,?,?)').run(iid, new Date().toISOString(), me.username, JSON.stringify(data));
@@ -154,7 +158,7 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
       need(me, 'admin', 'qs');
       const b = await readBody(req), head = itemHead(b, item);
       const prev = JSON.parse(db.prepare('SELECT data FROM item_versions WHERE item_id=? AND version=?').get(item.id, item.current_version).data);
-      const data = cleanData(b, prev), version = item.current_version + 1;
+      const data = cleanData(b, prev, head), version = item.current_version + 1;
       tx(() => {
         db.prepare('UPDATE items SET code=?, section_id=?, unit=?, name_ar=?, name_en=?, current_version=? WHERE id=?').run(head.code, head.section_id, head.unit, head.name_ar, head.name_en, version, item.id);
         db.prepare('INSERT INTO item_versions(item_id,version,created,created_by,data) VALUES(?,?,?,?,?)').run(item.id, version, new Date().toISOString(), me.username, JSON.stringify(data));
@@ -169,10 +173,12 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
 
   function itemHead(b, prev) {
     const n = prev ? { code: prev.code, section_id: prev.section_id, unit: prev.unit, name_ar: prev.name_ar, name_en: prev.name_en } : { code: null, section_id: null, unit: null, name_ar: null, name_en: null };
-    for (const f of ['code', 'unit', 'name_ar', 'name_en']) if (f in b) n[f] = text(b[f]);
+    if ('unit' in b) bad('use uom for the unit of measure');
+    if ('uom' in b) n.unit = text(b.uom);
+    for (const f of ['code', 'name_ar', 'name_en']) if (f in b) n[f] = text(b[f]);
     if ('section_id' in b) n.section_id = b.section_id;
     if (!n.code) bad('code is required');
-    if (!n.unit) bad('unit is required');
+    if (!n.unit) bad('uom is required');
     if (!n.name_ar && !n.name_en) bad('a name is required');
     if (!Number.isInteger(n.section_id) || !sectionRow(n.section_id)) bad('section not found');
     const dup = db.prepare('SELECT id FROM items WHERE code=?').get(n.code);

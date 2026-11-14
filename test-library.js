@@ -45,13 +45,13 @@ server.listen(0, async () => {
       equipment: [{ id: 'asset:3', name: 'Test Excavator', rate: 120, source: 'asset', overridden: false }], warnings: [],
     };
 
-    const good = { code: 'T-001', section_id: asphalt, unit: 'm2', name_en: 'Test item', name_ar: 'بند', rework_pct: 2, condition_factor: 1.25,
+    const good = { code: 'T-001', section_id: asphalt, uom: 'm2', name_en: 'Test item', name_ar: 'بند', rework_pct: 2, condition_factor: 1.25,
       parts: [{ kind: 'material', material_id: mat, qty: 1, waste_pct: 5 }, { kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }, { trade: 'Labourer', count: 4 }], output_per_day: 20 }, { kind: 'equipment', equipment_id: 'asset:3', output_per_hour: 10 }, { kind: 'fixed', amount: 5 }] };
 
     // access + validation
     assert.strictEqual((await call('POST', 'library/items', good, viewer)).s, 403);
     const badBodies = [
-      { ...good, code: '' }, { ...good, section_id: 9999 }, { ...good, unit: '' }, { ...good, name_en: '', name_ar: '' },
+      { ...good, code: '' }, { ...good, section_id: 9999 }, { ...good, uom: '' }, { ...good, unit: 'm2' }, { ...good, name_en: '', name_ar: '' },
       { ...good, parts: [] }, { ...good, parts: 'x' }, { ...good, rework_pct: -1 }, { ...good, condition_factor: 0.9 }, { ...good, condition_factor: 'abc' },
       { ...good, parts: [{ kind: 'magic' }] },
       { ...good, parts: [{ kind: 'material', material_id: 9999, qty: 1, waste_pct: 0 }] },
@@ -63,6 +63,9 @@ server.listen(0, async () => {
       { ...good, parts: [{ kind: 'labour', crew: [{ trade: 'Foreman', count: 0 }], output_per_day: 5 }] },
       { ...good, parts: [{ kind: 'equipment', equipment_id: 'asset:3', output_per_hour: 0 }] },
       { ...good, parts: [{ kind: 'equipment', equipment_id: 5, output_per_hour: 1 }] },
+      { ...good, parts: [{ kind: 'material', material_id: mat, qty: 1e10, waste_pct: 0 }] },
+      { ...good, parts: [{ kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }], output_per_day: 1e10 }] },
+      { ...good, parts: [{ kind: 'sub', rate: 1e10 }] }, { ...good, parts: [{ kind: 'fixed', amount: 1e10 }] },
       { ...good, parts: [{ kind: 'sub', rate: -1 }] }, { ...good, parts: [{ kind: 'fixed', amount: 'x' }] },
     ];
     for (const [i, b] of badBodies.entries()) assert.strictEqual((await call('POST', 'library/items', b, qs)).s, 400, 'bad body #' + i);
@@ -74,7 +77,7 @@ server.listen(0, async () => {
     assert.strictEqual((await call('POST', 'library/items', { ...good, name_en: 'dup' }, qs)).s, 400, 'duplicate code');
     const v1raw = db.prepare('SELECT data FROM item_versions WHERE item_id=? AND version=1').get(id).data;
     assert.strictEqual((await call('PUT', `library/items/${id}`, { ...good, name_en: 'Test item v2', parts: [...good.parts, { kind: 'sub', rate: 10 }] }, qs)).s, 200);
-    assert.strictEqual((await call('PUT', `library/items/${id}`, { ...good, unit: 'm3', rework_pct: 0 }, qs)).s, 200);
+    assert.strictEqual((await call('PUT', `library/items/${id}`, { ...good, uom: 'm3', rework_pct: 0 }, qs)).s, 200);
     assert.strictEqual((await call('PUT', `library/items/${id}`, good, viewer)).s, 403);
     const vs = await call('GET', `library/items/${id}/versions`, null, viewer);
     assert.deepStrictEqual(vs.j.map(v => v.version), [1, 2, 3]);
@@ -89,6 +92,11 @@ server.listen(0, async () => {
     assert.strictEqual((await call('GET', 'library/items/9999/versions', null, qs)).s, 404);
     assert.ok(db.prepare("SELECT 1 FROM audit_log WHERE entity='items' AND action='create'").get());
     assert.ok(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE entity='items' AND action='update'").get().n >= 2);
+
+    // frozen head fields and rework in each version
+    assert.deepStrictEqual(vs.j[0].data.head, { code: 'T-001', uom: 'm2', name_ar: 'بند', name_en: 'Test item', section_id: asphalt });
+    assert.strictEqual(vs.j[1].data.head.name_en, 'Test item v2'); assert.strictEqual(vs.j[2].data.head.uom, 'm3');
+    assert.strictEqual(vs.j[2].data.rework_pct, 0);
 
     // no snapshot yet: unit null + missing ['snapshot']
     let list = await call('GET', 'library/items', null, qs);
@@ -111,8 +119,17 @@ server.listen(0, async () => {
     const d = await call('POST', 'library/items', { ...noRework, code: 'T-003', section_id: ns.j.id }, qs);
     near((await call('GET', 'library/items', null, qs)).j.find(i => i.id === d.j.id).unit, 392.7 / 1.02 * 1.03, 'section default rework');
 
+    // a section edit never changes a saved version's cost; the version froze its rework
+    assert.strictEqual(JSON.parse(db.prepare('SELECT data FROM item_versions WHERE item_id=? AND version=1').get(d.j.id).data).rework_pct, 3);
+    await call('PUT', `library/sections/${ns.j.id}`, { default_rework_pct: 50 }, qs);
+    near((await call('GET', 'library/items', null, qs)).j.find(i => i.id === d.j.id).unit, 392.7 / 1.02 * 1.03, 'unit unchanged after section edit');
+    // a list row cannot be round-tripped into PUT (cost is in `unit`)
+    const rt = (await call('GET', 'library/items', null, qs)).j.find(i => i.id === d.j.id);
+    const rr = await call('PUT', `library/items/${d.j.id}`, rt, qs);
+    assert.strictEqual(rr.s, 400); assert.ok(/uom/.test(rr.j.error));
+
     // privacy: single small trade labour part hides its cost from non-admin
-    const priv = { code: 'T-004', section_id: asphalt, unit: 'm', name_en: 'Priv', name_ar: 'خاص',
+    const priv = { code: 'T-004', section_id: asphalt, uom: 'm', name_en: 'Priv', name_ar: 'خاص',
       parts: [{ kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }], output_per_day: 8 }, { kind: 'labour', crew: [{ trade: 'Mason', count: 1 }], output_per_day: 8 }, { kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }, { trade: 'Mason', count: 1 }], output_per_day: 8 }, { kind: 'fixed', amount: 1 }] };
     const p = await call('POST', 'library/items', priv, qs);
     for (const [ck, who] of [[qs, 'qs'], [viewer, 'viewer']]) {

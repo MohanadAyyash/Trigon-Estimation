@@ -51,6 +51,22 @@ for (const o of [0, -1, null, NaN]) {
 // no snapshot at all
 r = unitCost({ parts: [{ kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }], output_per_day: 10 }] }, null, cfg);
 assert.strictEqual(r.unit, null); assert.deepStrictEqual(r.missing, ['trade:Foreman']);
+// missing quantities / rates / counts are never zero
+const one = (part, c) => unitCost({ parts: [part] }, snap, c || cfg);
+for (const [part, code] of [
+  [{ kind: 'material', material_id: 12, waste_pct: 0 }, 'material:qty'], [{ kind: 'sub' }, 'sub:rate'], [{ kind: 'fixed' }, 'fixed:amount'],
+  [{ kind: 'labour', crew: [{ trade: 'Foreman' }], output_per_day: 5 }, 'labour:count'],
+]) { r = one(part); assert.strictEqual(r.unit, null, code); assert.strictEqual(r.parts[0].cost, null); assert.deepStrictEqual(r.missing, [code]); }
+// work_hours must be positive and finite for labour
+for (const h of [undefined, NaN, 0, -8]) {
+  r = one({ kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }], output_per_day: 5 }, { ...cfg, work_hours: h });
+  assert.strictEqual(r.unit, null); assert.deepStrictEqual(r.missing, ['work_hours']);
+}
+near(one({ kind: 'fixed', amount: 3 }, { ...cfg, work_hours: undefined }).unit, 3, 'work_hours irrelevant without labour');
+// overflow is reported, never a silent Infinity/null
+near(one({ kind: 'sub', rate: 1e308 }).unit, 1e308, 'finite large value is not an overflow');
+r = unitCost({ rework_pct: 1e308, parts: [{ kind: 'sub', rate: 1e308 }] }, snap, cfg); assert.strictEqual(r.unit, null); assert.deepStrictEqual(r.missing, ['overflow']);
+r = one({ kind: 'material', material_id: 12, qty: 1e308, waste_pct: 1e308 }); assert.strictEqual(r.unit, null); assert.deepStrictEqual(r.missing, ['overflow']); assert.strictEqual(r.parts[0].cost, null);
 // unknown kind is a hard error, not a silent zero
 assert.throws(() => unitCost({ parts: [{ kind: 'magic' }] }, snap, cfg));
 console.log('unitcost ok');
