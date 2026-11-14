@@ -29,7 +29,7 @@ const send = (res, code, body, headers = {}) => {
 const readBody = (req, max = 20e6) => req._body !== undefined ? Promise.resolve(req._body) : new Promise((ok, no) => {
   let b = '', over = false;
   req.on('data', c => { if (over) return; b += c; if (b.length > max) { over = true; b = ''; no(Object.assign(new Error('the request is too large'), { status: 413 })); req.resume(); } });
-  req.on('end', () => { if (over) return; try { ok(req._body = b ? JSON.parse(b) : {}); } catch (e) { no(Object.assign(new Error('invalid request body'), { status: 400 })); } });
+  req.on('end', () => { if (over) return; try { const j = b ? JSON.parse(b) : {}; if (!j || typeof j !== 'object' || Array.isArray(j)) throw 0; ok(req._body = j); } catch (e) { no(Object.assign(new Error('invalid request body'), { status: 400 })); } });
   req.on('error', no);
 });
 const audit = (user, action, entity, id, detail) => db.prepare('INSERT INTO audit_log(at,user,action,entity,entity_id,detail) VALUES(?,?,?,?,?,?)')
@@ -80,6 +80,8 @@ async function api(req, res, url) {
   if (a === 'setup' && method === 'POST') {
     if (db.prepare('SELECT COUNT(*) n FROM users').get().n) return send(res, 403, { error: 'already set up' });
     const { username, password } = await readBody(req);
+    // re-check after the await, in the same synchronous block as the insert (two concurrent setups must not both win)
+    if (db.prepare('SELECT COUNT(*) n FROM users').get().n) return send(res, 403, { error: 'already set up' });
     const id = createUser(username, password, 'admin');
     audit({ username: String(username).trim() }, 'create', 'users', id, { role: 'admin', setup: true });
     return send(res, 200, { ok: 1 }, { 'Set-Cookie': cookie(req, createSession(id), 2592000) });

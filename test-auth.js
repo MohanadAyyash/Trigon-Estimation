@@ -22,8 +22,13 @@ server.listen(0, async () => {
   try {
     assert.strictEqual((await call('GET', 'status')).j.setup, true);
     assert.strictEqual((await call('GET', 'settings')).s, 401);
-    const su = await call('POST', 'setup', { username: 'admin', password: 'secret12' });
-    assert.strictEqual(su.s, 200);
+    // two concurrent first-admin setups: exactly one wins
+    const race = await Promise.all([call('POST', 'setup', { username: 'admin', password: 'secret12' }), call('POST', 'setup', { username: 'admin2', password: 'secret12' })]);
+    assert.deepStrictEqual(race.map(r => r.s).sort(), [200, 403], 'concurrent setup: one 200, one 403');
+    assert.strictEqual(require('./server.js').db.prepare('SELECT COUNT(*) n FROM users').get().n, 1, 'exactly one user');
+    const su = race.find(r => r.s === 200);
+    // non-object JSON bodies are 400, not 500
+    for (const raw of ['null', '[]', '5']) assert.strictEqual((await fetch(base + 'login', { method: 'POST', body: raw })).status, 400, 'body ' + raw);
     assert.ok(/HttpOnly/.test(su.raw) && /SameSite=Strict/.test(su.raw), 'cookie flags');
     const admin = su.ck;
     assert.strictEqual((await call('POST', 'setup', { username: 'x', password: 'secret12' })).s, 403);
