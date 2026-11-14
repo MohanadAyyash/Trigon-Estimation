@@ -4,6 +4,7 @@ const { readErp } = require('../lib/erpsync');
 const { buildSnapshot, viewSnapshot } = require('../lib/costs');
 
 const CONFIG_KEYS = ['category_map', 'trade_map', 'trade_groups', 'overrides'];
+const CATEGORY_KINDS = ['overhead', 'labour_oncost', 'equipment', 'project', 'ignore'];
 const norm = s => String(s == null ? '' : s).toLowerCase().trim().replace(/\s+/g, ' ');
 const DAY = 86400000;
 const dayMs = s => {   // real 'YYYY-MM-DD' -> UTC ms, else null
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
     if (running) return { ok: false, error: 'a sync is already running' };
     running = true;
     try {
+      await new Promise(r => setImmediate(r));   // yield once, so a second concurrent call really meets the guard
       const now = opts && opts.now instanceof Date ? opts.now : new Date();
       let json;
       try {
@@ -89,7 +91,7 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
     let best = pts[0];
     for (const p of pts) if (p.ms > best.ms || (p.ms === best.ms && p.source === 'quote' && best.source !== 'quote')) best = p;
     const rates = pts.map(p => p.rate);
-    const staleDays = getSettings().material_stale_days;
+    const sd = getSettings().material_stale_days, staleDays = Number.isFinite(sd) && sd > 0 ? sd : 60;
     return {
       rate: best.rate, date: best.date, source: best.source,
       avg: rates.reduce((a, b) => a + b, 0) / rates.length, min: Math.min(...rates), max: Math.max(...rates),
@@ -117,7 +119,7 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
       const ok = db.prepare('SELECT id, created FROM snapshots WHERE ok=1 ORDER BY id DESC LIMIT 1').get();
       const last = db.prepare('SELECT created, ok, error FROM snapshots ORDER BY id DESC LIMIT 1').get();
       const stale = !ok || (Date.now() - Date.parse(ok.created)) / DAY > getSettings().stale_days;
-      return reply(res, 200, { last_ok: ok ? ok.created : null, last_ok_id: ok ? ok.id : null, last_attempt: last ? last.created : null, last_error: last && !last.ok ? last.error : null, stale });
+      return reply(res, 200, { last_ok: ok ? ok.created : null, last_ok_id: ok ? ok.id : null, last_attempt: last ? last.created : null, last_error: last && !last.ok ? (me.role === 'admin' ? last.error : 'ERP sync failed') : null, stale });
     }
     if (sub === 'snapshot' && parts.length === 2 && method === 'GET') {
       const s = latest();
@@ -135,7 +137,12 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
           const v = {};
           for (const [kk, vv] of Object.entries(b[key])) {
             if (key === 'overrides') { const n = num(vv); if (n === null || !(n > 0)) bad(`overrides.${kk} must be a positive number`); v[kk] = n; }
-            else { if (typeof vv !== 'string') bad(`${key}.${kk} must be text`); v[kk] = vv; }
+            else {
+              if (typeof vv !== 'string') bad(`${key}.${kk} must be text`);
+              if (key === 'category_map' && !CATEGORY_KINDS.includes(vv)) bad(`${key}.${kk} must be one of ${CATEGORY_KINDS.join(', ')}`);
+              if (key !== 'category_map' && !vv.trim()) bad(`${key}.${kk} must not be empty`);
+              v[kk] = vv;
+            }
           }
           changed[key] = v;
         }

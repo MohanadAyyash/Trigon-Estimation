@@ -50,6 +50,9 @@ server.listen(0, async () => {
     assert.strictEqual((await call('POST', 'costs/sync', null, qs)).s, 403);
     const ok = await call('POST', 'costs/sync', null, admin);
     assert.strictEqual(ok.s, 200, JSON.stringify(ok.j)); assert.ok(ok.j.id);
+    assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots WHERE ok=1 AND id=?').get(ok.j.id).n, 1, 'HTTP sync wrote an ok row');
+    // every content assertion below runs on a snapshot built at a fixed clock, so the suite does not depend on today's date
+    assert.strictEqual((await ctx.costs.sync({ now: new Date('2026-11-14T10:00:00Z') })).ok, true);
     const snapA = await call('GET', 'costs/snapshot', null, admin);
     assert.strictEqual(snapA.s, 200);
     assert.ok(Array.isArray(snapA.j.trades) && snapA.j.trades.length >= 1, 'admin snapshot has trades');
@@ -86,6 +89,33 @@ server.listen(0, async () => {
     assert.strictEqual(r.ok, true);
     st = (await call('GET', 'costs/status', null, admin)).j; assert.strictEqual(st.last_error, null);
 
+    // scheduler is off under ERP_SYNC_DISABLED=1
+    let rows = db.prepare('SELECT COUNT(*) n FROM snapshots').get().n;
+    ctx.costs.startScheduler();
+    await new Promise(r => setTimeout(r, 100));
+    assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots').get().n, rows, 'startScheduler does nothing when disabled');
+    // overlap guard: two concurrent syncs -> one runs, the other is refused, one row written
+    const fixed = new Date('2026-11-14T10:00:00Z');
+    const res2 = await Promise.all([ctx.costs.sync({ now: fixed }), ctx.costs.sync({ now: fixed })]);
+    assert.deepStrictEqual(res2.map(x => x.ok).sort(), [false, true], 'exactly one concurrent sync runs');
+    assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots').get().n, rows + 1, 'only one row written');
+    assert.strictEqual((await ctx.costs.sync({ now: fixed })).ok, true, 'guard released afterwards');
+
+    // config values are validated
+    for (const bodyBad of [{ category_map: { Rent: 'overheads' } }, { trade_map: { Mason: '' } }, { trade_groups: { Mason: '' } }])
+      assert.strictEqual((await call('PUT', 'costs/config', bodyBad, admin)).s, 400, JSON.stringify(bodyBad));
+    for (const v of ['overhead', 'labour_oncost', 'equipment', 'project', 'ignore'])
+      assert.strictEqual((await call('PUT', 'costs/config', { category_map: { Rent: v } }, admin)).s, 200, v);
+    await call('PUT', 'costs/config', { category_map: { Rent: 'overhead' } }, admin);
+
+    // non-admin status hides the server path
+    await call('PUT', 'settings', { erp_db_path: path.join(dir, 'missing2.db') }, admin);
+    await call('POST', 'costs/sync', null, admin);
+    const sq = (await call('GET', 'costs/status', null, qs)).j, sa = (await call('GET', 'costs/status', null, admin)).j;
+    assert.strictEqual(sq.last_error, 'ERP sync failed'); assert.ok(/missing2\.db/.test(sa.last_error));
+    await call('PUT', 'settings', { erp_db_path: erpFile }, admin);
+    assert.strictEqual((await ctx.costs.sync({ now: fixed })).ok, true);
+
     // materials: CRUD + permissions
     assert.strictEqual((await call('POST', 'costs/materials', { name_en: 'Tile', unit: 'm2' }, null)).s, 401);
     assert.strictEqual((await call('POST', 'costs/materials', { unit: 'm2' }, qs)).s, 400);
@@ -119,6 +149,9 @@ server.listen(0, async () => {
     await call('DELETE', `costs/materials/${mid}/quotes/${q.j.id}`, null, qs);
     p = ctx.costs.materialPrice(mid, snap, now); assert.strictEqual(p.source, 'quote'); assert.strictEqual(p.rate, 28);
     assert.strictEqual(p.avg, 29); assert.strictEqual(p.min, 28); assert.strictEqual(p.max, 30);
+    ctx.setSetting('material_stale_days', 'abc');   // NaN must not make stale silently false
+    assert.strictEqual(ctx.costs.materialPrice(mid, snap, new Date('2027-01-01T00:00:00Z')).stale, true, 'bad stale setting falls back to 60');
+    ctx.setSetting('material_stale_days', 60);
     assert.strictEqual(ctx.costs.materialPrice(m2, snap, now), null);
     assert.strictEqual(ctx.costs.materialPrice(mid, null, now).rate, 28, 'works without a snapshot (quotes only)');
     assert.strictEqual((await call('GET', `costs/materials/${mid}/links`, null, qs)).j.length, 1);
