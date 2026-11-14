@@ -56,18 +56,23 @@ server.listen(0, async () => {
     const item = (await ok(call('POST', 'library/items', { code: 'T-1', section_id: sec, uom: 'm3', name_en: 'Test concrete item', name_ar: 'بند خرسانة تجريبي', rework_pct: 0,
       parts: [{ kind: 'material', material_id: mat, qty: 1, waste_pct: 0 }, { kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }], output_per_day: 8 }, { kind: 'fixed', amount: 5 }] }, admin), 'item')).id;
     const info = { title: 'Test UI Road', ref: 'UI-1', client: 'Fake Client LLC', kind: 'direct', M: 4, adv_pct: 0, ret_pct: 5, collection_days: 45, retention_months: 6 };
-    const makeTender = async (title, unlinked) => {
+    const makeTender = async (title, unlinked, zeroQty) => {
       const id = (await ok(call('POST', 'tenders', { ...info, title }, admin), 'tender')).id;
       await ok(call('POST', `tenders/${id}/rows`, { no: 'A', description: 'Test heading section', is_heading: true }, admin), 'heading');
       const row = (await ok(call('POST', `tenders/${id}/rows`, { no: '1', description: 'Test <b id="xss">concrete</b> works', unit: 'm3' }, admin), 'row')).id;
       await ok(call('POST', `tenders/${id}/rows/${row}/lines`, { description: 'slab', l: 10, w: 5, d: 0.2, count: 2 }, admin), 'line');
       await ok(call('PUT', `tenders/${id}/rows/${row}/links`, { links: [{ item_id: item, share: 1 }] }, admin), 'link');
       if (unlinked) await ok(call('POST', `tenders/${id}/rows`, { no: '2', description: 'Test unlinked row', unit: 'm2' }, admin), 'unlinked row');
+      if (zeroQty) {   // linked but no take-off lines yet: priced (complete) yet blocked by row_zero_qty
+        const z = (await ok(call('POST', `tenders/${id}/rows`, { no: '3', description: 'Test zero qty row', unit: 'm3' }, admin), 'zero row')).id;
+        await ok(call('PUT', `tenders/${id}/rows/${z}/links`, { links: [{ item_id: item, share: 1 }] }, admin), 'zero link');
+      }
       for (const h of (await call('GET', `tenders/${id}/hidden`, null, admin)).j) await ok(call('PUT', `tenders/${id}/hidden/${h.id}`, { status: 'na' }, admin), 'answer');
       return id;
     };
-    const full = await makeTender('Test UI Complete', false), partial = await makeTender('Test UI Partial', true);
-    addSnap(SNAP);   // a newer sync: both tenders now have newer_snapshot
+    const full = await makeTender('Test UI Complete', false), partial = await makeTender('Test UI Partial', true), blocked = await makeTender('Test UI Blocked', false, true);
+    const bound = (await call('GET', `tenders/${full}`, null, admin)).j.snapshot_id;
+    const latestSnap = addSnap({ ...SNAP, oh_monthly: 30000 });   // a newer sync: every tender now has newer_snapshot
     // the last sync attempt failed: red banner with the last good time
     db.prepare('INSERT INTO snapshots(created,ok,error,data) VALUES(?,0,?,NULL)').run(new Date().toISOString(), 'test: ERP file not found');
 
@@ -115,12 +120,57 @@ server.listen(0, async () => {
     const after = (await call('GET', `tenders/${full}`, null, admin)).j;
     assert.strictEqual(after.margin_pct, null); assert.strictEqual(after.M, 4, 'what-if saves nothing');
 
+    // reprice: the difference is shown first and nothing changes until Apply (spec 7.8)
+    await page.click('#reprice');
+    await page.waitForSelector('#reprice-preview-box');
+    const preview = (await call('GET', `tenders/${full}/price?snapshot=latest`, null, admin)).j;
+    const f2 = v => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    assert.ok((await page.textContent('#reprice-old')).includes(f2(pr.result.P)), 'preview shows the old P');
+    assert.ok((await page.textContent('#reprice-new')).includes(f2(preview.result.P)), 'preview shows the new P');
+    assert.notStrictEqual(preview.result.P, pr.result.P);
+    assert.strictEqual((await call('GET', `tenders/${full}`, null, admin)).j.snapshot_id, bound, 'the preview does not rebind the tender');
+    await page.click('#reprice-apply');
+    await page.waitForSelector('#reprice-result');
+    assert.strictEqual((await call('GET', `tenders/${full}`, null, admin)).j.snapshot_id, latestSnap, 'Apply rebinds to the latest costs');
+
+    // approval only at the margin of the numbers on screen
+    await ok(call('POST', `tenders/${full}/submit`, null, admin), 'submit');
+    await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
+    await page.click('#tab-summary'); await page.waitForSelector(`#summary[data-tender="${full}"] #ap-approve`);
+    assert.strictEqual(await page.isEnabled('#ap-approve'), true, 'approve enabled at the shown margin');
+    await page.fill('#ap-margin', '20');
+    assert.ok(await page.isVisible('#ap-margin-changed'), 'changed margin warns');
+    assert.strictEqual(await page.isEnabled('#ap-approve'), false, 'changed margin blocks approve');
+    await page.click('#ap-reprice');
+    await page.waitForSelector('#whatif-note');
+    const at20 = (await call('GET', `tenders/${full}/price?margin_pct=20`, null, admin)).j.result.P;
+    assert.strictEqual((await page.textContent('#num-P')).trim(), f2(at20), 'priced at the typed margin');
+    assert.strictEqual(await page.isEnabled('#ap-approve'), true, 'approve enabled once priced at that margin');
+    await page.click('#ap-approve');
+    await page.waitForSelector('#summary .banner-ok');
+    const ap = (await call('GET', `tenders/${full}`, null, admin)).j;
+    assert.strictEqual(ap.status, 'approved'); assert.strictEqual(ap.margin_pct, 20); assert.strictEqual(ap.approved_P, at20, 'approved P is the P that was shown');
+
+    // complete but blocked: BLOCKED, not PARTIAL
+    await page.goto(`${origin}/#/tender/${blocked}/summary`);
+    await page.waitForSelector(`#summary[data-tender="${blocked}"] #num-P`);
+    const bb = await page.textContent('#price-banner');
+    assert.ok(bb.includes('BLOCKED — not a tender price') && !bb.includes('PARTIAL'), 'blocked banner: ' + bb);
+
     // partial tender: P is shown under the PARTIAL banner, the blocking row links to its row
     await page.goto(`${origin}/#/tender/${partial}/summary`);
     await page.waitForSelector(`#summary[data-tender="${partial}"] #num-P`);
     const pb = await page.textContent('#price-banner');
     assert.ok(pb.includes('PARTIAL — not a tender price'), 'partial banner: ' + pb);
     assert.ok(await page.isVisible('#blocking-list a'), 'blocking item links to the row');
+
+    // Links tab of a partial tender: no plain per-row rate
+    await page.click('#tab-links'); await page.waitForSelector('#tab-body-links');
+    const pp = (await call('GET', `tenders/${partial}/price`, null, admin)).j;
+    const linkedRow = pp.rows.find(r => r.rate !== null);
+    const rateTxt = await page.textContent(`#row-${linkedRow.id} .rate`);
+    assert.ok(rateTxt.includes('—') && rateTxt.includes('PARTIAL — not a tender price'), 'partial rate marked: ' + rateTxt);
+    assert.ok(!rateTxt.includes(f2(linkedRow.rate)), 'partial rate not shown as a number');
 
     // other tabs, BOQ text is escaped, headings are marked
     for (const tab of ['info', 'quantities', 'links', 'hidden']) { await page.click('#tab-' + tab); await page.waitForSelector('#tab-body-' + tab); }

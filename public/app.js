@@ -83,6 +83,8 @@
   const blockLabel = c => ({ no_snapshot: t('blk_no_snapshot'), snapshot_stale: t('blk_snapshot_stale'), overhead_missing: t('blk_overhead_missing'), row_unlinked: t('blk_row_unlinked'),
     row_unpriced: t('blk_row_unpriced'), row_zero_qty: t('blk_row_zero_qty'), material_stale: t('blk_material_stale'), hidden_unanswered: t('blk_hidden_unanswered') })[c] || c;
   const badge = s => h('span', { class: 'badge st-' + s }, statusLabel(s));
+  const priceState = p => !p || !p.result ? 'none' : !p.complete ? 'partial' : p.blocking.length ? 'blocked' : 'complete';
+  const stateLabel = st => ({ complete: t('complete'), partial: t('partial'), blocked: t('blocked'), none: t('no_price_short') })[st];
 
   // ---- language -----------------------------------------------------------------------------------------------
   function applyLang() {
@@ -262,14 +264,17 @@
         t('old_price') + ': ', rp.old_P === null ? '—' : fmt2(rp.old_P), ' (' + (rp.old_complete ? t('complete') : t('partial')) + ') → ',
         t('new_price') + ': ', rp.new_P === null ? '—' : fmt2(rp.new_P), ' (' + (rp.new_complete ? t('complete') : t('partial')) + ')'));
     }
+    const previewBox = h('div');
     if (price && price.newer_snapshot) {
       page.append(h('div', { class: 'banner banner-yellow', id: 'newer-banner' },
         t('newer_costs', { date: fmtTime(price.snapshot_created) || '—' }), ' ',
         editable ? h('button', { id: 'reprice', onclick: async ev => {
-          if (!confirm(t('reprice_confirm'))) return;
           ev.target.disabled = true;
-          try { repriced.set(id, await api('POST', `tenders/${id}/reprice`)); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
-        } }, t('reprice')) : null));
+          try { previewBox.replaceChildren(repricePreview(id, price, await api('GET', `tenders/${id}/price?snapshot=latest`))); }
+          catch (e) { fail(e); }
+          ev.target.disabled = false;
+        } }, t('reprice_preview')) : null));
+      page.append(previewBox);
     }
 
     const tabs = [['info', t('tab_info')], ['quantities', t('tab_quantities')], ['links', t('tab_links')], ['hidden', t('tab_hidden')], ['summary', t('tab_summary')]];
@@ -284,6 +289,21 @@
     else if (tab === 'hidden') await tabHidden(body, ctx);
     else tabSummary(body, ctx);
     out.append(page);
+  }
+
+  // old vs new before anything changes; only Apply rebinds the tender to the latest costs
+  function repricePreview(id, cur, next) {
+    const P = p => p && p.result ? fmt2(p.result.P) : '—';
+    return h('div', { class: 'banner banner-info', id: 'reprice-preview-box' },
+      h('strong', null, t('reprice_preview_title')), ' ',
+      h('span', { id: 'reprice-old' }, t('old_price') + ': ', P(cur), ' (' + stateLabel(priceState(cur)) + ')'), ' → ',
+      h('span', { id: 'reprice-new' }, t('new_price') + ': ', P(next), ' (' + stateLabel(priceState(next)) + ')'),
+      ' · ' + t('snapshot_date') + ': ' + (fmtTime(next.snapshot_created) || '—'),
+      next.blocking.length ? blockingList(id, next, 'reprice-blocking') : null,
+      h('div', { class: 'row' }, h('button', { id: 'reprice-apply', onclick: async ev => {
+        ev.target.disabled = true;
+        try { repriced.set(id, await api('POST', `tenders/${id}/reprice`)); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+      } }, t('reprice_apply')), h('button', { class: 'secondary', onclick: ev => ev.target.closest('#reprice-preview-box').remove() }, t('cancel'))));
   }
 
   function workflowButtons(T) {
@@ -452,6 +472,8 @@
   async function tabLinks(body, { id, price, frozen, editable, focusId }) {
     const [rows, items] = await Promise.all([api('GET', `tenders/${id}/rows`), editable ? api('GET', 'library/items') : Promise.resolve([])]);
     const pRows = new Map(((frozen ? frozen.rows : price && price.rows) || []).map(r => [r.id, r]));
+    const st = frozen ? 'complete' : priceState(price);
+    const notPrice = { none: t('no_tender_price'), partial: t('partial_banner'), blocked: t('blocked_banner') }[st];
     const itemOpts = [['', '—'], ...items.map(i => [String(i.id), `${i.code} — ${nm(i)} (${i.uom})`])];
     const list = rows.filter(r => !r.is_heading);
     if (!list.length) { body.append(card(t('tab_links'), h('p', { class: 'muted' }, t('no_priced_rows')))); return; }
@@ -492,7 +514,7 @@
       body.append(h('section', { class: 'card link-card' + (focusId === r.id ? ' focus' : ''), id: 'row-' + r.id },
         h('div', { class: 'row wrap' }, h('strong', null, (r.no ? r.no + ' ' : '') + (r.description || '')), h('span', { class: 'muted' }, fmtQ(r.qty) + ' ' + (r.unit || '')), state,
           h('span', { class: 'spacer' }), h('span', null, t('direct_unit') + ': ', pr ? money(pr.direct_unit, pr.direct_unit === null ? t('not_priced') : null) : '—'),
-          h('span', null, t('rate') + ': ', pr ? money(pr.rate, t('no_tender_price')) : '—')),
+          h('span', { class: 'rate' }, t('rate') + ': ', st !== 'complete' ? missing(notPrice) : pr ? money(pr.rate, t('no_tender_price')) : '—')),
         r.qty === 0 ? h('p', { class: 'warn' }, t('blk_row_zero_qty')) : null,
         breakdown, editor));
     }
@@ -540,18 +562,21 @@
     ['D', t('c_D'), r.D], ['H', t('c_H'), r.H], ['OH', t('c_OH'), r.OH], ['F', t('c_F'), r.F], ['L', t('c_L'), r.L],
     ['C', t('c_C'), r.C], ['P_min', t('c_Pmin'), r.P_min], ['P', t('c_P'), r.P]];
 
-  function threeNumbers(r, partial) {
-    const c = (id, label, v, note) => h('div', { class: 'big' + (partial ? ' partial' : '') + (id === 'P' ? ' main' : '') }, h('div', { class: 'label' }, label),
+  function threeNumbers(r, st) {
+    const bad = st === 'partial' || st === 'blocked';
+    const c = (id, label, v, note) => h('div', { class: 'big' + (bad ? ' partial' : '') + (id === 'P' ? ' main' : '') }, h('div', { class: 'label' }, label),
       h('div', { class: 'value', id: 'num-' + id }, fin(v) ? fmt2(v) : '—'), h('div', { class: 'small muted' }, note));
     return h('div', { class: 'three' }, c('C', t('true_cost'), r.C, t('true_cost_note')), c('Pmin', t('floor_price'), r.P_min, t('floor_note')),
-      c('P', partial ? t('partial_price') : t('proposed_price'), r.P, partial ? t('partial_banner') : t('proposed_note')));
+      st === 'partial' ? c('P', t('partial_price'), r.P, t('partial_banner')) : st === 'blocked' ? c('P', t('blocked_price'), r.P, t('blocked_banner'))
+        : c('P', t('proposed_price'), r.P, t('proposed_note')));
   }
 
   function waterfall(r) {
     const scale = Math.max(r.P, r.P_min, r.C);
+    if (!(fin(scale) && scale > 0)) return h('div', { id: 'waterfall', class: 'waterfall' }, missing(t('no_value')));
     const w = v => Math.max(0, v / scale * 100).toFixed(3) + '%';
     const segs = [['D', t('c_D'), r.D], ['H', t('c_H'), r.H], ['OH', t('c_OH'), r.OH], ['F', t('c_F'), r.F], ['L', t('c_L'), r.L], ['M', t('c_margin'), r.P - r.C]];
-    const bar = h('div', { class: 'wf-bar' }, segs.filter(s => s[2] > 0).map(([k, l, v]) => h('div', { class: 'wf-seg wf-' + k, style: 'width:' + w(v), title: l + ': ' + fmt2(v) }, v / scale > 0.06 ? k : '')));
+    const bar = h('div', { class: 'wf-bar' }, segs.filter(s => fin(s[2]) && s[2] > 0).map(([k, l, v]) => h('div', { class: 'wf-seg wf-' + k, style: 'width:' + w(v), title: l + ': ' + fmt2(v) }, v / scale > 0.06 ? k : '')));
     const marks = h('div', { class: 'wf-marks' },
       [['C', r.C], ['P_min', r.P_min], ['P', r.P]].map(([k, v]) => h('div', { class: 'wf-mark', style: 'inset-inline-start:' + w(v) }, h('span', null, k))));
     return h('div', { id: 'waterfall', class: 'waterfall' }, h('div', { class: 'wf-wrap' }, bar, marks),
@@ -582,10 +607,10 @@
         r.schedule.map(x => h('tr', null, h('td', { class: 'num' }, x.month), h('td', { class: 'num' }, money(x.out)), h('td', { class: 'num' }, money(x.in)), h('td', { class: 'num' }, money(x.balance)), h('td', { class: 'num' }, money(x.cost)))), { class: 'grid' })));
   }
 
-  function blockingList(id, p) {
+  function blockingList(id, p, listId) {
     const rows = new Map((p.rows || []).map(r => [r.id, r])), hid = new Map((p.hidden || []).map(x => [x.id, x]));
     return h('section', { class: 'card blocking' }, h('h2', null, t('blocking_title') + ' (' + p.blocking.length + ')'),
-      h('ul', { id: 'blocking-list' }, p.blocking.map(b => {
+      h('ul', { id: listId || 'blocking-list' }, p.blocking.map(b => {
         let target = null;
         if (b.row_id) { const r = rows.get(b.row_id); target = h('a', { href: `#/tender/${id}/links/${b.row_id}` }, t('row') + ' ' + (r ? [r.no, r.description].filter(Boolean).join(' — ') : '#' + b.row_id)); }
         else if (b.hidden_id) { const x = hid.get(b.hidden_id); target = h('a', { href: `#/tender/${id}/hidden/${b.hidden_id}` }, t('hidden_item') + ' ' + (x ? nm(x) : '#' + b.hidden_id)); }
@@ -596,24 +621,31 @@
   }
 
   function drawSummary(box, ctx, p, whatIf) {
-    const { id, T } = ctx, r = p.result;
-    const partial = !!r && (!p.complete || p.blocking.length > 0);
+    const { id, T } = ctx, r = p.result, st = priceState(p);
     box.replaceChildren();
     if (whatIf) box.append(h('div', { class: 'banner banner-info', id: 'whatif-note' }, h('strong', null, t('whatif_note')), ' ',
       h('button', { class: 'small secondary', onclick: () => drawSummary(box, ctx, ctx.price, null) }, t('reset'))));
     if (!r) box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('no_price')), p.error ? ' — ' + p.error : ''));
-    else if (partial) box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('partial_banner')), ' ',
+    else if (st === 'partial') box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('partial_banner')), ' ',
       t('partial_detail', { rows: p.excluded_rows.length, hidden: p.unanswered_hidden.length })));
+    else if (st === 'blocked') box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('blocked_banner')), ' ', t('blocked_detail')));
     if (p.blocking.length) box.append(blockingList(id, p));
 
     if (r) {
-      box.append(threeNumbers(r, partial));
+      box.append(threeNumbers(r, st));
       box.append(card(t('waterfall'), waterfall(r), costTable(r)));
       box.append(ohCompare(r));
     }
 
     // inputs and what-if
     const inpts = p.inputs || {};
+    const runWhatIf = async (margin, M, cd) => {
+      const q = new URLSearchParams(), w = { M, cd };
+      if (margin !== null && margin !== undefined) { w.margin = margin; if (!blank(margin)) q.set('margin_pct', String(margin).trim()); }
+      if (!blank(M)) q.set('M', String(M).trim());
+      if (!blank(cd)) q.set('collection_days', String(cd).trim());
+      drawSummary(box, ctx, await api('GET', `tenders/${id}/price?${q}`), w);
+    };
     const wiM = inp('wi-M', whatIf && whatIf.M !== undefined ? whatIf.M : inpts.M, { class: 'w-num', inputmode: 'numeric' });
     const wiCd = inp('wi-cd', whatIf && whatIf.cd !== undefined ? whatIf.cd : inpts.collection_days, { class: 'w-num', inputmode: 'decimal' });
     const wiMargin = isAdmin() ? inp('wi-margin', whatIf && whatIf.margin !== undefined ? whatIf.margin : p.margin_pct, { class: 'w-num', inputmode: 'decimal' }) : null;
@@ -633,38 +665,45 @@
       card(t('whatif'), h('p', { class: 'muted small' }, t('whatif_hint')),
         h('div', { class: 'form-grid' }, wiMargin ? field(t('margin_pct'), wiMargin) : null, field(t('duration_months'), wiM), field(t('collection_days'), wiCd)),
         h('button', { id: 'wi-apply', onclick: async ev => {
-          const q = new URLSearchParams(), w = { M: wiM.value, cd: wiCd.value };
-          if (wiMargin) { w.margin = wiMargin.value; if (!blank(wiMargin.value)) q.set('margin_pct', wiMargin.value.trim()); }
-          if (!blank(wiM.value)) q.set('M', wiM.value.trim());
-          if (!blank(wiCd.value)) q.set('collection_days', wiCd.value.trim());
           ev.target.disabled = true;
-          try { drawSummary(box, ctx, await api('GET', `tenders/${id}/price?${q}`), w); } catch (e) { fail(e); ev.target.disabled = false; }
+          try { await runWhatIf(wiMargin ? wiMargin.value : null, wiM.value, wiCd.value); } catch (e) { fail(e); ev.target.disabled = false; }
         } }, t('whatif_apply')))));
 
-    if (isAdmin() && T.status === 'submitted' && !whatIf) box.append(approvePanel(ctx, p));
+    // approval: only when the numbers on screen are what approval will freeze (saved M and collection days)
+    const saved = ctx.price.inputs || {};
+    const sameTerms = !whatIf || (inpts.M === saved.M && inpts.collection_days === saved.collection_days);
+    if (isAdmin() && T.status === 'submitted' && sameTerms) box.append(approvePanel(ctx, p, m => runWhatIf(m, saved.M, saved.collection_days)));
     if (r) { const s = scheduleTable(r); if (s) box.append(s); }
   }
 
-  function approvePanel(ctx, p) {
+  function approvePanel(ctx, p, repriceAt) {
     const onlyStale = p.blocking.length > 0 && p.blocking.every(b => b.code === 'snapshot_stale');
     const margin = inp('ap-margin', p.margin_pct, { class: 'w-num', inputmode: 'decimal' });
     const override = onlyStale ? h('input', { type: 'checkbox', id: 'ap-override' }) : null;
     const can = !!p.result && p.complete && (!p.blocking.length || onlyStale);
     const msg = h('div');
-    return card(t('approve_title'),
-      h('div', { class: 'form-grid' }, field(t('margin_pct'), margin), override ? field(t('override_stale'), override, 'check') : null),
-      onlyStale ? h('p', { class: 'warn' }, t('override_stale_note')) : null,
-      !can ? h('p', { class: 'err' }, t('approve_blocked')) : null,
-      h('button', { id: 'ap-approve', disabled: !can, onclick: async ev => {
-        const b = { margin_pct: pnum(margin.value) };
+    // a typed margin that differs from the margin of the numbers shown must be priced first
+    const changed = h('div', { id: 'ap-margin-changed', class: 'warn', hidden: true }, t('approve_margin_changed'), ' ',
+      h('button', { class: 'small', id: 'ap-reprice', onclick: async ev => { ev.target.disabled = true; try { await repriceAt(margin.value); } catch (e) { fail(e); ev.target.disabled = false; } } }, t('approve_price_at_margin')));
+    const btn = h('button', { id: 'ap-approve', disabled: !can, onclick: async ev => {
+        const b = { margin_pct: p.margin_pct };
         if (override) b.override_stale = override.checked;
         ev.target.disabled = true;
         try { await api('POST', `tenders/${ctx.id}/approve`, b); flash(t('approved_ok'), 'ok'); rerender(); }
         catch (e) {
           fail(e); ev.target.disabled = false;
-          if (e.body && e.body.blocking) msg.replaceChildren(blockingList(ctx.id, { ...p, blocking: e.body.blocking }));
+          if (e.body && e.body.blocking) msg.replaceChildren(blockingList(ctx.id, { ...p, blocking: e.body.blocking }, 'approve-blocking'));
         }
-      } }, t('approve')), msg);
+      } }, t('approve'));
+    margin.addEventListener('input', () => {
+      const same = pnum(margin.value) === p.margin_pct;
+      changed.hidden = same;
+      btn.disabled = !can || !same;
+    });
+    return card(t('approve_title'),
+      h('div', { class: 'form-grid' }, field(t('margin_pct'), margin), override ? field(t('override_stale'), override, 'check') : null),
+      changed, onlyStale ? h('p', { class: 'warn' }, t('override_stale_note')) : null,
+      !can ? h('p', { class: 'err' }, t('approve_blocked')) : null, btn, msg);
   }
 
   function drawFrozen(box, { frozen: f }) {
@@ -672,7 +711,7 @@
       t('approved_by') + ': ' + (f.approved_by || '—') + ' · ' + (fmtTime(f.approved_at) || '') + ' · ' + t('snapshot_date') + ': ' + (fmtTime(f.snapshot_created) || '—') + ' · ' + t('margin_pct') + ': ' + pctTxt(f.margin_pct)),
     );
     if (f.override_stale) box.append(h('p', { class: 'warn' }, t('approved_on_stale')));
-    box.append(threeNumbers(f, false), card(t('waterfall'), waterfall(f), costTable(f)), ohCompare(f));
+    box.append(threeNumbers(f, 'complete'), card(t('waterfall'), waterfall(f), costTable(f)), ohCompare(f));
     const s = scheduleTable(f); if (s) box.append(s);
   }
 
@@ -842,7 +881,10 @@
     };
     draw();
     const clean = () => parts.map(p => {
-      if (p.kind === 'material') return { kind: 'material', material_id: p.material_id ?? null, qty: pnum(p.qty), waste_pct: pnum(p.waste_pct) ?? 0 };
+      if (p.kind === 'material') {
+        if (blank(p.waste_pct)) throw new Error(t('waste_required'));
+        return { kind: 'material', material_id: p.material_id ?? null, qty: pnum(p.qty), waste_pct: pnum(p.waste_pct) };
+      }
       if (p.kind === 'labour') return { kind: 'labour', output_per_day: pnum(p.output_per_day), crew: p.crewText.split(',').map(s => s.trim()).filter(Boolean).map(s => {
         const m = /^(.*?)\s*[:x×]\s*(\d+)$/.exec(s);
         return m ? { trade: m[1].trim(), count: Number(m[2]) } : { trade: s, count: 1 };
@@ -857,7 +899,9 @@
       h('h3', null, t('parts')), plist,
       item ? h('p', { class: 'muted small' }, t('new_version_note')) : null,
       h('div', { class: 'row' }, h('button', { id: 'it-save', onclick: async ev => {
-        const b = { code: code.value, section_id: Number(sec.value), uom: uom.value, name_en: en.value, name_ar: ar.value, rework_pct: pnum(rw.value), condition_factor: pnum(cf.value), parts: clean() };
+        let b;
+        try { b = { code: code.value, section_id: Number(sec.value), uom: uom.value, name_en: en.value, name_ar: ar.value, rework_pct: pnum(rw.value), condition_factor: pnum(cf.value), parts: clean() }; }
+        catch (e) { fail(e); return; }
         ev.target.disabled = true;
         try { await api(item ? 'PUT' : 'POST', item ? 'library/items/' + item.id : 'library/items', b); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
       } }, t('save')), h('button', { class: 'secondary', onclick: () => box.replaceChildren() }, t('cancel'))),
@@ -880,9 +924,10 @@
     page.append(card(t('general_settings'), h('div', { class: 'form-grid' }, Object.keys(labels).map(k => field(labels[k], ins[k], k === 'erp_db_path' ? 'wide' : ''))),
       h('div', { class: 'row' }, h('button', { id: 'set-save', onclick: async ev => {
         const b = {};
-        for (const k of Object.keys(labels)) b[k] = ins[k].value;
+        for (const k of Object.keys(labels)) if (ins[k].value !== String(s[k])) b[k] = ins[k].value;
+        if (!Object.keys(b).length) { flash(t('nothing_changed'), 'ok'); return; }
         ev.target.disabled = true;
-        try { await api('PUT', 'settings', b); flash(t('saved'), 'ok'); } catch (e) { fail(e); }
+        try { Object.assign(s, await api('PUT', 'settings', b)); flash(t('saved'), 'ok'); } catch (e) { fail(e); }
         ev.target.disabled = false;
       } }, t('save')), h('button', { class: 'secondary', onclick: ev => syncNow(ev.target) }, t('sync_now')))));
 

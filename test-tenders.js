@@ -423,10 +423,29 @@ server.listen(0, async () => {
       ['tender_rows', 'links'], ['takeoff_lines', 'create'], ['takeoff_lines', 'update'], ['takeoff_lines', 'delete'], ['tender_hidden', 'create'], ['tender_hidden', 'update'],
       ['tender_hidden', 'delete'], ['hidden_templates', 'create'], ['hidden_templates', 'update']])
       assert.ok(db.prepare('SELECT 1 FROM audit_log WHERE entity=? AND action=?').get(entity, action), `audited: ${entity} ${action}`);
+    // ---- reprice preview: priced on the latest snapshot, nothing saved (spec 7.8: show the difference before applying) ----
+    const boundSnap = (await call('GET', `tenders/${tid}`, null, qs)).j.snapshot_id;
+    const plainP = (await ok(call('GET', `tenders/${tid}/price`, null, qs), 'price before preview')).result.P;
+    const newer = addSnap({ ...SNAP, oh_monthly: 30000 });
+    const prev = await ok(call('GET', `tenders/${tid}/price?snapshot=latest`, null, qs), 'reprice preview');
+    assert.strictEqual(prev.snapshot_id, newer); assert.strictEqual(prev.newer_snapshot, false);
+    assert.strictEqual(prev.inputs.oh_monthly, 30000, 'preview uses the latest snapshot');
+    assert.strictEqual(prev.snapshot_created, db.prepare('SELECT created FROM snapshots WHERE id=?').get(newer).created);
+    assert.ok(prev.result.P > plainP, 'higher overhead, higher preview P');
+    assert.strictEqual((await call('GET', `tenders/${tid}`, null, qs)).j.snapshot_id, boundSnap, 'preview saves nothing');
+    const plainAfter = (await call('GET', `tenders/${tid}/price`, null, qs)).j;
+    assert.strictEqual(plainAfter.result.P, plainP); assert.strictEqual(plainAfter.snapshot_id, boundSnap); assert.strictEqual(plainAfter.newer_snapshot, true);
+    assert.ok(!db.prepare("SELECT 1 FROM audit_log WHERE entity='tenders' AND action='reprice' AND entity_id=?").get(String(tid)), 'preview is not a reprice');
+    for (const v of ['5', 'newest']) assert.strictEqual((await call('GET', `tenders/${tid}/price?snapshot=${v}`, null, qs)).s, 400, 'bad snapshot param ' + v);
+
     // ---- approved tender: exports come from the frozen result, never recomputed ----------------------------------
     const beforeX = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, qs)).b).BOQ;
     await ok(call('POST', `tenders/${tid}/submit`, null, qs), 'submit');
-    await ok(call('POST', `tenders/${tid}/approve`, { margin_pct: 15 }, admin), 'approve');
+    assert.strictEqual((await call('GET', `tenders/${tid}/price?snapshot=latest`, null, qs)).s, 409, 'reprice preview only for a draft');
+    const ap = await ok(call('POST', `tenders/${tid}/approve`, { margin_pct: 15 }, admin), 'approve');
+    // what-if params on a frozen tender: ignored, the frozen result comes back
+    const fr = await ok(call('GET', `tenders/${tid}/price?M=0&collection_days=-1`, null, qs), 'frozen price with what-if params');
+    assert.strictEqual(fr.frozen.P, ap.frozen.P); assert.ok(!('result' in fr));
     addSnap({ ...SNAP, oh_monthly: 99999 });
     db.prepare('UPDATE tender_rows SET qty=qty*2 WHERE tender_id=?').run(tid);
     db.prepare('UPDATE tender_hidden SET status=NULL WHERE tender_id=?').run(tid);

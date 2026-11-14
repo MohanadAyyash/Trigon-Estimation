@@ -298,11 +298,18 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const qM = url.searchParams.get('M'), qCd = url.searchParams.get('collection_days'), w = { ...t };
       if (qM !== null && qM !== '') w.M = intField(qM, 'M (duration in months)', 1);
       if (qCd !== null && qCd !== '') w.collection_days = nonNegField(qCd, 'collection_days', MAX_MONTHS * 30);
+      // reprice preview: priced on the latest snapshot without rebinding (spec 7.8: the difference is shown before applying)
+      const qS = url.searchParams.get('snapshot'), latest = latestId();
+      if (qS !== null && qS !== '') {
+        if (qS !== 'latest') bad("snapshot must be 'latest'");
+        if (t.status !== 'draft') conflict(`tender is ${t.status}: only a draft can be repriced`);
+        if (latest === null) bad('no cost snapshot yet');
+        w.snapshot_id = latest;
+      }
       const c = compute(w, margin);
       if (!c.result && !c.blocking.length) bad(c.error);
-      const latest = latestId();
-      return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: t.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
-        newer_snapshot: latest !== null && latest !== t.snapshot_id, margin_pct: c.margin, inputs: c.inputs, result: c.result, error: c.error,
+      return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: w.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
+        newer_snapshot: latest !== null && latest !== w.snapshot_id, margin_pct: c.margin, inputs: c.inputs, result: c.result, error: c.error,
         complete: c.complete, excluded_rows: c.excludedRows, unanswered_hidden: c.unansweredHidden,
         rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking });
     }
