@@ -254,6 +254,17 @@ server.listen(0, async () => {
     assert.strictEqual(what.margin_pct, 20); assert.ok(what.result.P > pr.result.P);
     for (const m of ['100', '-1', 'abc']) assert.strictEqual((await call('GET', `tenders/${tid}/price?margin_pct=${m}`, null, qs)).s, 400, 'bad what-if ' + m);
     assert.strictEqual((await call('GET', `tenders/${tid}/price`, null, qs)).j.margin_pct, 12, 'what-if is not saved');
+    // what-if on duration and collection days: priced with the overrides, nothing saved
+    const whatMC = await ok(call('GET', `tenders/${tid}/price?M=9&collection_days=120`, null, qs), 'what-if M/collection');
+    const expectMC = priceTender({ rows: [{ id: a1.id, qty: 1250.5, direct_unit: 0.6 * units[i1] + 0.4 * units[i2] }, { id: a2.id, qty: 300, direct_unit: 50 }, { id: tr, qty: 17, direct_unit: units[i1] }],
+      hidden: [{ kind: 'locked', amount: 20000, months: 6, bank_fee_pct: 1, loss_pct: 5 }, { kind: 'fixed', amount: 10000 }, { kind: 'pct', pct: 0.5 }],
+      M: 9, oh_monthly: 20000, w_monthly: 500000, finance_rate_pct: 8, margin_pct: 12, min_profit_pct: 5, adv_pct: 10, ret_pct: 10, collection_days: 120, retention_months: 12 });
+    assert.strictEqual(whatMC.inputs.M, 9); assert.strictEqual(whatMC.inputs.collection_days, 120);
+    near(whatMC.result.P, expectMC.P, 'what-if P');
+    for (const q of ['M=0', 'M=1.5', 'M=abc', 'collection_days=-1', 'collection_days=x']) assert.strictEqual((await call('GET', `tenders/${tid}/price?${q}`, null, qs)).s, 400, 'bad what-if ' + q);
+    const after = (await call('GET', `tenders/${tid}`, null, qs)).j;
+    assert.strictEqual(after.M, 6); assert.strictEqual(after.collection_days, 60);
+    near((await call('GET', `tenders/${tid}/price`, null, qs)).j.result.P, pr.result.P, 'what-if M/collection is not saved');
     await ok(call('PUT', `tenders/${tid}`, { margin_pct: 15 }, admin), 'admin sets margin');
     assert.strictEqual((await call('GET', `tenders/${tid}/price`, null, qs)).j.margin_pct, 15);
 

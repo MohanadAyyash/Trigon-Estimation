@@ -1,0 +1,932 @@
+// Trigon Estimation browser UI: hash routes, Arabic (RTL) / English. Plain JS, no libraries, works offline.
+// Every user / BOQ text goes into the DOM as text (h() appends text nodes), never as HTML.
+// Money is never computed here: the server prices; the UI only formats. A missing value shows "—", never 0.
+'use strict';
+(() => {
+  const I = window.I18N;
+  let lang = 'en';
+  try { if (localStorage.getItem('est_lang') === 'ar') lang = 'ar'; } catch (e) { /* storage blocked: English */ }
+  const t = (k, vars) => {
+    let s = (I[lang] && I[lang][k]) || I.en[k] || k;
+    if (vars) for (const v of Object.keys(vars)) s = s.split('{' + v + '}').join(String(vars[v]));
+    return s;
+  };
+
+  // ---- DOM helpers ------------------------------------------------------------------------------------------
+  const addKids = (e, kids) => { for (const k of kids.flat(Infinity)) if (k !== null && k !== undefined && k !== false) e.append(k instanceof Node ? k : String(k)); };
+  function h(tag, attrs, ...kids) {
+    const e = document.createElement(tag);
+    addKids(e, kids);
+    if (attrs) for (const [k, v] of Object.entries(attrs)) {
+      if (v === null || v === undefined || v === false || (k === 'id' && v === '')) continue;
+      if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+      else if (k === 'class') e.className = v;
+      else if (k === 'value') e.value = v;
+      else if (k === 'checked' || k === 'disabled') e[k] = true;
+      else e.setAttribute(k, v === true ? '' : v);
+    }
+    return e;
+  }
+  const $ = s => document.querySelector(s);
+  const pad = n => String(n).padStart(2, '0');
+  const iso = s => '\u2066' + s + '\u2069';   // left-to-right isolate: dates and percentages read correctly inside Arabic text
+  const fmtTime = s => { if (!s) return null; const d = new Date(s); return iso(isNaN(d) ? String(s) : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`); };
+  const fin = v => typeof v === 'number' && Number.isFinite(v);
+  const fmt2 = v => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtQ = v => fin(v) ? v.toLocaleString('en-US', { maximumFractionDigits: 3 }) : '';
+  const missing = reason => h('span', { class: 'missing', title: reason || null }, '—', reason ? h('small', null, ' ' + reason) : null);
+  const money = (v, reason) => fin(v) ? h('span', { class: 'num' }, fmt2(v)) : missing(reason || t('no_value'));
+  const pctTxt = v => fin(v) ? iso(v.toLocaleString('en-US', { maximumFractionDigits: 4 }) + ' %') : '—';
+  const nm = o => (lang === 'ar' ? o.name_ar || o.name_en : o.name_en || o.name_ar) || '';
+  const blank = s => s === null || s === undefined || String(s).trim() === '';
+  const val = e => blank(e.value) ? null : e.value.trim();
+  // a typed number for fields the server wants as JSON numbers; anything unparsable is sent as typed so the server explains
+  const pnum = s => { if (blank(s)) return null; const x = String(s).replace(/[,\s]/g, ''); return /^[-+]?(\d+\.?\d*|\.\d+)$/.test(x) ? Number(x) : String(s); };
+  const inp = (id, value, attrs) => h('input', { id, value: value === null || value === undefined ? '' : String(value), ...attrs });
+  const sel = (id, value, opts, attrs) => h('select', { id, ...attrs, value: value === null || value === undefined ? '' : String(value) }, opts.map(([v, l]) => h('option', { value: v }, l)));
+  const field = (label, control, cls) => h('label', { class: 'field ' + (cls || '') }, h('span', null, label), control);
+  const table = (heads, rows, attrs) => h('table', attrs, h('thead', null, h('tr', null, heads.map(x => h('th', null, x)))), h('tbody', null, rows));
+  const yesNo = v => v ? t('yes') : t('no');
+  const card = (title, ...kids) => h('section', { class: 'card' }, title ? h('h2', null, title) : null, kids);
+
+  function flash(msg, kind) {
+    const box = $('#flash');
+    if (!box) return;
+    const m = h('div', { class: 'flash ' + (kind || 'err') }, msg, h('button', { class: 'link', onclick: () => m.remove() }, '×'));
+    box.append(m);
+    if (kind === 'ok') setTimeout(() => m.remove(), 3000);
+  }
+  const fail = e => flash(t('error') + ': ' + (e && e.message || e));
+
+  // ---- API ------------------------------------------------------------------------------------------------
+  let me = null;
+  async function api(method, path, body) {
+    const r = await fetch('/api/' + path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+    let j = null;
+    try { j = await r.json(); } catch (e) { j = null; }
+    if (r.status === 401 && me && path !== 'login') { me = null; renderLogin(); }
+    if (!r.ok) throw Object.assign(new Error((j && j.error) || r.statusText || String(r.status)), { status: r.status, body: j });
+    return j;
+  }
+  const isAdmin = () => me && me.role === 'admin';
+  const canWrite = () => me && (me.role === 'admin' || me.role === 'qs');
+
+  // ---- labels (literal keys only) ---------------------------------------------------------------------------
+  const STATUSES = ['draft', 'submitted', 'approved', 'sent', 'won', 'lost'];
+  const FROZEN = ['approved', 'sent', 'won', 'lost'];
+  const statusLabel = s => ({ draft: t('st_draft'), submitted: t('st_submitted'), approved: t('st_approved'), sent: t('st_sent'), won: t('st_won'), lost: t('st_lost') })[s] || s;
+  const kindLabel = k => ({ rta: t('kind_rta'), direct: t('kind_direct') })[k] || k;
+  const hiddenKindLabel = k => ({ fixed: t('hk_fixed'), monthly: t('hk_monthly'), pct: t('hk_pct'), locked: t('hk_locked') })[k] || k;
+  const partKindLabel = k => ({ material: t('pk_material'), labour: t('pk_labour'), equipment: t('pk_equipment'), sub: t('pk_sub'), fixed: t('pk_fixed') })[k] || k;
+  const roleLabel = r => ({ admin: t('role_admin'), qs: t('role_qs'), viewer: t('role_viewer') })[r] || r;
+  const catKindLabel = k => ({ overhead: t('ck_overhead'), labour_oncost: t('ck_labour_oncost'), equipment: t('ck_equipment'), project: t('ck_project'), ignore: t('ck_ignore') })[k] || k;
+  const blockLabel = c => ({ no_snapshot: t('blk_no_snapshot'), snapshot_stale: t('blk_snapshot_stale'), overhead_missing: t('blk_overhead_missing'), row_unlinked: t('blk_row_unlinked'),
+    row_unpriced: t('blk_row_unpriced'), row_zero_qty: t('blk_row_zero_qty'), material_stale: t('blk_material_stale'), hidden_unanswered: t('blk_hidden_unanswered') })[c] || c;
+  const badge = s => h('span', { class: 'badge st-' + s }, statusLabel(s));
+
+  // ---- language -----------------------------------------------------------------------------------------------
+  function applyLang() {
+    document.documentElement.lang = lang;
+    document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+    document.title = t('app_title');
+  }
+  function toggleLang() {
+    lang = lang === 'ar' ? 'en' : 'ar';
+    try { localStorage.setItem('est_lang', lang); } catch (e) { /* not saved: still switches for this page */ }
+    applyLang();
+    if (me) { renderShell(); route(); } else renderLogin();
+  }
+  const langButton = () => h('button', { id: 'lang-toggle', class: 'secondary', onclick: toggleLang }, lang === 'ar' ? 'English' : 'العربية');
+
+  // ---- login / first setup -------------------------------------------------------------------------------------
+  let setupMode = false;
+  function renderLogin() {
+    const root = $('#root');
+    const u = inp(setupMode ? 'setup-username' : 'login-username', '', { autocomplete: 'username', required: true });
+    const p = inp(setupMode ? 'setup-password' : 'login-password', '', { type: 'password', autocomplete: setupMode ? 'new-password' : 'current-password', required: true });
+    const msg = h('p', { class: 'err' });
+    const form = h('form', { class: 'card login', onsubmit: async ev => {
+      ev.preventDefault(); msg.textContent = '';
+      try {
+        await api('POST', setupMode ? 'setup' : 'login', { username: u.value, password: p.value });
+        await boot();
+      } catch (e) { msg.textContent = e.status === 401 ? t('bad_login') : e.message; }
+    } },
+    h('h1', null, t('app_title')),
+    setupMode ? h('p', null, t('setup_intro')) : null,
+    field(t('username'), u), field(t('password'), p), msg,
+    h('div', { class: 'row' }, h('button', { id: setupMode ? 'setup-submit' : 'login-submit', type: 'submit' }, setupMode ? t('create_admin') : t('login')), langButton()));
+    root.replaceChildren(h('div', { class: 'login-wrap' }, form));
+    u.focus();
+  }
+
+  // ---- shell -------------------------------------------------------------------------------------------------
+  function renderShell() {
+    const nav = [['#/', t('nav_tenders')], ['#/costs', t('nav_costs')], ['#/library', t('nav_library')]];
+    if (isAdmin()) nav.push(['#/settings', t('nav_settings')]);
+    $('#root').replaceChildren(
+      h('header', { class: 'topbar' }, h('strong', null, t('app_title')), h('span', { class: 'spacer' }),
+        h('span', { class: 'who' }, me.username + ' · ' + roleLabel(me.role)), langButton(),
+        h('button', { class: 'secondary', onclick: async () => { try { await api('POST', 'logout'); } catch (e) { /* signed out anyway */ } me = null; boot(); } }, t('logout'))),
+      h('div', { id: 'sync-banner' }),
+      h('div', { class: 'layout' },
+        h('nav', { class: 'sidebar' }, nav.map(([href, l]) => h('a', { href, 'data-nav': href }, l))),
+        h('main', null, h('div', { id: 'flash' }), h('div', { id: 'main' }))));
+  }
+
+  async function syncBanner() {
+    let st;
+    try { st = await api('GET', 'costs/status'); } catch (e) { return null; }
+    const box = $('#sync-banner');
+    if (box) {
+      box.replaceChildren();
+      if (st.stale || st.last_error) box.append(h('div', { class: 'banner banner-red' },
+        h('strong', null, st.last_error ? t('sync_failed') : t('costs_stale')), ' ',
+        t('last_good_sync') + ': ' + (fmtTime(st.last_ok) || t('never')),
+        st.last_error ? h('div', { class: 'small' }, st.last_error) : null));
+    }
+    return st;
+  }
+  async function syncNow(btn) {
+    btn.disabled = true;
+    try { await api('POST', 'costs/sync'); flash(t('sync_done'), 'ok'); } catch (e) { fail(e); }
+    btn.disabled = false;
+    route();
+  }
+
+  // ---- router -------------------------------------------------------------------------------------------------
+  let routeTok = 0;
+  async function route(navigated) {
+    if (!me) return;
+    const tok = ++routeTok;
+    const p = location.hash.replace(/^#\/?/, '').split('?')[0].split('/').filter(Boolean);
+    for (const a of document.querySelectorAll('nav.sidebar a')) a.classList.toggle('active', a.getAttribute('data-nav') === '#/' + (p[0] === 'tender' ? '' : (p[0] || '')));
+    const main = $('#main'), out = h('div');
+    main.replaceChildren(h('p', { class: 'muted' }, t('loading')));
+    if (navigated) $('#flash').replaceChildren();
+    const st = await syncBanner();
+    try {
+      if (!p.length) await pageHome(out, st);
+      else if (p[0] === 'costs') await pageCosts(out, st);
+      else if (p[0] === 'library') await pageLibrary(out, st);
+      else if (p[0] === 'settings' && isAdmin()) await pageSettings(out, st);
+      else if (p[0] === 'tender' && /^\d+$/.test(p[1] || '')) await pageTender(out, Number(p[1]), p[2] || 'info', p[3] ? Number(p[3]) : null);
+      else out.append(h('p', null, t('not_found')));
+    } catch (e) {
+      if (!me) return;
+      out.replaceChildren(h('div', { class: 'banner banner-red' }, t('error') + ': ' + e.message));
+    }
+    if (tok === routeTok) main.replaceChildren(out);
+    const target = p[0] === 'tender' && p[3] ? document.getElementById((p[2] === 'hidden' ? 'hidden-' : 'row-') + p[3]) : null;
+    if (target) target.scrollIntoView({ block: 'center' });
+  }
+  const rerender = () => route(false);
+
+  // ---- home: tenders by status, sync status, new tender -------------------------------------------------------------
+  async function pageHome(out, st) {
+    const list = await api('GET', 'tenders');
+    const page = h('div', { id: 'page-home' });
+    page.append(card(t('sync_status'),
+      h('dl', { class: 'kv' },
+        h('dt', null, t('last_good_sync')), h('dd', null, fmtTime(st && st.last_ok) || t('never')),
+        h('dt', null, t('last_attempt')), h('dd', null, fmtTime(st && st.last_attempt) || '—'),
+        h('dt', null, t('sync_state')), h('dd', null, !st ? '—' : st.last_error ? t('sync_failed') : st.stale ? t('costs_stale') : t('sync_ok'))),
+      st && st.last_error ? h('p', { class: 'err' }, st.last_error) : null,
+      isAdmin() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));
+
+    const head = h('div', { class: 'row' }, h('h1', null, t('nav_tenders')), h('span', { class: 'spacer' }));
+    page.append(head);
+    if (canWrite()) {
+      const formBox = h('div');
+      head.append(h('button', { id: 'new-tender', onclick: () => { formBox.replaceChildren(newTenderForm()); } }, t('new_tender')));
+      page.append(formBox);
+    }
+    for (const s of STATUSES) {
+      const rows = list.filter(x => x.status === s);
+      page.append(h('section', { class: 'card' }, h('h2', null, badge(s), ' ', h('span', { class: 'muted' }, '(' + rows.length + ')')),
+        rows.length ? table([t('ref'), t('title'), t('client'), t('kind'), t('rev'), t('created'), t('approved_price')],
+          rows.map(x => h('tr', null, h('td', null, x.ref || ''), h('td', null, h('a', { href: '#/tender/' + x.id + '/info' }, x.title)), h('td', null, x.client || ''),
+            h('td', null, kindLabel(x.kind)), h('td', { class: 'num' }, x.rev), h('td', null, fmtTime(x.created)), h('td', { class: 'num' }, fin(x.approved_P) ? fmt2(x.approved_P) : '—'))), { class: 'grid' })
+          : h('p', { class: 'muted' }, t('none'))));
+    }
+    out.append(page);
+  }
+
+  function infoFields(prefix, v, editable) {
+    const dis = editable ? {} : { disabled: true };
+    const f = {
+      title: inp(prefix + 'title', v.title, { required: true, ...dis }), ref: inp(prefix + 'ref', v.ref, dis), client: inp(prefix + 'client', v.client, dis),
+      kind: sel(prefix + 'kind', v.kind || 'direct', [['direct', t('kind_direct')], ['rta', t('kind_rta')]], dis),
+      M: inp(prefix + 'M', v.M, { inputmode: 'numeric', ...dis }), adv_pct: inp(prefix + 'adv', v.adv_pct, { inputmode: 'decimal', ...dis }),
+      ret_pct: inp(prefix + 'ret', v.ret_pct, { inputmode: 'decimal', ...dis }), collection_days: inp(prefix + 'cd', v.collection_days, { inputmode: 'decimal', ...dis }),
+      retention_months: inp(prefix + 'retm', v.retention_months, { inputmode: 'numeric', ...dis }), submit_date: inp(prefix + 'date', v.submit_date, { type: 'date', ...dis }),
+    };
+    const grid = h('div', { class: 'form-grid' },
+      field(t('title'), f.title), field(t('ref'), f.ref), field(t('client'), f.client), field(t('kind'), f.kind),
+      field(t('duration_months'), f.M), field(t('adv_pct'), f.adv_pct), field(t('ret_pct'), f.ret_pct), field(t('collection_days'), f.collection_days),
+      field(t('retention_months'), f.retention_months), field(t('submit_date'), f.submit_date));
+    const values = () => Object.fromEntries(Object.entries(f).map(([k, e]) => [k, k === 'kind' ? e.value : val(e)]));
+    return { grid, f, values };
+  }
+  function newTenderForm() {
+    const x = infoFields('nt-', {}, true);
+    return card(t('new_tender'), x.grid, h('div', { class: 'row' },
+      h('button', { id: 'nt-save', onclick: async ev => {
+        ev.target.disabled = true;
+        try { const r = await api('POST', 'tenders', x.values()); location.hash = '#/tender/' + r.id + '/info'; }
+        catch (e) { fail(e); ev.target.disabled = false; }
+      } }, t('create'))));
+  }
+
+  // ---- tender ----------------------------------------------------------------------------------------------------
+  const repriced = new Map();   // tender id -> last reprice result, shown once on the page
+  async function pageTender(out, id, tab, focusId) {
+    const T = await api('GET', 'tenders/' + id);
+    let price = null, priceErr = null;
+    try { price = await api('GET', `tenders/${id}/price`); } catch (e) { priceErr = e.message; }
+    const frozen = price && price.frozen ? price.frozen : null;
+    const editable = canWrite() && T.status === 'draft';
+    const page = h('div', { id: 'page-tender' });
+
+    // header
+    page.append(h('div', { class: 'tender-head' },
+      h('h1', null, T.title, ' ', badge(T.status)),
+      h('div', { class: 'muted' }, [T.ref ? t('ref') + ': ' + T.ref : null, t('rev') + ' ' + T.rev, T.client, kindLabel(T.kind)].filter(Boolean).join(' · ')),
+      h('div', { class: 'row wrap' }, workflowButtons(T), exportLinks(T, price))));
+
+    // newer costs (yellow): never applied silently; reprice shows old vs new
+    const rp = repriced.get(id);
+    if (rp) {
+      repriced.delete(id);
+      page.append(h('div', { class: 'banner banner-info', id: 'reprice-result' }, h('strong', null, t('repriced')), ' ',
+        t('old_price') + ': ', rp.old_P === null ? '—' : fmt2(rp.old_P), ' (' + (rp.old_complete ? t('complete') : t('partial')) + ') → ',
+        t('new_price') + ': ', rp.new_P === null ? '—' : fmt2(rp.new_P), ' (' + (rp.new_complete ? t('complete') : t('partial')) + ')'));
+    }
+    if (price && price.newer_snapshot) {
+      page.append(h('div', { class: 'banner banner-yellow', id: 'newer-banner' },
+        t('newer_costs', { date: fmtTime(price.snapshot_created) || '—' }), ' ',
+        editable ? h('button', { id: 'reprice', onclick: async ev => {
+          if (!confirm(t('reprice_confirm'))) return;
+          ev.target.disabled = true;
+          try { repriced.set(id, await api('POST', `tenders/${id}/reprice`)); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+        } }, t('reprice')) : null));
+    }
+
+    const tabs = [['info', t('tab_info')], ['quantities', t('tab_quantities')], ['links', t('tab_links')], ['hidden', t('tab_hidden')], ['summary', t('tab_summary')]];
+    if (!tabs.some(x => x[0] === tab)) tab = 'info';
+    page.append(h('div', { class: 'tabs' }, tabs.map(([k, l]) => h('a', { id: 'tab-' + k, href: `#/tender/${id}/${k}`, class: k === tab ? 'active' : null }, l))));
+    const body = h('div', { id: 'tab-body-' + tab, class: 'tab-body' });
+    page.append(body);
+    const ctx = { T, id, price, priceErr, frozen, editable, focusId };
+    if (tab === 'info') tabInfo(body, ctx);
+    else if (tab === 'quantities') await tabQuantities(body, ctx);
+    else if (tab === 'links') await tabLinks(body, ctx);
+    else if (tab === 'hidden') await tabHidden(body, ctx);
+    else tabSummary(body, ctx);
+    out.append(page);
+  }
+
+  function workflowButtons(T) {
+    const go = (path, body, then) => async ev => {
+      ev.target.disabled = true;
+      try { const r = await api('POST', `tenders/${T.id}/${path}`, body); if (then) then(r); else rerender(); }
+      catch (e) { fail(e); ev.target.disabled = false; }
+    };
+    const b = [];
+    if (canWrite() && T.status === 'draft') b.push(h('button', { id: 'wf-submit', onclick: go('submit') }, t('submit_for_approval')));
+    if (isAdmin() && T.status === 'submitted') b.push(h('button', { class: 'secondary', id: 'wf-return', onclick: go('return') }, t('return_to_draft')));
+    if (canWrite() && T.status === 'approved') b.push(h('button', { id: 'wf-send', onclick: go('send') }, t('mark_sent')));
+    if (canWrite() && ['approved', 'sent'].includes(T.status)) b.push(h('button', { class: 'secondary', onclick: go('revise', null, r => { location.hash = '#/tender/' + r.id + '/info'; }) }, t('revise')));
+    if (canWrite() && T.status === 'sent') {
+      const res = sel('res-result', 'won', [['won', t('st_won')], ['lost', t('st_lost')]]), wp = inp('res-winner', '', { placeholder: t('winner_price'), inputmode: 'decimal' });
+      b.push(h('span', { class: 'row' }, res, wp, h('button', { onclick: async ev => {
+        ev.target.disabled = true;
+        const body = { result: res.value };
+        if (res.value === 'lost' && !blank(wp.value)) body.winner_price = wp.value.trim();
+        try { await api('PUT', `tenders/${T.id}/result`, body); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+      } }, t('record_result'))));
+    }
+    if (T.result) b.push(h('span', null, t('result') + ': ' + statusLabel(T.result) + (fin(T.winner_price) ? ' · ' + t('winner_price') + ' ' + fmt2(T.winner_price) : '')));
+    if (canWrite() && T.status === 'draft') b.push(h('button', { class: 'danger', onclick: async ev => {
+      if (!confirm(t('delete_tender_confirm'))) return;
+      ev.target.disabled = true;
+      try { await api('DELETE', 'tenders/' + T.id); location.hash = '#/'; } catch (e) { fail(e); ev.target.disabled = false; }
+    } }, t('delete')));
+    return b;
+  }
+
+  function exportLinks(T, price) {
+    const ready = price && (price.frozen || (price.result && price.complete && !price.blocking.length));
+    const a = (kind, format, label) => h('a', { class: 'button secondary', href: `/api/tenders/${T.id}/export?format=${format}&kind=${kind}`, download: true }, label);
+    const out = [h('span', { class: 'muted' }, t('export') + ':')];
+    if (ready) out.push(a('client', 'xlsx', t('export_client_xlsx')), a('client', 'csv', t('export_client_csv')));
+    else out.push(h('span', { class: 'button secondary disabled', title: t('export_client_blocked') }, t('export_client_xlsx')));
+    if (canWrite()) out.push(a('internal', 'xlsx', t('export_internal_xlsx')), a('internal', 'csv', t('export_internal_csv')));
+    return h('span', { class: 'row wrap' }, out);
+  }
+
+  // ---- tab: info ----
+  function tabInfo(body, { T, editable }) {
+    const x = infoFields('ti-', T, editable);
+    const margin = inp('ti-margin', T.margin_pct, { inputmode: 'decimal', disabled: !(editable && isAdmin()) });
+    if (isAdmin()) x.grid.append(field(t('margin_pct'), margin));
+    else x.grid.append(field(t('margin_pct'), h('span', null, fin(T.margin_pct) ? pctTxt(T.margin_pct) : t('margin_default'))));
+    body.append(card(t('tab_info'), x.grid,
+      editable ? h('button', { id: 'ti-save', onclick: async ev => {
+        const b = x.values();
+        if (isAdmin()) b.margin_pct = val(margin);
+        ev.target.disabled = true;
+        try { await api('PUT', 'tenders/' + T.id, b); flash(t('saved'), 'ok'); } catch (e) { fail(e); }
+        ev.target.disabled = false;
+      } }, t('save')) : h('p', { class: 'muted' }, T.status === 'draft' ? t('read_only') : t('only_draft_editable'))),
+    card(null, h('dl', { class: 'kv' },
+      h('dt', null, t('created')), h('dd', null, (fmtTime(T.created) || '') + (T.created_by ? ' · ' + T.created_by : '')),
+      h('dt', null, t('approved_by')), h('dd', null, T.approved_by ? T.approved_by + ' · ' + fmtTime(T.approved_at) : '—'),
+      h('dt', null, t('approved_price')), h('dd', null, fin(T.approved_P) ? fmt2(T.approved_P) : '—'))));
+  }
+
+  // ---- tab: quantities (import + take-off) ----
+  const colName = i => { let s = ''; for (let n = i + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s; return s; };
+  async function tabQuantities(body, { T, id, editable }) {
+    const rows = await api('GET', `tenders/${id}/rows`);
+    if (editable) body.append(importPanel(id, rows.some(r => r.source === 'import')));
+
+    const tb = [];
+    for (const r of rows) {
+      const isTake = r.source === 'takeoff';
+      const qtyCell = r.is_heading ? h('span', { class: 'tag' }, t('heading'))
+        : editable && !isTake ? (() => {
+          const q = inp('', r.qty, { class: 'w-num', inputmode: 'decimal' });
+          return h('span', { class: 'row' }, q, h('button', { class: 'small', onclick: async () => {
+            try { await api('PUT', `tenders/${id}/rows/${r.id}`, { qty: q.value }); rerender(); } catch (e) { fail(e); }
+          } }, t('save')));
+        })() : h('span', { class: 'num' }, fmtQ(r.qty));
+      tb.push(h('tr', { id: 'row-' + r.id, class: r.is_heading ? 'heading' : null },
+        h('td', null, r.no || ''), h('td', { class: 'desc' }, r.description || ''), h('td', null, r.unit || ''), h('td', { class: 'num' }, qtyCell),
+        h('td', null, isTake ? t('src_takeoff') : t('src_import')),
+        h('td', null, editable ? h('button', { class: 'small danger', onclick: async () => {
+          if (!confirm(t('delete_row_confirm'))) return;
+          try { await api('DELETE', `tenders/${id}/rows/${r.id}`); rerender(); } catch (e) { fail(e); }
+        } }, t('delete')) : null)));
+      if (isTake && !r.is_heading) tb.push(h('tr', { class: 'lines-row' }, h('td'), h('td', { colspan: 5 }, takeoffLines(id, r, editable))));
+    }
+    body.append(card(t('boq_rows'), h('p', { class: 'muted small' }, t('heading_hint')),
+      rows.length ? table([t('no'), t('description'), t('unit'), t('qty'), t('source'), ''], tb, { class: 'grid boq' }) : h('p', { class: 'muted' }, t('no_rows'))));
+
+    if (editable) {
+      const no = inp('to-no', ''), desc = inp('to-desc', ''), unit = inp('to-unit', ''), head = h('input', { type: 'checkbox', id: 'to-heading' });
+      body.append(card(t('add_takeoff_row'), h('div', { class: 'form-grid' }, field(t('no'), no), field(t('description'), desc), field(t('unit'), unit), field(t('is_heading'), head, 'check')),
+        h('button', { onclick: async () => {
+          try { await api('POST', `tenders/${id}/rows`, { no: no.value, description: desc.value, unit: unit.value, is_heading: head.checked }); rerender(); } catch (e) { fail(e); }
+        } }, t('add'))));
+    }
+  }
+
+  function takeoffLines(id, r, editable) {
+    const lineInputs = l => ({ description: inp('', l.description, { class: 'w-desc' }), l: inp('', l.l, { class: 'w-num', inputmode: 'decimal' }), w: inp('', l.w, { class: 'w-num', inputmode: 'decimal' }),
+      d: inp('', l.d, { class: 'w-num', inputmode: 'decimal' }), count: inp('', l.count, { class: 'w-num', inputmode: 'decimal' }), deduct: h('input', { type: 'checkbox', checked: !!l.deduct }) });
+    const bodyOf = f => ({ description: f.description.value, l: val(f.l), w: val(f.w), d: val(f.d), count: val(f.count), deduct: f.deduct.checked });
+    const rowsOut = r.lines.map(l => {
+      if (!editable) return h('tr', null, h('td', null, l.description || ''), [l.l, l.w, l.d, l.count].map(x => h('td', { class: 'num' }, fmtQ(x))), h('td', null, l.deduct ? t('deduct') : ''), h('td'));
+      const f = lineInputs(l);
+      return h('tr', null, h('td', null, f.description), h('td', null, f.l), h('td', null, f.w), h('td', null, f.d), h('td', null, f.count), h('td', null, f.deduct),
+        h('td', null, h('button', { class: 'small', onclick: async () => { try { await api('PUT', `tenders/${id}/rows/${r.id}/lines/${l.id}`, bodyOf(f)); rerender(); } catch (e) { fail(e); } } }, t('save')),
+          h('button', { class: 'small danger', onclick: async () => { try { await api('DELETE', `tenders/${id}/rows/${r.id}/lines/${l.id}`); rerender(); } catch (e) { fail(e); } } }, '×')));
+    });
+    if (editable) {
+      const f = lineInputs({});
+      rowsOut.push(h('tr', { class: 'new' }, h('td', null, f.description), h('td', null, f.l), h('td', null, f.w), h('td', null, f.d), h('td', null, f.count), h('td', null, f.deduct),
+        h('td', null, h('button', { class: 'small', onclick: async () => { try { await api('POST', `tenders/${id}/rows/${r.id}/lines`, bodyOf(f)); rerender(); } catch (e) { fail(e); } } }, t('add_line')))));
+    }
+    return h('div', null, h('div', { class: 'small muted' }, t('takeoff_lines') + ' — ' + t('takeoff_hint')),
+      table([t('description'), t('len'), t('width'), t('depth'), t('count'), t('deduct'), ''], rowsOut, { class: 'grid lines' }));
+  }
+
+  function importPanel(id, hasImport) {
+    const box = h('div');
+    const file = h('input', { type: 'file', id: 'imp-file', accept: '.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    let b64 = null, sheets = [];
+    const showPreview = () => {
+      const sheetSel = sel('imp-sheet', sheets[0].name, sheets.map(s => [s.name, `${s.name} (${s.row_count})`]));
+      const hdr = inp('imp-header', '1', { class: 'w-num', inputmode: 'numeric' });
+      const cNo = inp('imp-col-no', 'A', { class: 'w-col' }), cDesc = inp('imp-col-desc', 'B', { class: 'w-col' }), cUnit = inp('imp-col-unit', 'C', { class: 'w-col' }), cQty = inp('imp-col-qty', 'D', { class: 'w-col' });
+      const prev = h('div', { class: 'scroll' });
+      const draw = () => {
+        const s = sheets.find(x => x.name === sheetSel.value) || sheets[0];
+        const width = Math.max(1, ...s.rows.map(r => r.length));
+        prev.replaceChildren(table(['#', ...Array.from({ length: width }, (_, i) => colName(i))],
+          s.rows.map((r, i) => h('tr', null, h('td', { class: 'muted' }, i + 1), Array.from({ length: width }, (_, j) => h('td', null, r[j] === null || r[j] === undefined ? '' : String(r[j]))))), { class: 'grid preview' }));
+      };
+      sheetSel.addEventListener('change', draw);
+      draw();
+      box.replaceChildren(
+        h('div', { class: 'form-grid' }, field(t('sheet'), sheetSel), field(t('header_row'), hdr), field(t('col_no'), cNo), field(t('col_desc'), cDesc), field(t('col_unit'), cUnit), field(t('col_qty'), cQty)),
+        h('p', { class: 'muted small' }, t('import_hint')), hasImport ? h('p', { class: 'warn' }, t('import_replaces')) : null,
+        h('button', { id: 'imp-go', onclick: async ev => {
+          const n = Number(hdr.value);
+          ev.target.disabled = true;
+          try {
+            const r = await api('POST', `tenders/${id}/import`, { file_b64: b64, sheet: sheetSel.value, header_row: Number.isInteger(n) ? n : hdr.value, cols: { no: val(cNo), desc: val(cDesc), unit: val(cUnit), qty: val(cQty) } });
+            flash(t('imported', { n: r.rows }) + (r.links_removed ? ' ' + t('links_removed', { n: r.links_removed }) : ''), r.links_removed ? 'warn' : 'ok');
+            rerender();
+          } catch (e) { fail(e); ev.target.disabled = false; }
+        } }, t('import')),
+        h('p', { class: 'muted small' }, t('preview_first_rows')), prev);
+    };
+    file.addEventListener('change', () => {
+      const f = file.files && file.files[0];
+      if (!f) return;
+      const rd = new FileReader();
+      rd.onload = async () => {
+        b64 = String(rd.result).replace(/^data:[^,]*,/, '');
+        try { sheets = (await api('POST', `tenders/${id}/import/preview`, { file_b64: b64 })).sheets; if (!sheets.length) throw new Error(t('no_sheets')); showPreview(); }
+        catch (e) { fail(e); }
+      };
+      rd.onerror = () => fail(t('file_read_error'));
+      rd.readAsDataURL(f);
+    });
+    return card(t('import_boq'), field(t('xlsx_file'), file), box);
+  }
+
+  // ---- tab: links (rows -> library items, manual unit rates, cost breakdown) ----
+  async function tabLinks(body, { id, price, frozen, editable, focusId }) {
+    const [rows, items] = await Promise.all([api('GET', `tenders/${id}/rows`), editable ? api('GET', 'library/items') : Promise.resolve([])]);
+    const pRows = new Map(((frozen ? frozen.rows : price && price.rows) || []).map(r => [r.id, r]));
+    const itemOpts = [['', '—'], ...items.map(i => [String(i.id), `${i.code} — ${nm(i)} (${i.uom})`])];
+    const list = rows.filter(r => !r.is_heading);
+    if (!list.length) { body.append(card(t('tab_links'), h('p', { class: 'muted' }, t('no_priced_rows')))); return; }
+    body.append(h('p', { class: 'muted small' }, t('links_hint')));
+    for (const r of list) {
+      const pr = pRows.get(r.id);
+      let state;
+      if (r.manual_unit !== null) state = h('span', { class: 'tag' }, t('manual_rate'));
+      else if (!r.links.length) state = h('span', { class: 'tag bad' }, t('blk_row_unlinked'));
+      else if (pr && pr.direct_unit === null) state = h('span', { class: 'tag bad' }, t('blk_row_unpriced'));
+      else state = h('span', { class: 'tag good' }, t('linked'));
+      const breakdown = pr && pr.links.length ? table([t('item'), t('share'), t('unit_cost'), t('parts')], pr.links.map(l => h('tr', null,
+        h('td', null, l.code + ' — ' + nm(l) + (l.version ? ' (v' + l.version + ')' : '')), h('td', { class: 'num' }, fmtQ(l.share)),
+        h('td', { class: 'num' }, money(l.unit, l.missing && l.missing.length ? t('missing') + ': ' + l.missing.join(', ') : null)),
+        h('td', null, l.parts.map(p => h('div', { class: 'part' }, partKindLabel(p.kind) + ': ', p.hidden ? h('span', { class: 'missing' }, '— ', h('small', null, t('hidden_part'))) : money(p.cost)))))), { class: 'grid inner' }) : null;
+
+      let editor = null;
+      if (editable) {
+        const lines = r.links.map(l => ({ item_id: l.item_id, share: l.share }));
+        const lbox = h('div');
+        const draw = () => {
+          lbox.replaceChildren(...lines.map((l, i) => {
+            const s = sel('', l.item_id === null ? '' : String(l.item_id), itemOpts, { class: 'w-item', onchange: ev => { l.item_id = ev.target.value ? Number(ev.target.value) : null; } });
+            const sh = inp('', l.share, { class: 'w-num', inputmode: 'decimal', onchange: ev => { l.share = pnum(ev.target.value); } });
+            return h('div', { class: 'row' }, s, h('span', { class: 'muted' }, t('share')), sh, h('button', { class: 'small danger', onclick: () => { lines.splice(i, 1); draw(); } }, '×'));
+          }), h('button', { class: 'small secondary', onclick: () => { lines.push({ item_id: null, share: lines.length ? null : 1 }); draw(); } }, t('add_link')));
+        };
+        draw();
+        const mu = inp('', r.manual_unit, { class: 'w-num', inputmode: 'decimal' });
+        editor = h('div', { class: 'editor' },
+          h('div', null, h('strong', null, t('links')), lbox, h('button', { onclick: async () => {
+            try { await api('PUT', `tenders/${id}/rows/${r.id}/links`, { links: lines.filter(l => l.item_id !== null).map(l => ({ item_id: l.item_id, share: l.share })) }); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); }
+          } }, t('save_links'))),
+          h('div', null, h('strong', null, t('manual_unit')), h('div', { class: 'row' }, mu, h('button', { class: 'small', onclick: async () => {
+            try { await api('PUT', `tenders/${id}/rows/${r.id}`, { manual_unit: val(mu) }); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); }
+          } }, t('save'))), h('div', { class: 'muted small' }, t('manual_unit_hint'))));
+      }
+      body.append(h('section', { class: 'card link-card' + (focusId === r.id ? ' focus' : ''), id: 'row-' + r.id },
+        h('div', { class: 'row wrap' }, h('strong', null, (r.no ? r.no + ' ' : '') + (r.description || '')), h('span', { class: 'muted' }, fmtQ(r.qty) + ' ' + (r.unit || '')), state,
+          h('span', { class: 'spacer' }), h('span', null, t('direct_unit') + ': ', pr ? money(pr.direct_unit, pr.direct_unit === null ? t('not_priced') : null) : '—'),
+          h('span', null, t('rate') + ': ', pr ? money(pr.rate, t('no_tender_price')) : '—')),
+        r.qty === 0 ? h('p', { class: 'warn' }, t('blk_row_zero_qty')) : null,
+        breakdown, editor));
+    }
+  }
+
+  // ---- tab: hidden items ----
+  async function tabHidden(body, { id, editable, focusId }) {
+    const list = await api('GET', `tenders/${id}/hidden`);
+    const FIELDS = { fixed: ['amount'], monthly: ['amount'], pct: ['pct'], locked: ['amount', 'months', 'bank_fee_pct', 'loss_pct'] };
+    const rows = list.map(x => {
+      const st = sel('', x.status || '', [['', t('hs_unanswered')], ['applies', t('hs_applies')], ['na', t('hs_na')], ['included', t('hs_included')]], { disabled: !editable });
+      const f = {};
+      for (const k of ['amount', 'pct', 'months', 'bank_fee_pct', 'loss_pct']) f[k] = FIELDS[x.kind].includes(k) ? inp('', x[k], { class: 'w-sm', inputmode: 'decimal', disabled: !editable }) : h('span', { class: 'muted' }, '');
+      const note = inp('', x.note, { class: 'w-note', disabled: !editable });
+      return h('tr', { id: 'hidden-' + x.id, class: (x.status === null ? 'unanswered' : '') + (focusId === x.id ? ' focus' : '') },
+        h('td', null, nm(x)), h('td', null, hiddenKindLabel(x.kind)), h('td', null, st),
+        ['amount', 'pct', 'months', 'bank_fee_pct', 'loss_pct'].map(k => h('td', null, f[k])), h('td', null, note),
+        h('td', null, editable ? [h('button', { class: 'small', onclick: async () => {
+          const b = { status: st.value || null, note: note.value };
+          for (const k of FIELDS[x.kind]) b[k] = val(f[k]);
+          try { await api('PUT', `tenders/${id}/hidden/${x.id}`, b); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); }
+        } }, t('save')), x.template_id === null ? h('button', { class: 'small danger', onclick: async () => {
+          try { await api('DELETE', `tenders/${id}/hidden/${x.id}`); rerender(); } catch (e) { fail(e); }
+        } }, '×') : null] : null));
+    });
+    body.append(card(t('tab_hidden'), h('p', { class: 'muted small' }, t('hidden_hint')),
+      h('div', { class: 'scroll' }, table([t('name'), t('kind'), t('answer'), t('amount'), t('pct'), t('months'), t('bank_fee_pct'), t('loss_pct'), t('note'), ''], rows, { class: 'grid' }))));
+    if (editable) {
+      const en = inp('nh-en', ''), ar = inp('nh-ar', ''), kind = sel('nh-kind', 'fixed', [['fixed', t('hk_fixed')], ['monthly', t('hk_monthly')], ['pct', t('hk_pct')], ['locked', t('hk_locked')]]);
+      body.append(card(t('add_hidden_item'), h('div', { class: 'form-grid' }, field(t('name_en'), en), field(t('name_ar'), ar), field(t('kind'), kind)),
+        h('button', { onclick: async () => { try { await api('POST', `tenders/${id}/hidden`, { name_en: en.value, name_ar: ar.value, kind: kind.value }); rerender(); } catch (e) { fail(e); } } }, t('add'))));
+    }
+  }
+
+  // ---- tab: summary ----
+  function tabSummary(body, ctx) {
+    const box = h('div', { id: 'summary', 'data-tender': String(ctx.id) });
+    body.append(box);
+    if (ctx.frozen) return drawFrozen(box, ctx);
+    if (!ctx.price) { box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('no_price')), ' ', ctx.priceErr || '')); return; }
+    drawSummary(box, ctx, ctx.price, null);
+  }
+
+  const resultRows = (r) => [
+    ['D', t('c_D'), r.D], ['H', t('c_H'), r.H], ['OH', t('c_OH'), r.OH], ['F', t('c_F'), r.F], ['L', t('c_L'), r.L],
+    ['C', t('c_C'), r.C], ['P_min', t('c_Pmin'), r.P_min], ['P', t('c_P'), r.P]];
+
+  function threeNumbers(r, partial) {
+    const c = (id, label, v, note) => h('div', { class: 'big' + (partial ? ' partial' : '') + (id === 'P' ? ' main' : '') }, h('div', { class: 'label' }, label),
+      h('div', { class: 'value', id: 'num-' + id }, fin(v) ? fmt2(v) : '—'), h('div', { class: 'small muted' }, note));
+    return h('div', { class: 'three' }, c('C', t('true_cost'), r.C, t('true_cost_note')), c('Pmin', t('floor_price'), r.P_min, t('floor_note')),
+      c('P', partial ? t('partial_price') : t('proposed_price'), r.P, partial ? t('partial_banner') : t('proposed_note')));
+  }
+
+  function waterfall(r) {
+    const scale = Math.max(r.P, r.P_min, r.C);
+    const w = v => Math.max(0, v / scale * 100).toFixed(3) + '%';
+    const segs = [['D', t('c_D'), r.D], ['H', t('c_H'), r.H], ['OH', t('c_OH'), r.OH], ['F', t('c_F'), r.F], ['L', t('c_L'), r.L], ['M', t('c_margin'), r.P - r.C]];
+    const bar = h('div', { class: 'wf-bar' }, segs.filter(s => s[2] > 0).map(([k, l, v]) => h('div', { class: 'wf-seg wf-' + k, style: 'width:' + w(v), title: l + ': ' + fmt2(v) }, v / scale > 0.06 ? k : '')));
+    const marks = h('div', { class: 'wf-marks' },
+      [['C', r.C], ['P_min', r.P_min], ['P', r.P]].map(([k, v]) => h('div', { class: 'wf-mark', style: 'inset-inline-start:' + w(v) }, h('span', null, k))));
+    return h('div', { id: 'waterfall', class: 'waterfall' }, h('div', { class: 'wf-wrap' }, bar, marks),
+      h('div', { class: 'wf-legend' }, segs.map(([k, l, v]) => h('span', { class: 'wf-key' }, h('i', { class: 'wf-' + k }), l + ' ', h('span', { class: 'num' }, fmt2(v))))),
+      r.P < r.P_min ? h('p', { class: 'warn' }, t('below_floor')) : null);
+  }
+
+  function costTable(r) {
+    return table([t('component'), t('amount_aed')], [
+      ...resultRows(r).map(([k, l, v]) => h('tr', { class: ['C', 'P_min', 'P'].includes(k) ? 'total' : null }, h('td', null, k + ' — ' + l), h('td', { class: 'num' }, money(v)))),
+      h('tr', null, h('td', null, t('c_margin')), h('td', { class: 'num' }, money(r.P - r.C))),
+      h('tr', null, h('td', null, t('room_to_floor')), h('td', { class: 'num' }, money(r.P - r.P_min))),
+      h('tr', null, h('td', null, t('boq_total')), h('td', { class: 'num' }, money(r.total))),
+      h('tr', null, h('td', null, t('rounding_diff')), h('td', { class: 'num' }, money(r.rounding_diff)))], { class: 'grid costs' });
+  }
+
+  function ohCompare(r) {
+    return card(t('oh_compare'), h('dl', { class: 'kv' },
+      h('dt', null, t('oh_this_method')), h('dd', null, money(r.OH)),
+      h('dt', null, t('oh_flat')), h('dd', null, fin(r.OH_flat_compare) ? money(r.OH_flat_compare) : h('span', null, '—', h('small', { class: 'muted' }, ' ' + t('oh_flat_null'))))),
+    h('p', { class: 'muted small' }, t('oh_compare_note')));
+  }
+
+  function scheduleTable(r) {
+    if (!r.schedule || !r.schedule.length) return null;
+    return h('details', { class: 'card' }, h('summary', null, t('cashflow')),
+      h('div', { class: 'scroll' }, table([t('month'), t('cf_out'), t('cf_in'), t('cf_balance'), t('cf_cost')],
+        r.schedule.map(x => h('tr', null, h('td', { class: 'num' }, x.month), h('td', { class: 'num' }, money(x.out)), h('td', { class: 'num' }, money(x.in)), h('td', { class: 'num' }, money(x.balance)), h('td', { class: 'num' }, money(x.cost)))), { class: 'grid' })));
+  }
+
+  function blockingList(id, p) {
+    const rows = new Map((p.rows || []).map(r => [r.id, r])), hid = new Map((p.hidden || []).map(x => [x.id, x]));
+    return h('section', { class: 'card blocking' }, h('h2', null, t('blocking_title') + ' (' + p.blocking.length + ')'),
+      h('ul', { id: 'blocking-list' }, p.blocking.map(b => {
+        let target = null;
+        if (b.row_id) { const r = rows.get(b.row_id); target = h('a', { href: `#/tender/${id}/links/${b.row_id}` }, t('row') + ' ' + (r ? [r.no, r.description].filter(Boolean).join(' — ') : '#' + b.row_id)); }
+        else if (b.hidden_id) { const x = hid.get(b.hidden_id); target = h('a', { href: `#/tender/${id}/hidden/${b.hidden_id}` }, t('hidden_item') + ' ' + (x ? nm(x) : '#' + b.hidden_id)); }
+        else if (['no_snapshot', 'snapshot_stale', 'overhead_missing'].includes(b.code)) target = h('a', { href: '#/costs' }, t('nav_costs'));
+        return h('li', null, h('strong', null, blockLabel(b.code)), target ? [' — ', target] : null, b.detail && b.code !== 'row_unpriced' ? h('span', { class: 'muted' }, ' (' + (b.code === 'snapshot_stale' ? fmtTime(b.detail) : b.detail) + ')') : null,
+          b.code === 'row_unpriced' && b.detail ? h('span', { class: 'muted' }, ' (' + t('missing') + ': ' + b.detail + ')') : null);
+      })));
+  }
+
+  function drawSummary(box, ctx, p, whatIf) {
+    const { id, T } = ctx, r = p.result;
+    const partial = !!r && (!p.complete || p.blocking.length > 0);
+    box.replaceChildren();
+    if (whatIf) box.append(h('div', { class: 'banner banner-info', id: 'whatif-note' }, h('strong', null, t('whatif_note')), ' ',
+      h('button', { class: 'small secondary', onclick: () => drawSummary(box, ctx, ctx.price, null) }, t('reset'))));
+    if (!r) box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('no_price')), p.error ? ' — ' + p.error : ''));
+    else if (partial) box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('partial_banner')), ' ',
+      t('partial_detail', { rows: p.excluded_rows.length, hidden: p.unanswered_hidden.length })));
+    if (p.blocking.length) box.append(blockingList(id, p));
+
+    if (r) {
+      box.append(threeNumbers(r, partial));
+      box.append(card(t('waterfall'), waterfall(r), costTable(r)));
+      box.append(ohCompare(r));
+    }
+
+    // inputs and what-if
+    const inpts = p.inputs || {};
+    const wiM = inp('wi-M', whatIf && whatIf.M !== undefined ? whatIf.M : inpts.M, { class: 'w-num', inputmode: 'numeric' });
+    const wiCd = inp('wi-cd', whatIf && whatIf.cd !== undefined ? whatIf.cd : inpts.collection_days, { class: 'w-num', inputmode: 'decimal' });
+    const wiMargin = isAdmin() ? inp('wi-margin', whatIf && whatIf.margin !== undefined ? whatIf.margin : p.margin_pct, { class: 'w-num', inputmode: 'decimal' }) : null;
+    box.append(h('div', { class: 'cols' },
+      card(t('inputs_used'), h('dl', { class: 'kv' },
+        h('dt', null, t('snapshot_date')), h('dd', null, fmtTime(p.snapshot_created) || '—'),
+        h('dt', null, t('margin_pct')), h('dd', null, pctTxt(p.margin_pct)),
+        h('dt', null, t('duration_months')), h('dd', null, inpts.M ?? '—'),
+        h('dt', null, t('adv_pct')), h('dd', null, pctTxt(inpts.adv_pct)),
+        h('dt', null, t('ret_pct')), h('dd', null, pctTxt(inpts.ret_pct)),
+        h('dt', null, t('collection_days')), h('dd', null, inpts.collection_days ?? '—'),
+        h('dt', null, t('retention_months')), h('dd', null, inpts.retention_months ?? '—'),
+        h('dt', null, t('finance_rate')), h('dd', null, pctTxt(inpts.finance_rate_pct)),
+        h('dt', null, t('min_profit')), h('dd', null, pctTxt(inpts.min_profit_pct)),
+        h('dt', null, t('oh_monthly')), h('dd', null, money(inpts.oh_monthly, t('oh_missing'))),
+        h('dt', null, t('w_monthly')), h('dd', null, money(inpts.w_monthly, t('no_value'))))),
+      card(t('whatif'), h('p', { class: 'muted small' }, t('whatif_hint')),
+        h('div', { class: 'form-grid' }, wiMargin ? field(t('margin_pct'), wiMargin) : null, field(t('duration_months'), wiM), field(t('collection_days'), wiCd)),
+        h('button', { id: 'wi-apply', onclick: async ev => {
+          const q = new URLSearchParams(), w = { M: wiM.value, cd: wiCd.value };
+          if (wiMargin) { w.margin = wiMargin.value; if (!blank(wiMargin.value)) q.set('margin_pct', wiMargin.value.trim()); }
+          if (!blank(wiM.value)) q.set('M', wiM.value.trim());
+          if (!blank(wiCd.value)) q.set('collection_days', wiCd.value.trim());
+          ev.target.disabled = true;
+          try { drawSummary(box, ctx, await api('GET', `tenders/${id}/price?${q}`), w); } catch (e) { fail(e); ev.target.disabled = false; }
+        } }, t('whatif_apply')))));
+
+    if (isAdmin() && T.status === 'submitted' && !whatIf) box.append(approvePanel(ctx, p));
+    if (r) { const s = scheduleTable(r); if (s) box.append(s); }
+  }
+
+  function approvePanel(ctx, p) {
+    const onlyStale = p.blocking.length > 0 && p.blocking.every(b => b.code === 'snapshot_stale');
+    const margin = inp('ap-margin', p.margin_pct, { class: 'w-num', inputmode: 'decimal' });
+    const override = onlyStale ? h('input', { type: 'checkbox', id: 'ap-override' }) : null;
+    const can = !!p.result && p.complete && (!p.blocking.length || onlyStale);
+    const msg = h('div');
+    return card(t('approve_title'),
+      h('div', { class: 'form-grid' }, field(t('margin_pct'), margin), override ? field(t('override_stale'), override, 'check') : null),
+      onlyStale ? h('p', { class: 'warn' }, t('override_stale_note')) : null,
+      !can ? h('p', { class: 'err' }, t('approve_blocked')) : null,
+      h('button', { id: 'ap-approve', disabled: !can, onclick: async ev => {
+        const b = { margin_pct: pnum(margin.value) };
+        if (override) b.override_stale = override.checked;
+        ev.target.disabled = true;
+        try { await api('POST', `tenders/${ctx.id}/approve`, b); flash(t('approved_ok'), 'ok'); rerender(); }
+        catch (e) {
+          fail(e); ev.target.disabled = false;
+          if (e.body && e.body.blocking) msg.replaceChildren(blockingList(ctx.id, { ...p, blocking: e.body.blocking }));
+        }
+      } }, t('approve')), msg);
+  }
+
+  function drawFrozen(box, { frozen: f }) {
+    box.append(h('div', { class: 'banner banner-ok' }, h('strong', null, t('frozen_price')), ' ',
+      t('approved_by') + ': ' + (f.approved_by || '—') + ' · ' + (fmtTime(f.approved_at) || '') + ' · ' + t('snapshot_date') + ': ' + (fmtTime(f.snapshot_created) || '—') + ' · ' + t('margin_pct') + ': ' + pctTxt(f.margin_pct)),
+    );
+    if (f.override_stale) box.append(h('p', { class: 'warn' }, t('approved_on_stale')));
+    box.append(threeNumbers(f, false), card(t('waterfall'), waterfall(f), costTable(f)), ohCompare(f));
+    const s = scheduleTable(f); if (s) box.append(s);
+  }
+
+  // ---- company costs -----------------------------------------------------------------------------------------------
+  async function pageCosts(out, st) {
+    const page = h('div', { id: 'page-costs' });
+    out.append(page);
+    page.append(h('div', { class: 'row' }, h('h1', null, t('nav_costs')), h('span', { class: 'spacer' }),
+      isAdmin() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));
+    const snap = st && st.last_ok_id ? await api('GET', 'costs/snapshot') : null;
+    if (!snap) page.append(h('div', { class: 'banner banner-red' }, t('no_snapshot_yet')));
+    else {
+      page.append(card(t('overhead'), h('dl', { class: 'kv' },
+        h('dt', null, t('last_good_sync')), h('dd', null, fmtTime(st.last_ok) || '—'),
+        h('dt', null, t('oh_monthly')), h('dd', null, money(snap.oh_monthly, t('oh_missing')), snap.oh_overridden ? h('span', { class: 'tag' }, t('overridden')) : null),
+        h('dt', null, t('months_covered')), h('dd', null, snap.months_covered ?? '—'),
+        h('dt', null, t('w_monthly')), h('dd', null, money(snap.w_monthly, t('no_value'))),
+        snap.oh_parts ? [h('dt', null, t('oh_bills')), h('dd', null, money(snap.oh_parts.bills)), h('dt', null, t('oh_payroll')), h('dd', null, money(snap.oh_parts.payroll)),
+          h('dt', null, t('oh_depreciation')), h('dd', null, money(snap.oh_parts.depreciation, t('no_value')))] : null),
+        snap.oh_parts ? h('p', { class: 'muted small' }, t('oh_parts_note')) : null));
+      page.append(card(t('trades'), table([t('trade'), t('group'), t('rate_per_hour'), isAdmin() ? t('headcount') : null, ''].filter(x => x !== null),
+        (snap.trades || []).map(x => h('tr', null, h('td', null, x.trade), h('td', null, x.group), h('td', { class: 'num' }, money(x.rate, x.via_group ? t('group_rate_hidden') : t('no_valid_rate'))),
+          isAdmin() ? h('td', { class: 'num' }, x.headcount ?? '') : null,
+          h('td', null, x.via_group ? h('span', { class: 'tag' }, t('via_group')) : null, x.overridden ? h('span', { class: 'tag' }, t('overridden')) : null))), { class: 'grid' }),
+      table([t('group'), t('rate_per_hour'), isAdmin() ? t('headcount') : null].filter(x => x !== null),
+        (snap.groups || []).map(g => h('tr', null, h('td', null, g.group), h('td', { class: 'num' }, money(g.rate, t('group_rate_hidden'))), isAdmin() ? h('td', { class: 'num' }, g.headcount ?? '') : null)), { class: 'grid' })));
+      page.append(card(t('equipment'), (snap.equipment || []).length ? table([t('id'), t('name'), t('source'), t('rate_per_hour'), ''],
+        snap.equipment.map(e => h('tr', null, h('td', null, e.id), h('td', null, e.name || ''), h('td', null, e.source === 'hired' ? t('hired') : t('owned')),
+          h('td', { class: 'num' }, money(e.rate, t('no_valid_rate'))), h('td', null, e.overridden ? h('span', { class: 'tag' }, t('overridden')) : null))), { class: 'grid' }) : h('p', { class: 'muted' }, t('none'))));
+      const um = snap.unmapped || {};
+      if ((snap.warnings || []).length || (um.categories || []).length || (um.designations || []).length) page.append(card(t('warnings'),
+        h('ul', null, (snap.warnings || []).map(w => h('li', null, h('code', null, w.code), w.detail ? ' — ' + w.detail : ''))),
+        (um.categories || []).length ? h('p', null, t('unmapped_categories') + ': ' + um.categories.join(', ')) : null,
+        (um.designations || []).length ? h('p', null, t('unmapped_designations') + ': ' + um.designations.join(', ')) : null,
+        isAdmin() ? h('a', { href: '#/settings' }, t('fix_in_settings')) : null));
+    }
+    if (isAdmin()) {
+      const cfg = await api('GET', 'costs/config');
+      const sugg = ['oh_monthly', ...((snap && snap.trades) || []).map(x => 'trade:' + x.trade), ...((snap && snap.equipment) || []).map(e => 'equip:' + e.id)];
+      page.append(mapEditor(t('overrides'), cfg.overrides || {}, { keyLabel: t('override_key'), valLabel: t('override_value'), numeric: true, suggestions: sugg.filter(k => !(k in (cfg.overrides || {}))),
+        note: t('overrides_note'), save: o => api('PUT', 'costs/config', { overrides: o }) }));
+    }
+    if (canWrite()) await materialsSection(page);
+  }
+
+  async function materialsSection(page) {
+    const mats = await api('GET', 'costs/materials');
+    const box = card(t('materials'), h('p', { class: 'muted small' }, t('materials_hint')));
+    page.append(box);
+    box.append(table([t('code'), t('name'), t('unit'), ''], mats.map(m => {
+      const detail = h('div');
+      return [h('tr', null, h('td', null, m.code || ''), h('td', null, nm(m)), h('td', null, m.unit),
+        h('td', null, h('button', { class: 'small secondary', onclick: async () => { if (detail.childNodes.length) detail.replaceChildren(); else await materialDetail(detail, m); } }, t('quotes_links')),
+          isAdmin() ? h('button', { class: 'small danger', onclick: async () => { if (!confirm(t('delete_material_confirm'))) return; try { await api('DELETE', 'costs/materials/' + m.id); rerender(); } catch (e) { fail(e); } } }, t('delete')) : null)),
+      h('tr', { class: 'lines-row' }, h('td', { colspan: 4 }, detail))];
+    }), { class: 'grid' }));
+    const code = inp('m-code', ''), en = inp('m-en', ''), ar = inp('m-ar', ''), unit = inp('m-unit', '');
+    box.append(h('h3', null, t('add_material')), h('div', { class: 'form-grid' }, field(t('code'), code), field(t('name_en'), en), field(t('name_ar'), ar), field(t('unit'), unit)),
+      h('button', { onclick: async () => { try { await api('POST', 'costs/materials', { code: code.value, name_en: en.value, name_ar: ar.value, unit: unit.value }); rerender(); } catch (e) { fail(e); } } }, t('add')));
+  }
+
+  async function materialDetail(box, m) {
+    const [quotes, links] = await Promise.all([api('GET', `costs/materials/${m.id}/quotes`), api('GET', `costs/materials/${m.id}/links`)]);
+    const redraw = () => materialDetail(box, m).catch(fail);
+    const qd = inp('', new Date().toISOString().slice(0, 10), { type: 'date' }), qs = inp('', '', { placeholder: t('supplier') }), qr = inp('', '', { class: 'w-num', inputmode: 'decimal', placeholder: t('rate') });
+    const ld = inp('', '', { placeholder: t('po_description') }), lu = inp('', '', { class: 'w-col', placeholder: t('unit') });
+    box.replaceChildren(h('div', { class: 'cols' },
+      h('div', null, h('h4', null, t('quotes')), table([t('date'), t('supplier'), t('rate'), ''], quotes.map(q => h('tr', null, h('td', null, q.date), h('td', null, q.supplier || ''), h('td', { class: 'num' }, money(q.rate)),
+        h('td', null, h('button', { class: 'small danger', onclick: async () => { try { await api('DELETE', `costs/materials/${m.id}/quotes/${q.id}`); redraw(); } catch (e) { fail(e); } } }, '×')))), { class: 'grid' }),
+        h('div', { class: 'row' }, qd, qs, qr, h('button', { class: 'small', onclick: async () => { try { await api('POST', `costs/materials/${m.id}/quotes`, { date: qd.value, supplier: qs.value, rate: qr.value }); redraw(); } catch (e) { fail(e); } } }, t('add')))),
+      h('div', null, h('h4', null, t('po_links')), h('p', { class: 'muted small' }, t('po_links_hint')), table([t('po_description'), t('unit'), ''], links.map(l => h('tr', null, h('td', null, l.description_norm), h('td', null, l.unit),
+        h('td', null, h('button', { class: 'small danger', onclick: async () => { try { await api('DELETE', `costs/materials/${m.id}/links/${l.id}`); redraw(); } catch (e) { fail(e); } } }, '×')))), { class: 'grid' }),
+        h('div', { class: 'row' }, ld, lu, h('button', { class: 'small', onclick: async () => { try { await api('POST', `costs/materials/${m.id}/links`, { description: ld.value, unit: lu.value }); redraw(); } catch (e) { fail(e); } } }, t('add'))))));
+  }
+
+  // key -> value editor for cost config maps and overrides
+  function mapEditor(title, obj, o) {
+    const entries = Object.entries(obj).map(([k, v]) => ({ k, v: String(v) }));
+    const box = card(title, o.note ? h('p', { class: 'muted small' }, o.note) : null);
+    const list = h('div');
+    const draw = () => {
+      list.replaceChildren(table([o.keyLabel, o.valLabel, ''], entries.map((e, i) => h('tr', null,
+        h('td', null, inp('', e.k, { class: 'w-desc', oninput: ev => { e.k = ev.target.value; } })),
+        h('td', null, o.options ? sel('', e.v, [['', '—'], ...o.options], { onchange: ev => { e.v = ev.target.value; } }) : inp('', e.v, { class: o.numeric ? 'w-num' : 'w-desc', inputmode: o.numeric ? 'decimal' : null, oninput: ev => { e.v = ev.target.value; } })),
+        h('td', null, h('button', { class: 'small danger', onclick: () => { entries.splice(i, 1); draw(); } }, '×')))), { class: 'grid' }),
+      h('div', { class: 'row wrap' }, h('button', { class: 'small secondary', onclick: () => { entries.push({ k: '', v: '' }); draw(); } }, t('add_entry')),
+        (o.suggestions || []).filter(s => !entries.some(e => e.k === s)).slice(0, 40).map(s => h('button', { class: 'small secondary', title: t('add_entry'), onclick: () => { entries.push({ k: s, v: '' }); draw(); } }, '+ ' + s))));
+    };
+    draw();
+    box.append(list, h('button', { onclick: async ev => {
+      const out = {};
+      for (const e of entries) if (!blank(e.k)) out[e.k.trim()] = o.numeric ? e.v.trim() : e.v;
+      ev.target.disabled = true;
+      try { await o.save(out); flash(t('saved'), 'ok'); } catch (e) { fail(e); }
+      ev.target.disabled = false;
+    } }, t('save')));
+    return box;
+  }
+
+  // ---- item library ------------------------------------------------------------------------------------------------
+  let libSection = null;
+  async function pageLibrary(out, st) {
+    const [sections, items] = await Promise.all([api('GET', 'library/sections'), api('GET', 'library/items')]);
+    const page = h('div', { id: 'page-library' });
+    out.append(page);
+    page.append(h('h1', null, t('nav_library')));
+    const secName = id => { const s = sections.find(x => x.id === id); return s ? nm(s) : '#' + id; };
+    const editorBox = h('div');
+    const shown = items.filter(i => libSection === null || i.section_id === libSection);
+    page.append(h('div', { class: 'lib' },
+      h('aside', { class: 'card sections' }, h('h2', null, t('sections')),
+        h('ul', null, h('li', null, h('a', { href: '#/library', class: libSection === null ? 'active' : null, onclick: ev => { ev.preventDefault(); libSection = null; rerender(); } }, t('all'))),
+          sections.map(s => h('li', null, h('a', { href: '#/library', class: libSection === s.id ? 'active' : null, onclick: ev => { ev.preventDefault(); libSection = s.id; rerender(); } }, nm(s)),
+            s.default_rework_pct ? h('small', { class: 'muted' }, ' ' + pctTxt(s.default_rework_pct)) : null))),
+        canWrite() ? sectionForm() : null),
+      h('div', null,
+        card(t('items'), canWrite() ? h('button', { id: 'new-item', onclick: () => itemEditor(editorBox, null, sections, st).catch(fail) }, t('new_item')) : null,
+          shown.length ? table([t('code'), t('name'), t('section'), t('unit'), t('version'), t('unit_cost'), t('parts'), ''], shown.map(i => h('tr', null,
+            h('td', null, i.code), h('td', null, nm(i)), h('td', null, secName(i.section_id)), h('td', null, i.uom), h('td', { class: 'num' }, 'v' + i.version),
+            h('td', { class: 'num' }, money(i.unit, i.missing && i.missing.length ? t('missing') + ': ' + i.missing.join(', ') : null)),
+            h('td', null, i.parts.map(p => h('div', { class: 'part' }, partKindLabel(p.kind) + ': ', p.hidden ? h('span', { class: 'missing' }, '— ', h('small', null, t('hidden_part'))) : money(p.cost)))),
+            h('td', null, canWrite() ? h('button', { class: 'small secondary', onclick: () => itemEditor(editorBox, i, sections, st).catch(fail) }, t('edit')) : null))), { class: 'grid' }) : h('p', { class: 'muted' }, t('none'))),
+        editorBox)));
+  }
+
+  function sectionForm() {
+    const en = inp('sec-en', ''), ar = inp('sec-ar', ''), rw = inp('sec-rework', '', { class: 'w-num', inputmode: 'decimal' });
+    return h('div', { class: 'stack' }, h('h3', null, t('add_section')), field(t('name_en'), en), field(t('name_ar'), ar), field(t('default_rework_pct'), rw),
+      h('button', { onclick: async () => {
+        const b = { name_en: en.value, name_ar: ar.value };
+        if (!blank(rw.value)) b.default_rework_pct = pnum(rw.value);
+        try { await api('POST', 'library/sections', b); rerender(); } catch (e) { fail(e); }
+      } }, t('add')));
+  }
+
+  async function itemEditor(box, item, sections, st) {
+    const [mats, snap, versions] = await Promise.all([api('GET', 'costs/materials'), st && st.last_ok_id ? api('GET', 'costs/snapshot') : Promise.resolve(null),
+      item ? api('GET', `library/items/${item.id}/versions`) : Promise.resolve([])]);
+    const cur = versions.length ? versions[versions.length - 1].data : { rework_pct: null, condition_factor: 1, parts: [] };
+    const parts = cur.parts.map(p => ({ ...p, crewText: p.crew ? p.crew.map(c => c.trade + ':' + c.count).join(', ') : '' }));
+    const code = inp('it-code', item ? item.code : ''), uom = inp('it-uom', item ? item.uom : ''), en = inp('it-en', item ? item.name_en : ''), ar = inp('it-ar', item ? item.name_ar : '');
+    const sec = sel('it-section', item ? String(item.section_id) : (libSection !== null ? String(libSection) : String(sections[0] && sections[0].id)), sections.map(s => [String(s.id), nm(s)]));
+    const rw = inp('it-rework', cur.rework_pct, { class: 'w-num', inputmode: 'decimal', placeholder: t('section_default') }), cf = inp('it-cf', cur.condition_factor, { class: 'w-num', inputmode: 'decimal' });
+    const trades = h('datalist', { id: 'dl-trades' }, ((snap && snap.trades) || []).map(x => h('option', { value: x.trade })));
+    const equipOpts = [['', '—'], ...((snap && snap.equipment) || []).map(e => [e.id, `${e.id} — ${e.name || ''}`])];
+    const matOpts = [['', '—'], ...mats.map(m => [String(m.id), `${m.code ? m.code + ' — ' : ''}${nm(m)} (${m.unit})`])];
+    const plist = h('div');
+    const num = (p, k, ph) => inp('', p[k], { class: 'w-num', inputmode: 'decimal', placeholder: ph, oninput: ev => { p[k] = ev.target.value; } });
+    const draw = () => {
+      plist.replaceChildren(...parts.map((p, i) => {
+        const kind = sel('', p.kind, [['material', t('pk_material')], ['labour', t('pk_labour')], ['equipment', t('pk_equipment')], ['sub', t('pk_sub')], ['fixed', t('pk_fixed')]],
+          { onchange: ev => { parts[i] = { kind: ev.target.value, crewText: '' }; draw(); } });
+        let f;
+        if (p.kind === 'material') {
+          const opts = p.material_id && !mats.some(m => m.id === p.material_id) ? [...matOpts, [String(p.material_id), '#' + p.material_id]] : matOpts;
+          f = [sel('', p.material_id ? String(p.material_id) : '', opts, { onchange: ev => { p.material_id = ev.target.value ? Number(ev.target.value) : null; } }),
+            field(t('qty_per_unit'), num(p, 'qty')), field(t('waste_pct'), num(p, 'waste_pct'))];
+        } else if (p.kind === 'labour') {
+          f = [field(t('crew'), inp('', p.crewText, { class: 'w-desc', list: 'dl-trades', placeholder: t('crew_ph'), oninput: ev => { p.crewText = ev.target.value; } })), field(t('output_per_day'), num(p, 'output_per_day'))];
+        } else if (p.kind === 'equipment') {
+          const opts = p.equipment_id && !equipOpts.some(o => o[0] === p.equipment_id) ? [...equipOpts, [p.equipment_id, p.equipment_id]] : equipOpts;
+          f = [sel('', p.equipment_id || '', opts, { onchange: ev => { p.equipment_id = ev.target.value || null; } }), field(t('output_per_hour'), num(p, 'output_per_hour'))];
+        } else if (p.kind === 'sub') f = [field(t('sub_rate'), num(p, 'rate'))];
+        else f = [field(t('fixed_amount'), num(p, 'amount'))];
+        return h('div', { class: 'part-row row wrap' }, kind, f, h('button', { class: 'small danger', onclick: () => { parts.splice(i, 1); draw(); } }, '×'));
+      }), h('button', { class: 'small secondary', onclick: () => { parts.push({ kind: 'material', crewText: '' }); draw(); } }, t('add_part')));
+    };
+    draw();
+    const clean = () => parts.map(p => {
+      if (p.kind === 'material') return { kind: 'material', material_id: p.material_id ?? null, qty: pnum(p.qty), waste_pct: pnum(p.waste_pct) ?? 0 };
+      if (p.kind === 'labour') return { kind: 'labour', output_per_day: pnum(p.output_per_day), crew: p.crewText.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+        const m = /^(.*?)\s*[:x×]\s*(\d+)$/.exec(s);
+        return m ? { trade: m[1].trim(), count: Number(m[2]) } : { trade: s, count: 1 };
+      }) };
+      if (p.kind === 'equipment') return { kind: 'equipment', equipment_id: p.equipment_id || null, output_per_hour: pnum(p.output_per_hour) };
+      if (p.kind === 'sub') return { kind: 'sub', rate: pnum(p.rate) };
+      return { kind: 'fixed', amount: pnum(p.amount) };
+    });
+    box.replaceChildren(card(item ? t('edit_item') + ' ' + item.code + ' (v' + item.version + ')' : t('new_item'), trades,
+      h('div', { class: 'form-grid' }, field(t('code'), code), field(t('section'), sec), field(t('unit'), uom), field(t('name_en'), en), field(t('name_ar'), ar),
+        field(t('rework_pct'), rw), field(t('condition_factor'), cf)),
+      h('h3', null, t('parts')), plist,
+      item ? h('p', { class: 'muted small' }, t('new_version_note')) : null,
+      h('div', { class: 'row' }, h('button', { id: 'it-save', onclick: async ev => {
+        const b = { code: code.value, section_id: Number(sec.value), uom: uom.value, name_en: en.value, name_ar: ar.value, rework_pct: pnum(rw.value), condition_factor: pnum(cf.value), parts: clean() };
+        ev.target.disabled = true;
+        try { await api(item ? 'PUT' : 'POST', item ? 'library/items/' + item.id : 'library/items', b); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+      } }, t('save')), h('button', { class: 'secondary', onclick: () => box.replaceChildren() }, t('cancel'))),
+      versions.length ? h('details', null, h('summary', null, t('versions') + ' (' + versions.length + ')'),
+        h('ul', null, versions.map(v => h('li', null, 'v' + v.version + ' · ' + fmtTime(v.created) + ' · ' + (v.created_by || ''))))) : null));
+    box.scrollIntoView({ block: 'start' });
+  }
+
+  // ---- settings (admin) ------------------------------------------------------------------------------------------------
+  async function pageSettings(out) {
+    const [s, cfg, users, tpls, st] = await Promise.all([api('GET', 'settings'), api('GET', 'costs/config'), api('GET', 'users'), api('GET', 'hidden-templates'), api('GET', 'costs/status')]);
+    const snap = st.last_ok_id ? await api('GET', 'costs/snapshot') : null;
+    const page = h('div', { id: 'page-settings' });
+    out.append(page);
+    page.append(h('h1', null, t('nav_settings')));
+
+    const labels = { erp_db_path: t('set_erp_db_path'), work_days: t('set_work_days'), work_hours: t('set_work_hours'), finance_rate_pct: t('set_finance_rate_pct'), min_profit_pct: t('set_min_profit_pct'),
+      default_margin_pct: t('set_default_margin_pct'), stale_days: t('set_stale_days'), material_stale_days: t('set_material_stale_days'), sync_minutes: t('set_sync_minutes') };
+    const ins = Object.fromEntries(Object.keys(labels).map(k => [k, inp('set-' + k, s[k], k === 'erp_db_path' ? { class: 'w-path' } : { class: 'w-num', inputmode: 'decimal' })]));
+    page.append(card(t('general_settings'), h('div', { class: 'form-grid' }, Object.keys(labels).map(k => field(labels[k], ins[k], k === 'erp_db_path' ? 'wide' : ''))),
+      h('div', { class: 'row' }, h('button', { id: 'set-save', onclick: async ev => {
+        const b = {};
+        for (const k of Object.keys(labels)) b[k] = ins[k].value;
+        ev.target.disabled = true;
+        try { await api('PUT', 'settings', b); flash(t('saved'), 'ok'); } catch (e) { fail(e); }
+        ev.target.disabled = false;
+      } }, t('save')), h('button', { class: 'secondary', onclick: ev => syncNow(ev.target) }, t('sync_now')))));
+
+    const um = (snap && snap.unmapped) || { categories: [], designations: [] };
+    const catOpts = ['overhead', 'labour_oncost', 'equipment', 'project', 'ignore'].map(k => [k, catKindLabel(k)]);
+    const saveCfg = key => o => api('PUT', 'costs/config', { [key]: o });
+    page.append(mapEditor(t('category_map'), cfg.category_map || {}, { keyLabel: t('erp_category'), valLabel: t('category_kind'), options: catOpts, suggestions: um.categories || [], note: t('category_map_note'), save: saveCfg('category_map') }));
+    page.append(mapEditor(t('trade_map'), cfg.trade_map || {}, { keyLabel: t('erp_designation'), valLabel: t('trade'), suggestions: um.designations || [], note: t('trade_map_note'), save: saveCfg('trade_map') }));
+    const tradeNames = [...new Set(Object.values(cfg.trade_map || {}))];
+    page.append(mapEditor(t('trade_groups'), cfg.trade_groups || {}, { keyLabel: t('trade'), valLabel: t('group'), suggestions: tradeNames, note: t('trade_groups_note'), save: saveCfg('trade_groups') }));
+
+    // users
+    const un = inp('u-name', ''), upw = inp('u-pw', '', { type: 'password', autocomplete: 'new-password' }), ur = sel('u-role', 'qs', [['qs', t('role_qs')], ['viewer', t('role_viewer')], ['admin', t('role_admin')]]);
+    page.append(card(t('users'), table([t('username'), t('role'), t('created')], users.map(u => h('tr', null, h('td', null, u.username), h('td', null, roleLabel(u.role)), h('td', null, fmtTime(u.created)))), { class: 'grid' }),
+      h('h3', null, t('add_user')), h('div', { class: 'form-grid' }, field(t('username'), un), field(t('password'), upw), field(t('role'), ur)),
+      h('button', { onclick: async () => { try { await api('POST', 'users', { username: un.value, password: upw.value, role: ur.value }); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); } } }, t('add'))));
+
+    // hidden-cost templates
+    const kindOpts = [['fixed', t('hk_fixed')], ['monthly', t('hk_monthly')], ['pct', t('hk_pct')], ['locked', t('hk_locked')]];
+    const trow = x => {
+      const en = inp('', x.name_en, { class: 'w-desc' }), ar = inp('', x.name_ar, { class: 'w-desc' }), kind = sel('', x.kind, kindOpts), sort = inp('', x.sort, { class: 'w-col', inputmode: 'numeric' });
+      const act = h('input', { type: 'checkbox', checked: !!x.active });
+      return h('tr', null, h('td', null, en), h('td', null, ar), h('td', null, kind), h('td', null, sort), h('td', null, act),
+        h('td', null, h('button', { class: 'small', onclick: async () => {
+          try { await api('PUT', 'hidden-templates/' + x.id, { name_en: en.value, name_ar: ar.value, kind: kind.value, sort: pnum(sort.value) ?? 0, active: act.checked ? 1 : 0 }); flash(t('saved'), 'ok'); } catch (e) { fail(e); }
+        } }, t('save'))));
+    };
+    const nen = inp('tpl-en', ''), nar = inp('tpl-ar', ''), nk = sel('tpl-kind', 'fixed', kindOpts);
+    page.append(card(t('hidden_templates'), h('p', { class: 'muted small' }, t('hidden_templates_note')),
+      h('div', { class: 'scroll' }, table([t('name_en'), t('name_ar'), t('kind'), t('sort'), t('active'), ''], tpls.map(trow), { class: 'grid' })),
+      h('h3', null, t('add_template')), h('div', { class: 'form-grid' }, field(t('name_en'), nen), field(t('name_ar'), nar), field(t('kind'), nk)),
+      h('button', { onclick: async () => { try { await api('POST', 'hidden-templates', { name_en: nen.value, name_ar: nar.value, kind: nk.value }); rerender(); } catch (e) { fail(e); } } }, t('add'))));
+  }
+
+  // ---- boot ---------------------------------------------------------------------------------------------------------
+  async function boot() {
+    applyLang();
+    let st;
+    try { st = await api('GET', 'status'); } catch (e) { $('#root').replaceChildren(h('div', { class: 'banner banner-red' }, t('server_unreachable'))); return; }
+    me = st.user; setupMode = st.setup;
+    if (!me) return renderLogin();
+    renderShell();
+    await route();
+  }
+  window.addEventListener('hashchange', () => { if (me) route(true); });
+  boot();
+})();

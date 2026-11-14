@@ -294,7 +294,11 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (FROZEN_STATUSES.includes(t.status)) return reply(res, 200, { tender_id: t.id, status: t.status, frozen: viewFrozen(JSON.parse(t.frozen), me.role) });
       const q = url.searchParams.get('margin_pct');
       const margin = q === null || q === '' ? undefined : pctField(q, 'margin_pct');
-      const c = compute(t, margin);
+      // what-if on duration and collection days: priced with the override, never saved
+      const qM = url.searchParams.get('M'), qCd = url.searchParams.get('collection_days'), w = { ...t };
+      if (qM !== null && qM !== '') w.M = intField(qM, 'M (duration in months)', 1);
+      if (qCd !== null && qCd !== '') w.collection_days = nonNegField(qCd, 'collection_days', MAX_MONTHS * 30);
+      const c = compute(w, margin);
       if (!c.result && !c.blocking.length) bad(c.error);
       const latest = latestId();
       return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: t.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
