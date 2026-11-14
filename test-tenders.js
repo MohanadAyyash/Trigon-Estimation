@@ -18,6 +18,25 @@ const addSnap = (data, created = new Date().toISOString()) => Number(db.prepare(
 // every object in a JSON value
 const walk = (v, f) => { if (v && typeof v === 'object') { f(v); for (const k in v) walk(v[k], f); } };
 
+// binary GET (exports); returns status, headers and the body as a Buffer
+const getBin = async (base, u, ck) => { const r = await fetch(base + u, { headers: { cookie: ck || '' } }); return { s: r.status, h: r.headers, b: Buffer.from(await r.arrayBuffer()) }; };
+const { readXlsx } = require('./lib/xlsx.js');
+// minimal RFC 4180 parser: fields may be quoted, quotes doubled, CR/LF inside quotes kept
+const parseCsv = txt => {
+  const out = []; let row = [], f = '', q = false;
+  for (let i = 0; i < txt.length; i++) {
+    const c = txt[i];
+    if (q) { if (c === '"') { if (txt[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { row.push(f); f = ''; }
+    else if (c === '\r' && txt[i + 1] === '\n') { row.push(f); out.push(row); row = []; f = ''; i++; }
+    else f += c;
+  }
+  if (f !== '' || row.length) { row.push(f); out.push(row); }
+  return out;
+};
+const sheetsOf = buf => Object.fromEntries(readXlsx(buf).sheets.map(s => [s.name, s.rows]));
+
 server.listen(0, async () => {
   const base = `http://localhost:${server.address().port}/api/`;
   const call = async (m, u, b, ck) => {
@@ -170,6 +189,20 @@ server.listen(0, async () => {
     assert.strictEqual(pr.complete, false); assert.strictEqual(pr.result.partial, true);
     assert.deepStrictEqual(pr.excluded_rows.sort(), [a2.id, tr].sort()); assert.strictEqual(pr.unanswered_hidden.length, 11);
 
+
+    // ---- exports of a partial price: client refused, internal marked ----------------------------------------
+    const ex409 = await call('GET', `tenders/${tid}/export?format=xlsx&kind=client`, null, qs);
+    assert.strictEqual(ex409.s, 409); assert.ok(ex409.j.error && ex409.j.blocking.some(b => b.code === 'row_unlinked'), 'client export blocked with the blocking list');
+    assert.strictEqual((await call('GET', `tenders/${tid}/export?format=csv&kind=client`, null, viewer)).s, 409);
+    const exPart = await getBin(base, `tenders/${tid}/export?format=xlsx&kind=internal`, qs);
+    assert.strictEqual(exPart.s, 200);
+    const partS = sheetsOf(exPart.b);
+    assert.deepStrictEqual(Object.keys(partS), ['Summary', 'Rows', 'Hidden', 'CashFlow']);
+    assert.deepStrictEqual(partS.Summary[0].slice(0, 2), ['PARTIAL — not a tender price', 'سعر ناقص — ليس سعر المناقصة']);
+    assert.ok(JSON.stringify(partS.Summary).includes('Kerb take-off'), 'excluded rows are listed');
+    const partCsv = (await getBin(base, `tenders/${tid}/export?format=csv&kind=internal`, qs)).b.toString('utf8');
+    assert.ok(partCsv.replace(/^﻿/, '').startsWith('PARTIAL — not a tender price,'), 'csv banner is the first row');
+
     // manual unit
     assert.strictEqual((await call('PUT', `tenders/${tid}/rows/${a2.id}`, { manual_unit: -1 }, qs)).s, 400);
     assert.strictEqual((await call('PUT', `tenders/${tid}/rows/${h1.id}`, { manual_unit: 5 }, qs)).s, 400);
@@ -240,6 +273,82 @@ server.listen(0, async () => {
     const av = await ok(call('GET', `tenders/${tid}/price`, null, admin), 'price admin');
     near(av.rows.find(r => r.id === a1.id).links.find(l => l.item_id === i2).parts[0].cost, 40, 'admin sees the part');
 
+
+    // ---- exports: client + internal (complete price) -------------------------------------------------------------
+    assert.strictEqual((await call('GET', `tenders/${tid}/export?format=pdf&kind=client`, null, qs)).s, 400);
+    assert.strictEqual((await call('GET', `tenders/${tid}/export?format=xlsx&kind=other`, null, qs)).s, 400);
+    assert.strictEqual((await call('GET', `tenders/${tid}/export?format=xlsx&kind=client`, null)).s, 401);
+    assert.strictEqual((await call('GET', `tenders/999999/export?format=xlsx&kind=client`, null, qs)).s, 404);
+    assert.strictEqual((await call('GET', `tenders/${tid}/export?format=xlsx&kind=internal`, null, viewer)).s, 403, 'viewer: client kind only');
+    assert.strictEqual((await call('GET', `tenders/${tid}/export?format=csv&kind=internal`, null, viewer)).s, 403);
+    await ok(call('PUT', `tenders/${tid}`, { ref: 'T-01/ö x' }, qs), 'ref');
+    await ok(call('POST', `tenders/${tid}/rows`, { description: '=SUM(1,2)', is_heading: true }, qs), 'formula-looking heading');
+    await ok(call('POST', `tenders/${tid}/rows`, { description: 'Pipe, "DN100"\nsecond line', is_heading: true }, qs), 'quoted heading');
+    pr = await ok(call('GET', `tenders/${tid}/price`, null, qs), 'price for export');
+    assert.deepStrictEqual(pr.blocking, []);
+    for (const ck of [qs, viewer, admin]) {
+      const r = await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, ck);
+      assert.strictEqual(r.s, 200);
+      assert.strictEqual(r.h.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      assert.strictEqual(r.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client.xlsx"');
+      const cs = sheetsOf(r.b);
+      assert.deepStrictEqual(Object.keys(cs), ['BOQ']);
+      const rowsX = cs.BOQ;
+      assert.deepStrictEqual(rowsX[0], ['No', 'Description', 'Unit', 'Qty', 'Rate', 'Amount']);
+      const body = pr.rows.map(r2 => [r2.no, r2.description, r2.unit, r2.qty, r2.rate, r2.amount]);
+      assert.deepStrictEqual(rowsX.slice(1, 1 + body.length), body, 'rows in BOQ order, rates as priced, headings blank, text kept verbatim');
+      assert.ok(pr.rows.some(r2 => r2.is_heading && r2.rate === null));
+      const totalRow = rowsX[1 + body.length];
+      assert.deepStrictEqual(totalRow.slice(0, 5), [null, 'Total', null, null, null]);
+      near(totalRow[5], pr.result.total, 'total = result.total');
+      near(pr.rows.reduce((a, x) => a + (x.amount || 0), 0), totalRow[5], 'total = sum of amounts');
+      assert.deepStrictEqual(rowsX.slice(2 + body.length).map(x => x[1]), ['Prices exclude VAT', 'الأسعار لا تشمل ضريبة القيمة المضافة']);
+      const dump = JSON.stringify(rowsX);
+      for (const w of ['Direct', 'OH', 'Margin', 'margin', 'Foreman', 'headcount']) assert.ok(!dump.includes(w), 'client file has no ' + w);
+    }
+    const cc = await getBin(base, `tenders/${tid}/export?format=csv&kind=client`, viewer);
+    assert.strictEqual(cc.s, 200);
+    assert.strictEqual(cc.h.get('content-type'), 'text/csv; charset=utf-8');
+    assert.strictEqual(cc.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client.csv"');
+    assert.deepStrictEqual([...cc.b.subarray(0, 3)], [0xEF, 0xBB, 0xBF], 'UTF-8 BOM');
+    const ctext = cc.b.toString('utf8').slice(1);
+    assert.ok(!/(^|[^\r])\n/.test(ctext.replace(/"[^"]*"/g, '""')), 'CRLF line endings outside quoted fields');
+    assert.ok(ctext.endsWith('\r\n'));
+    assert.ok(ctext.includes('"Pipe, ""DN100""\nsecond line"'), 'RFC 4180 quoting');
+    const crows = parseCsv(ctext);
+    assert.deepStrictEqual(crows[0], ['No', 'Description', 'Unit', 'Qty', 'Rate', 'Amount']);
+    assert.ok(crows.some(x => x[1] === "'=SUM(1,2)"), 'formula injection guarded');
+    assert.ok(crows.some(x => x[1] === 'Pipe, "DN100"\nsecond line'));
+    assert.ok(crows.some(x => x[1] === 'حفر التربة Excavation' && x[3] === '1250.5'), 'Arabic text and numbers round-trip');
+    assert.ok(crows.some(x => x[1] === 'Total' && Math.abs(Number(x[5]) - pr.result.total) < 1e-6));
+    assert.ok(crows.some(x => x[1] === 'Prices exclude VAT'));
+
+    // internal: admin sees everything, qs sees no small-trade rate; viewer is refused (above)
+    const intA = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=internal`, admin)).b);
+    const intQ = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=internal`, qs)).b);
+    assert.deepStrictEqual(Object.keys(intQ), ['Summary', 'Rows', 'Hidden', 'CashFlow']);
+    const near2 = (a, b, m) => assert.ok(Math.abs(a - b) <= 0.0051, `${m}: ${a} vs ${b}`);   // exports round to 2 decimals
+    const lab = (S, l) => { const r = S.Summary.find(x => typeof x[0] === 'string' && x[0].startsWith(l)); assert.ok(r, 'summary row ' + l); return r[1]; };
+    for (const S of [intA, intQ]) {
+      assert.ok(!String(S.Summary[0][0]).startsWith('PARTIAL'), 'complete price: no banner');
+      near2(lab(S, 'D '), pr.result.D, 'D'); near2(lab(S, 'H '), pr.result.H, 'H'); near2(lab(S, 'OH '), pr.result.OH, 'OH'); near2(lab(S, 'F '), pr.result.F, 'F');
+      near2(lab(S, 'L '), pr.result.L, 'L'); near2(lab(S, 'C '), pr.result.C, 'C'); near2(lab(S, 'P_min'), pr.result.P_min, 'P_min'); near2(lab(S, 'P '), pr.result.P, 'P');
+      assert.strictEqual(lab(S, 'Margin'), 15); assert.strictEqual(lab(S, 'Snapshot date'), pr.snapshot_created);
+      assert.strictEqual(S.CashFlow.length, pr.result.schedule.length + 1);
+    }
+    const partsOf = (S, no, desc) => S.Rows.find(x => x[1] === desc)[S.Rows[0].indexOf('Parts')];
+    const a1desc = 'حفر التربة Excavation';
+    assert.ok(partsOf(intA, '1.1', a1desc).includes('T-2 x0.4: labour 40 | fixed 2'), 'admin sees the foreman part');
+    const qsParts = partsOf(intQ, '1.1', a1desc);
+    assert.ok(qsParts.includes('T-2 x0.4: labour hidden | fixed 2'), 'qs: small-trade part hidden, fixed part visible: ' + qsParts);
+    assert.ok(!qsParts.includes('T-2 x0.4: labour 40'), 'qs: no foreman rate');
+    const qsDump = JSON.stringify(intQ);
+    for (const w of ['Foreman', 'headcount', 'Labourer']) assert.ok(!qsDump.includes(w), 'qs internal export has no ' + w);
+    assert.ok(intQ.Hidden.some(x => x.includes('Consultant')), 'hidden sheet lists the checklist');
+    const intQcsv = (await getBin(base, `tenders/${tid}/export?format=csv&kind=internal`, qs)).b.toString('utf8');
+    assert.ok(intQcsv.includes('[Rows]') && intQcsv.includes('[Hidden]') && intQcsv.includes('[CashFlow]') && !intQcsv.includes('Foreman'));
+    assert.ok(!intQcsv.startsWith('﻿PARTIAL'));
+
     // ---- overhead missing: blocking, result null, not a crash ---------------------------------------------
     addSnap({ ...SNAP, oh_monthly: null });
     const tOh = (await ok(call('POST', 'tenders', tInfo, qs), 'create oh')).id;
@@ -249,6 +358,11 @@ server.listen(0, async () => {
     for (const h of (await call('GET', `tenders/${tOh}/hidden`, null, qs)).j) await ok(call('PUT', `tenders/${tOh}/hidden/${h.id}`, { status: 'na' }, qs), 'answer');
     const pOh = await ok(call('GET', `tenders/${tOh}/price`, null, qs), 'price oh');
     assert.strictEqual(pOh.result, null); assert.ok(pOh.blocking.some(b => b.code === 'overhead_missing'));
+
+    // no price at all: client refused, internal says so
+    assert.strictEqual((await call('GET', `tenders/${tOh}/export?format=xlsx&kind=client`, null, qs)).s, 409);
+    const noPrice = sheetsOf((await getBin(base, `tenders/${tOh}/export?format=xlsx&kind=internal`, admin)).b);
+    assert.ok(String(noPrice.Summary[0][0]).startsWith('NO PRICE'));
 
     // a tender with nothing to price and no blocking: clear 400, not a 500
     addSnap(SNAP);
@@ -298,6 +412,22 @@ server.listen(0, async () => {
       ['tender_rows', 'links'], ['takeoff_lines', 'create'], ['takeoff_lines', 'update'], ['takeoff_lines', 'delete'], ['tender_hidden', 'create'], ['tender_hidden', 'update'],
       ['tender_hidden', 'delete'], ['hidden_templates', 'create'], ['hidden_templates', 'update']])
       assert.ok(db.prepare('SELECT 1 FROM audit_log WHERE entity=? AND action=?').get(entity, action), `audited: ${entity} ${action}`);
+    // ---- approved tender: exports come from the frozen result, never recomputed ----------------------------------
+    const beforeX = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, qs)).b).BOQ;
+    await ok(call('POST', `tenders/${tid}/submit`, null, qs), 'submit');
+    await ok(call('POST', `tenders/${tid}/approve`, { margin_pct: 15 }, admin), 'approve');
+    addSnap({ ...SNAP, oh_monthly: 99999 });
+    db.prepare('UPDATE tender_rows SET qty=qty*2 WHERE tender_id=?').run(tid);
+    db.prepare('UPDATE tender_hidden SET status=NULL WHERE tender_id=?').run(tid);
+    for (const ck of [qs, viewer]) {
+      const r = await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, ck);
+      assert.strictEqual(r.s, 200, 'frozen client export allowed');
+      assert.deepStrictEqual(sheetsOf(r.b).BOQ, beforeX, 'frozen export unchanged by later data changes');
+    }
+    const fz = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=internal`, qs)).b);
+    assert.ok(Math.abs(fz.Summary.find(x => String(x[0]).startsWith('P '))[1] - pr.result.P) <= 0.0051, 'frozen P');
+    assert.ok(!String(fz.Summary[0][0]).startsWith('PARTIAL'));
+    assert.ok(!JSON.stringify(fz).includes('Foreman'), 'frozen internal export obeys the role view');
     console.log('tenders ok'); process.exit(0);
   } catch (e) { console.error(e); process.exit(1); }
 });

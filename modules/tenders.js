@@ -3,6 +3,8 @@
 const { readXlsx } = require('../lib/xlsx');
 const { unitCost } = require('../lib/unitcost');
 const { priceTender } = require('../lib/pricing');
+const { writeXlsx } = require('../lib/xlsx');
+const { round2 } = require('../lib/money');
 
 const DAY = 86400000, MAX = 1e12, MAX_MONTHS = 1200;
 const KINDS = ['rta', 'direct'];
@@ -39,6 +41,28 @@ const takeoffQty = lines => lines.reduce((s, x) => {
   const v = (x.l ?? 1) * (x.w ?? 1) * (x.d ?? 1) * (x.count ?? 1);
   return s + (x.deduct ? -v : v);
 }, 0);
+
+// ---- export helpers (pure) -------------------------------------------------------------------------------
+const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+const PARTIAL_EN = 'PARTIAL — not a tender price', PARTIAL_AR = 'سعر ناقص — ليس سعر المناقصة';
+const NO_PRICE_EN = 'NO PRICE — pricing is blocked', NO_PRICE_AR = 'لا يوجد سعر — التسعير متوقف';
+// CSV: a text cell that a spreadsheet could read as a formula gets a leading quote (the client's BOQ text is untrusted)
+const csvCell = v => {
+  if (v === null || v === undefined) return '';
+  let t = typeof v === 'number' ? String(v) : String(v);
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(t)) t = "'" + t;
+  return /[",\r\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+};
+// sheets: [{ name, rows }]. One sheet -> plain table; several -> each later sheet is introduced by a [Name] row.
+const toCsv = sheets => {
+  const lines = [];
+  sheets.forEach((sh, i) => {
+    if (i > 0) { lines.push(''); lines.push(csvCell('[' + sh.name + ']')); }
+    for (const r of sh.rows) lines.push(r.map(csvCell).join(','));
+  });
+  return Buffer.concat([Buffer.from('﻿', 'utf8'), Buffer.from(lines.join('\r\n') + '\r\n', 'utf8')]);
+};
+const safeRef = (ref, id) => { const r = String(ref || '').replace(/[^A-Za-z0-9_-]/g, '_'); return r.replace(/_/g, '') ? r : String(id); };
 
 module.exports = ctx => {
   const { db, send, bad, need, readBody, audit, getSettings, num } = ctx;
@@ -278,6 +302,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         complete: c.complete, excluded_rows: c.excludedRows, unanswered_hidden: c.unansweredHidden,
         rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking });
     }
+    if (sub === 'export' && parts.length === 3 && method === 'GET') return exportApi(res, url, t, me);
     if (parts.length === 3 && method === 'POST' && ['submit', 'return', 'send', 'reprice', 'approve', 'revise'].includes(sub)) return workflow(sub, req, res, t, me);
     if (sub === 'result' && parts.length === 3 && method === 'PUT') {
       need(me, 'admin', 'qs');
@@ -345,6 +370,68 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     if (sub === 'rows') return rowsApi(req, res, t, me, subId, sub2, sub2Id, parts.length);
     if (sub === 'hidden') return hiddenApi(req, res, t, me, subId, parts.length);
     return false;
+  }
+
+  // ---- exports (xlsx / csv) ---------------------------------------------------------------------------------
+  // client: only a complete price; internal: also a draft, but a partial price is marked on its first row.
+  // approved/sent/won/lost tenders read the frozen result only.
+  function exportApi(res, url, t, me) {
+    need(me, 'admin', 'qs', 'viewer');
+    const format = url.searchParams.get('format') || 'xlsx', kind = url.searchParams.get('kind') || 'client';
+    if (!['xlsx', 'csv'].includes(format)) bad('format must be xlsx or csv');
+    if (!['client', 'internal'].includes(kind)) bad('kind must be client or internal');
+    if (kind === 'internal') need(me, 'admin', 'qs');
+    let d;
+    if (FROZEN_STATUSES.includes(t.status)) {
+      const f = JSON.parse(t.frozen);
+      d = { result: f, rows: f.rows, hidden: f.hidden, complete: true, blocking: [], excluded: [], unanswered: [], margin: f.margin_pct, snapshot: f.snapshot_created, error: null };
+    } else {
+      const c = compute(t);
+      if (kind === 'client' && (!c.result || !c.complete || c.blocking.length)) conflict(c.error && !c.blocking.length ? c.error : 'pricing is not complete: a client BOQ needs a complete price', c.blocking);
+      d = { result: c.result, rows: c.rows, hidden: c.hidden, complete: c.complete, blocking: c.blocking, excluded: c.excludedRows, unanswered: c.unansweredHidden,
+        margin: c.margin, snapshot: c.snap ? c.snap.created : null, error: c.error };
+    }
+    const rows = viewRows(d.rows, me.role);   // the same role view as the price response: no small-trade labour part for qs
+    const r = d.result;
+    let sheets;
+    if (kind === 'client') {
+      sheets = [{ name: 'BOQ', colWidths: [8, 60, 8, 12, 12, 14], rows: [
+        ['No', 'Description', 'Unit', 'Qty', 'Rate', 'Amount'],
+        ...rows.map(o => o.is_heading ? [o.no, o.description, o.unit, null, null, null] : [o.no, o.description, o.unit, o.qty, o.rate, o.amount]),
+        [null, 'Total', null, null, null, r.total],
+        [null, 'Prices exclude VAT'], [null, 'الأسعار لا تشمل ضريبة القيمة المضافة'],
+      ] }];
+    } else {
+      const label = o => [o.no, o.description].filter(Boolean).join(' ');
+      const sum = [];
+      if (!r) sum.push([NO_PRICE_EN, NO_PRICE_AR], ...d.blocking.map(b => [b.code, b.detail ?? (b.row_id ? 'row ' + b.row_id : b.hidden_id ? 'hidden item ' + b.hidden_id : null)]), [d.error], []);
+      else if (!d.complete) {
+        sum.push([PARTIAL_EN, PARTIAL_AR]);
+        sum.push(['Rows left out of the price']);
+        for (const o of rows.filter(x => d.excluded.includes(x.id))) sum.push([label(o)]);
+        sum.push(['Unanswered hidden items']);
+        for (const h of d.hidden.filter(x => d.unanswered.includes(x.id))) sum.push([h.name_en || h.name_ar]);
+        sum.push([]);
+      }
+      sum.push(['Tender', t.title], ['Ref', t.ref], ['Revision', t.rev], ['Status', t.status], ['Snapshot date', d.snapshot], ['Margin %', d.margin]);
+      if (r) sum.push(['D (direct cost)', round2(r.D)], ['H (hidden items)', round2(r.H)], ['OH (overhead)', round2(r.OH)], ['F (financing)', round2(r.F)], ['L (locked amounts)', round2(r.L)],
+        ['C (true cost)', round2(r.C)], ['P_min (floor price)', round2(r.P_min)], ['P (price)', round2(r.P)], ['Total of BOQ amounts', r.total], ['Rounding difference', r.rounding_diff]);
+      const parts = o => o.manual_unit !== null ? 'manual unit rate' : o.links.map(l => `${l.code} x${l.share}: ` + (l.parts.length ? l.parts.map(p => p.hidden ? `${p.kind} hidden` : `${p.kind} ${round2(p.cost)}`).join(' | ') : (l.missing.length ? 'unpriced: ' + l.missing.join(', ') : ''))).join('; ');
+      sheets = [
+        { name: 'Summary', colWidths: [32, 40], rows: sum },
+        { name: 'Rows', colWidths: [8, 50, 8, 12, 14, 12, 14, 70], rows: [['No', 'Description', 'Unit', 'Qty', 'Direct unit', 'Rate', 'Amount', 'Parts'],
+          ...rows.map(o => o.is_heading ? [o.no, o.description, o.unit, null, null, null, null, null]
+            : [o.no, o.description, o.unit, o.qty, o.direct_unit === null ? null : round2(o.direct_unit), o.rate, o.amount, parts(o)])] },
+        { name: 'Hidden', colWidths: [34, 34, 10, 10, 12, 8, 8, 12, 8, 30], rows: [['Name', 'Name (AR)', 'Kind', 'Status', 'Amount', '%', 'Months', 'Bank fee %', 'Loss %', 'Note'],
+          ...d.hidden.map(h => [h.name_en, h.name_ar, h.kind, h.status, h.amount, h.pct, h.months, h.bank_fee_pct, h.loss_pct, h.note])] },
+        { name: 'CashFlow', colWidths: [8, 14, 14, 14, 14], rows: [['Month', 'Out', 'In', 'Balance', 'Financing cost'],
+          ...(r ? r.schedule.map(x => [x.month, round2(x.out), round2(x.in), round2(x.balance), round2(x.cost)]) : [])] },
+      ];
+    }
+    const name = `tender-${safeRef(t.ref, t.id)}-rev${t.rev}-${kind}.${format}`;
+    const head = { 'Content-Disposition': `attachment; filename="${name}"` };
+    if (format === 'xlsx') return reply(res, 200, writeXlsx(sheets), { ...head, 'Content-Type': XLSX_TYPE });
+    return reply(res, 200, toCsv(sheets), { ...head, 'Content-Type': 'text/csv; charset=utf-8' });
   }
 
   // ---- workflow ----------------------------------------------------------------------------------------
