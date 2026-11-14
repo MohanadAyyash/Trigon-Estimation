@@ -72,7 +72,7 @@ const createUser = (username, password, role) => {
 };
 
 // ---- modules (later tasks append require('./modules/x') here) -------------------
-const MODULES = [].map(f => f(ctx));
+const MODULES = [require('./modules/costs')].map(f => f(ctx));
 
 async function api(req, res, url) {
   const parts = url.pathname.split('/').slice(2), [a] = parts, method = req.method;
@@ -156,5 +156,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (require.main === module) server.listen(PORT, HOST, () => console.log(`Trigon Estimation on http://${HOST}:${PORT}`));
+if (require.main === module) server.listen(PORT, HOST, () => {
+  console.log(`Trigon Estimation on http://${HOST}:${PORT}`);
+  ctx.costs.startScheduler();   // once now, then every sync_minutes (skipped when ERP_SYNC_DISABLED=1)
+});
 module.exports = { server, db, ctx };
