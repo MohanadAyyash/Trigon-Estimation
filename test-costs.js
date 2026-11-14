@@ -1,6 +1,8 @@
 // Cost snapshot builder (pure): node --no-warnings test-costs.js
-const assert = require('assert');
+const fs = require('fs'), os = require('os'), path = require('path'), assert = require('assert');
 const { buildSnapshot, viewSnapshot } = require('./lib/costs.js');
+const { readErp } = require('./lib/erpsync.js');
+const { makeErp } = require('./test/fixtures/make-erp.js');
 
 const near = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) < 1e-4, `${msg}: expected ≈${b}, got ${a}`);
 const codes = s => s.warnings.map(w => w.code);
@@ -46,9 +48,11 @@ function fixture() {
     hires: [
       { key: 7, name: 'Test Roller', type: 'equipment', basis: 'month', rate: 13000, base_hours: 260 },
       { key: 8, name: 'Test Pump', type: 'equipment', basis: 'hour', rate: 40, base_hours: null },
+      { key: 9, name: 'Test Labour Supply', type: 'labour', basis: 'month', rate: 2600, base_hours: 260 },
     ],
     projects: [
-      { contract_value: 1200000, start_date: '2026-01-01', end_date: '2026-12-31' },   // 11 whole months
+      { contract_value: 1200000, start_date: '2026-01-01', end_date: '2026-12-31' },   // 12 months (end inclusive)
+      { contract_value: 100000, start_date: '2026-03-01', end_date: '2026-04-30' },    // 2 months
       { contract_value: 500000, start_date: null, end_date: '2027-01-01' },
     ],
     earliest_bill: '2024-02-01',
@@ -103,9 +107,10 @@ assert.strictEqual(equip(snap, 'asset:1'), undefined, 'never-logged asset is ove
 near(equip(snap, 'hire:7').rate, 50, 'hired roller');
 assert.strictEqual(equip(snap, 'hire:7').source, 'hired');
 near(equip(snap, 'hire:8').rate, 40, 'hired pump per hour');
+assert.strictEqual(equip(snap, 'hire:9'), undefined, 'hired labour is not equipment');
 
 // work per month, PO prices, carried warnings
-near(snap.w_monthly, 1200000 / 11, 'w_monthly');
+near(snap.w_monthly, 1200000 / 12 + 100000 / 2, 'w_monthly');
 assert.ok(codes(snap).includes('project_no_dates'));
 assert.deepStrictEqual(snap.po_prices, [{ description: 'Cement', unit: 'bag', date: '2026-10-01', rate: 18 }]);
 assert.ok(codes(snap).includes('bad_po_items'));
@@ -115,14 +120,18 @@ assert.ok(!JSON.stringify(snap).includes('employee_key'), 'no employee keys in t
 const snapCopy = JSON.parse(JSON.stringify(snap));
 for (const role of ['qs', 'viewer']) {
   const v = viewSnapshot(snap, role);
-  near(trade(v, 'Foreman').rate, 21.2740, role + ' Foreman via group');
+  // Site 4 = Mason 3 + Foreman 1: Foreman = Site + (Site - Mason) x 3, so neither Site nor Foreman is shown
+  assert.strictEqual(trade(v, 'Foreman').rate, null, role + ' Foreman hidden');
+  assert.strictEqual(group(v, 'Site').rate, null, role + ' Site hidden (small trades total 1)');
   assert.strictEqual(trade(v, 'Foreman').via_group, true);
   assert.ok(!('headcount' in trade(v, 'Foreman')), role + ' Foreman headcount hidden');
+  assert.ok(!('overridden' in trade(v, 'Foreman')), role + ' no overridden flag on via_group rows');
   near(trade(v, 'Mason').rate, 17.3077, role + ' Mason keeps own rate');
   assert.ok(!trade(v, 'Mason').via_group);
-  assert.ok(!('payroll' in v.oh_parts), role + ' payroll part hidden');
+  assert.ok(!('oh_parts' in v), role + ' overhead parts hidden (payroll derivable from the others)');
   assert.ok(!('headcount' in group(v, 'Site')), role + ' group headcount hidden (would reveal small trades by subtraction)');
 }
+near(group(viewSnapshot(snap, 'admin'), 'Site').rate, 21.2740, 'admin still sees Site');
 assert.deepStrictEqual(snap, snapCopy, 'viewSnapshot must not mutate its input');
 assert.deepStrictEqual(viewSnapshot(snap, 'admin'), snap, 'admin sees everything');
 
@@ -134,6 +143,39 @@ assert.deepStrictEqual(viewSnapshot(snap, 'admin'), snap, 'admin sees everything
   assert.strictEqual(trade(v, 'Foreman').rate, null);
   assert.strictEqual(trade(v, 'Foreman').via_group, true);
   assert.strictEqual(group(v, 'Supervision').rate, null);
+}
+
+// small trades totalling >= 3 people (Steel Fixer 2 + Foreman 1) next to Mason: the group rate is shown
+{
+  const r = fixture();
+  for (const m of ['2026-08', '2026-09', '2026-10']) for (const k of [6, 7]) {
+    r.payroll.push({ month: m, employee_key: k, designation: 'Steel Fixer', gross: 3500, overtime: 0, project_share: 1 });
+    r.eos.push({ month: m, employee_key: k, amount: 150 });
+  }
+  r.designations.push('Steel Fixer');
+  const s = buildSnapshot(r, cfg({ trade_map: { Mason: 'Mason', Foreman: 'Foreman', 'Steel Fixer': 'Steel Fixer' },
+    trade_groups: { Mason: 'Site', Foreman: 'Site', 'Steel Fixer': 'Site' }, overrides: { 'trade:Foreman': 40 } }));
+  const site = group(s, 'Site').rate;
+  assert.ok(site > 0);
+  const v = viewSnapshot(s, 'qs');
+  near(group(v, 'Site').rate, site, 'group visible');
+  near(trade(v, 'Foreman').rate, site, 'Foreman via group');
+  near(trade(v, 'Steel Fixer').rate, site, 'Steel Fixer via group');
+  assert.ok(!('overridden' in trade(v, 'Foreman')));
+  near(trade(v, 'Mason').rate, (2700 + 3000 / 6 + 150) / 208, 'Mason own rate (on-cost now shared by 6)');
+}
+
+// payroll-related warning details are hidden from non-admin views
+{
+  const r = fixture();
+  r.warnings.push({ code: 'bad_payroll_gross', id: 77 });
+  r.eos = r.eos.filter(e => e.employee_key !== 4);
+  const s = buildSnapshot(r, cfg());
+  assert.ok(s.warnings.some(w => w.code === 'bad_payroll_gross' && w.detail === 'id 77'));
+  assert.ok(s.warnings.some(w => w.code === 'eos_missing' && w.detail === 'Foreman'));
+  const v = viewSnapshot(s, 'qs');
+  for (const w of v.warnings) if (['bad_payroll_gross', 'eos_missing'].includes(w.code)) assert.ok(!('detail' in w), w.code + ' detail hidden');
+  assert.ok(v.warnings.some(w => w.code === 'unmapped_category' && w.detail === 'misc'), 'other details kept');
 }
 
 // trade with no group mapping is its own group
@@ -165,11 +207,15 @@ assert.deepStrictEqual(viewSnapshot(snap, 'admin'), snap, 'admin sees everything
 // short history
 {
   const r = fixture();
-  r.earliest_bill = '2026-05-20';
-  r.bills = r.bills.filter(b => b.date >= '2026-05-20');
+  r.earliest_bill = '2026-05-01';
+  r.bills = r.bills.filter(b => b.date >= '2026-05-01');
   const s = buildSnapshot(r, cfg());
   assert.strictEqual(s.months_covered, 6);   // 2026-05 .. 2026-10
   assert.ok(codes(s).includes('short_history'));
+  // office payroll 4000/month exists for 12 months, but only the 6 covered months count:
+  // (rent 6 x 10000 + payroll 6 x 4000 + depreciation 6 x 1000) / 6 = 15000
+  near(s.oh_parts.payroll, 24000, 'short-history OH payroll limited to covered months');
+  near(s.oh_monthly, 10000 + 4000 + 1000, 'short-history OH');
   r.earliest_bill = '2026-11-02';
   assert.strictEqual(buildSnapshot(r, cfg()).months_covered, 1);
 }
@@ -212,6 +258,35 @@ assert.deepStrictEqual(viewSnapshot(snap, 'admin'), snap, 'admin sees everything
   const r = fixture();
   r.eos = r.eos.filter(e => !(e.employee_key === 4 && e.month === '2026-09'));
   near(trade(buildSnapshot(r, cfg()), 'Foreman').rate, 33.1731, 'EOS average over present months');
+}
+
+// project months: end date inclusive
+{
+  const r = fixture();
+  r.projects = [{ contract_value: 60000, start_date: '2026-03-01', end_date: '2026-04-30' }];
+  near(buildSnapshot(r, cfg()).w_monthly, 30000, '2-month project');
+  r.projects = [{ contract_value: 60000, start_date: '2026-02-30', end_date: '2026-04-30' }];
+  const s = buildSnapshot(r, cfg());
+  assert.strictEqual(s.w_monthly, 0);
+  assert.ok(codes(s).includes('project_no_dates'), 'impossible date rejected');
+}
+
+// integration: readErp's window covers the builder's whole window (first day of month - 12)
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-costs-'));
+  try {
+    const file = path.join(dir, 'erp.db');
+    makeErp(file, {
+      employees: [{ id: 1, name: 'Test Clerk A', designation: 'Office Clerk', project_id: null }],
+      payroll: [{ id: 1, month: '2025-11', employee_id: 1, project_id: null, gross: 2400, overtime: 0, status: 'final' }],
+      bills: [{ id: 1, date: '2025-11-01', project_id: null, category: 'Rent', amount: 1200 }],
+    });
+    const s = buildSnapshot(readErp(file, { now: new Date('2026-11-14T10:00:00Z') }), cfg());
+    assert.strictEqual(s.months_covered, 12);
+    near(s.oh_parts.bills, 1200, 'bill dated 2025-11-01 counted');
+    near(s.oh_parts.payroll, 2400, 'payroll of 2025-11 counted');
+    near(s.oh_monthly, 300, 'integration OH');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 assert.throws(() => buildSnapshot(fixture(), null), /cfg/);

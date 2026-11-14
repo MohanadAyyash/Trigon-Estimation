@@ -76,7 +76,7 @@ assert.ok(!/"name"/.test(JSON.stringify({ p: raw.payroll, e: raw.eos })), 'name 
 assert.ok(!/employee_id/.test(json), 'employee_id key leaked');
 
 // payroll: final only, window, share
-assert.ok(raw.payroll.every(r => r.month >= '2025-12'), 'window');
+assert.ok(raw.payroll.every(r => r.month >= '2025-11'), 'window');
 assert.strictEqual(raw.payroll.length, 5);
 const mason9 = raw.payroll.find(r => r.month === '2026-09'), mason10 = raw.payroll.find(r => r.month === '2026-10' && r.designation === 'Mason');
 assert.strictEqual(mason9.project_share, 0.5);
