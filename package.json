@@ -1,0 +1,12 @@
+{
+  "name": "trigon-estimation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Trigon Estimation: construction tender estimating app (zero dependencies)",
+  "main": "server.js",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "test": "node --no-warnings run-tests.js"
+  }
+}
