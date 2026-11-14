@@ -39,9 +39,23 @@ const zip2 = buildZip([
 assert.deepStrictEqual(readXlsx(zip2).sheets, [{ name: 'A', rows: [[], [null, 'x']] }, { name: 'B', rows: [] }]);
 
 // 4. two sheets keep order and names
-const two = readXlsx(writeXlsx([{ name: 'Second?', rows: [['a']] }, { name: 'First & Last', rows: [[1, 2]] }]));
-assert.deepStrictEqual(two.sheets.map(s => s.name), ['Second?', 'First & Last']);
+const two = readXlsx(writeXlsx([{ name: 'Second', rows: [['a']] }, { name: 'First & Last', rows: [[1, 2]] }]));
+assert.deepStrictEqual(two.sheets.map(s => s.name), ['Second', 'First & Last']);
 assert.deepStrictEqual(two.sheets[1].rows, [[1, 2]]);
+
+// 4b. sheet-name validation, formula without cached value, no sheets
+const wr = name => () => writeXlsx([{ name, rows: [] }]);
+assert.throws(wr('Bad:Name'), /invalid sheet name/);
+assert.throws(wr('x'.repeat(32)), /31/);
+assert.doesNotThrow(wr('x'.repeat(31)));
+assert.throws(() => writeXlsx([{ name: 'Dup', rows: [] }, { name: 'dUP', rows: [] }]), /duplicate sheet name/);
+assert.throws(wr(''), /invalid sheet name/);
+assert.throws(wr("'quoted"), /apostrophe/);
+const one = sheetBody => buildZip([{ name: 'xl/workbook.xml', data: WB(['Sheet1']) }, { name: 'xl/_rels/workbook.xml.rels', data: RELS(1) }, { name: 'xl/worksheets/sheet1.xml', data: SHEET(sheetBody) }]);
+assert.throws(() => readXlsx(one('<row r="7"><c r="D7"><f>A1*B1</f></c></row>')), /formula without cached value at Sheet1!D7 .* Excel first/);
+assert.throws(() => readXlsx(one('<row r="7"><c r="D7"><f>A1*B1</f><v></v></c></row>')), /formula without cached value at Sheet1!D7/);
+assert.deepStrictEqual(readXlsx(one('<row r="1"><c r="A1"><f>1+2</f><v>3</v></c></row>')).sheets[0].rows, [[3]]);
+assert.throws(() => readXlsx(buildZip([{ name: 'xl/workbook.xml', data: WB(['S']).replace(/<sheet /g, '<x:sheet ') }])), /^Error: no sheets found in workbook$/);
 
 // 5. Arabic and awkward text round-trips unchanged
 const ar = [['البند', 'الوصف', 'الكمية'], ['١', 'رصف أحجار البردورة — مم', 12], ['2', '  padded  ', 'line1\nline2 & <b> "q" \'s\'']];
