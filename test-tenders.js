@@ -166,6 +166,9 @@ server.listen(0, async () => {
     assert.strictEqual(pr.blocking.filter(b => b.code === 'hidden_unanswered').length, 11);
     assert.strictEqual(pr.newer_snapshot, false);
     assert.ok(pr.result && pr.result.P > 0, 'pricing possible with blocking');
+    // a partial price is marked as such
+    assert.strictEqual(pr.complete, false); assert.strictEqual(pr.result.partial, true);
+    assert.deepStrictEqual(pr.excluded_rows.sort(), [a2.id, tr].sort()); assert.strictEqual(pr.unanswered_hidden.length, 11);
 
     // manual unit
     assert.strictEqual((await call('PUT', `tenders/${tid}/rows/${a2.id}`, { manual_unit: -1 }, qs)).s, 400);
@@ -205,6 +208,8 @@ server.listen(0, async () => {
     // ---- clean pricing ----------------------------------------------------------------------------------
     pr = await ok(call('GET', `tenders/${tid}/price`, null, qs), 'price');
     assert.deepStrictEqual(pr.blocking, []);
+    assert.strictEqual(pr.complete, true); assert.strictEqual(pr.result.partial, false);
+    assert.deepStrictEqual(pr.excluded_rows, []); assert.deepStrictEqual(pr.unanswered_hidden, []);
     const { priceTender } = require('./lib/pricing.js');
     const expect = priceTender({ rows: [{ id: a1.id, qty: 1250.5, direct_unit: 0.6 * units[i1] + 0.4 * units[i2] }, { id: a2.id, qty: 300, direct_unit: 50 }, { id: tr, qty: 17, direct_unit: units[i1] }],
       hidden: [{ kind: 'locked', amount: 20000, months: 6, bank_fee_pct: 1, loss_pct: 5 }, { kind: 'fixed', amount: 10000 }, { kind: 'pct', pct: 0.5 }],
@@ -251,6 +256,29 @@ server.listen(0, async () => {
     for (const h of (await call('GET', `tenders/${tEmpty}/hidden`, null, qs)).j) await ok(call('PUT', `tenders/${tEmpty}/hidden/${h.id}`, { status: 'na' }, qs), 'answer');
     const pe = await call('GET', `tenders/${tEmpty}/price`, null, qs);
     assert.strictEqual(pe.s, 400); assert.ok(/D/.test(pe.j.error));
+
+    // ---- zero qty, missing item version, links removed by re-import ---------------------------------------
+    const tZ = (await ok(call('POST', 'tenders', tInfo, qs), 'create z')).id;
+    const zr = await ok(call('POST', `tenders/${tZ}/import`, imp, qs), 'import z');
+    assert.strictEqual(zr.links_removed, 0);
+    const zRows = (await call('GET', `tenders/${tZ}/rows`, null, qs)).j;
+    await ok(call('PUT', `tenders/${tZ}/rows/${zRows[1].id}/links`, { links: [{ item_id: i1, share: 1 }] }, qs), 'link z');
+    await ok(call('PUT', `tenders/${tZ}/rows/${zRows[2].id}/links`, { links: [{ item_id: i1, share: 0.5 }, { item_id: i2, share: 0.5 }] }, qs), 'link z2');
+    assert.strictEqual((await ok(call('POST', `tenders/${tZ}/import`, imp, qs), 're-import z')).links_removed, 3);
+    assert.ok(db.prepare("SELECT 1 FROM audit_log WHERE entity='tenders' AND action='import' AND entity_id=? AND detail LIKE '%\"links_removed\":3%'").get(String(tZ)));
+    const zManual = (await ok(call('POST', `tenders/${tZ}/rows`, { description: 'No lines yet' }, qs), 'zero row')).id;
+    await ok(call('PUT', `tenders/${tZ}/rows/${zManual}`, { manual_unit: 10 }, qs), 'zero manual');
+    const zLinked = (await ok(call('POST', `tenders/${tZ}/rows`, { description: 'No lines, linked' }, qs), 'zero row 2')).id;
+    await ok(call('PUT', `tenders/${tZ}/rows/${zLinked}/links`, { links: [{ item_id: i1, share: 1 }] }, qs), 'zero link');
+    let pz = await ok(call('GET', `tenders/${tZ}/price`, null, qs), 'price z');
+    assert.deepStrictEqual(pz.blocking.filter(b => b.code === 'row_zero_qty').map(b => b.row_id), [zManual, zLinked]);
+    const i5 = await item('T-5', [{ kind: 'fixed', amount: 7 }]);
+    const zRows2 = (await call('GET', `tenders/${tZ}/rows`, null, qs)).j;
+    await ok(call('PUT', `tenders/${tZ}/rows/${zRows2[1].id}/links`, { links: [{ item_id: i5, share: 1 }] }, qs), 'link i5');
+    db.prepare('DELETE FROM item_versions WHERE item_id=?').run(i5);
+    pz = await ok(call('GET', `tenders/${tZ}/price`, null, qs), 'price with a missing version');
+    assert.ok(pz.blocking.some(b => b.code === 'row_unpriced' && b.row_id === zRows2[1].id && /version/.test(b.detail)), 'missing version → row_unpriced');
+    assert.ok(pz.excluded_rows.includes(zRows2[1].id));
 
     // ---- templates: deactivation never changes existing tenders -----------------------------------------
     const site = tpl.find(x => x.name_en === 'Site office').id;

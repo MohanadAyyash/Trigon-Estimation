@@ -131,6 +131,7 @@ server.listen(0, async () => {
 
     // ---- send / result -----------------------------------------------------------------------------------------
     assert.strictEqual((await call('PUT', `tenders/${B.id}/result`, { result: 'won' }, qs)).s, 409, 'result needs an approved tender');
+    assert.strictEqual((await call('PUT', `tenders/${A.id}/result`, { result: 'won' }, qs)).s, 409, 'result needs a sent tender');
     await ok(call('POST', `tenders/${A.id}/send`, null, qs), 'send');
     assert.strictEqual((await call('GET', `tenders/${A.id}`, null, qs)).j.status, 'sent');
     assert.strictEqual((await call('PUT', `tenders/${A.id}/result`, { result: 'maybe' }, qs)).s, 400);
@@ -141,6 +142,8 @@ server.listen(0, async () => {
     const tL = (await call('GET', `tenders/${A.id}`, null, qs)).j;
     assert.strictEqual(tL.status, 'lost'); assert.strictEqual(tL.result, 'lost'); assert.strictEqual(tL.winner_price, 123456.5);
     assert.ok(audited('send', A.id)); assert.ok(audited('result', A.id));
+    assert.strictEqual((await call('PUT', `tenders/${A.id}/result`, { result: 'won' }, qs)).s, 409, 'won/lost are final');
+    assert.strictEqual((await call('GET', `tenders/${A.id}`, null, qs)).j.result, 'lost');
     assert.strictEqual((await call('GET', `tenders/${A.id}/price`, null, qs)).j.frozen.P, ap.frozen.P);
 
     // ---- stale snapshot: approval blocked unless the admin overrides (Review Focus 3) ------------------------------
@@ -171,6 +174,12 @@ server.listen(0, async () => {
     const d2 = await ok(call('GET', `tenders/${D.id}/price`, null, qs), 'price D after reprice');
     assert.strictEqual(d2.newer_snapshot, false); assert.strictEqual(d2.result.P, rp.new_P);
     assert.ok(audited('reprice', D.id));
+    assert.strictEqual(rp.old_complete, true); assert.strictEqual(rp.new_complete, true); assert.deepStrictEqual(rp.blocking, []);
+    // reprice on a partial tender says so
+    const E = await makeTender(true);
+    const rpE = await ok(call('POST', `tenders/${E.id}/reprice`, null, qs), 'reprice partial');
+    assert.strictEqual(rpE.old_complete, false); assert.strictEqual(rpE.new_complete, false);
+    assert.ok(rpE.blocking.some(b => b.code === 'hidden_unanswered' && b.hidden_id === E.hidden[0].id));
     console.log('workflow ok'); process.exit(0);
   } catch (e) { console.error(e); process.exit(1); }
 });

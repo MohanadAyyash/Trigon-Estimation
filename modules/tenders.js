@@ -124,7 +124,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     const cfg = { work_hours: s.work_hours, materialPrice: id => { const m = mat(id); return m ? m.rate : null; } };
     const version = (itemId, v) => {
       const k = itemId + ':' + v;
-      if (!versions.has(k)) { const r = db.prepare('SELECT id, data FROM item_versions WHERE item_id=? AND version=?').get(itemId, v); versions.set(k, { id: r.id, data: JSON.parse(r.data) }); }
+      if (!versions.has(k)) { const r = db.prepare('SELECT id, data FROM item_versions WHERE item_id=? AND version=?').get(itemId, v); versions.set(k, r ? { id: r.id, data: JSON.parse(r.data) } : null); }
       return versions.get(k);
     };
     const linkQ = db.prepare('SELECT l.item_id, l.share, i.code, i.unit AS uom, i.name_ar, i.name_en, i.current_version FROM row_links l JOIN items i ON i.id=l.item_id WHERE l.row_id=? ORDER BY l.rowid');
@@ -133,22 +133,26 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const o = { id: r.id, seq: r.seq, no: r.no, description: r.description, unit: r.unit, qty: r.qty, is_heading: r.is_heading, source: r.source,
         manual_unit: r.manual_unit, direct_unit: null, links: [], rate: null, amount: null };
       if (r.is_heading) return o;
-      if (r.manual_unit !== null) { o.direct_unit = r.manual_unit; return o; }   // a manual row is a direct cost; its links are not used
+      // a priced row with qty 0 (e.g. a take-off row with no lines yet) would silently add nothing
+      const zero = () => { if (r.qty === 0) block('row_zero_qty', { row_id: r.id }); };
+      if (r.manual_unit !== null) { o.direct_unit = r.manual_unit; zero(); return o; }   // a manual row is a direct cost; its links are not used
       const links = linkQ.all(r.id);
       if (!links.length) { block('row_unlinked', { row_id: r.id }); return o; }
+      zero();
       let du = 0;
       const missing = [], stale = [];
       for (const l of links) {
         const v = version(l.item_id, l.current_version);
-        const lk = { item_id: l.item_id, code: l.code, name_ar: l.name_ar, name_en: l.name_en, uom: l.uom, share: l.share, version: l.current_version, version_id: v.id, unit: null, missing: [], parts: [] };
-        itemVersions.push({ row_id: r.id, item_id: l.item_id, version: l.current_version, version_id: v.id, share: l.share });
-        if (!snap) lk.missing = ['snapshot'];
+        const lk = { item_id: l.item_id, code: l.code, name_ar: l.name_ar, name_en: l.name_en, uom: l.uom, share: l.share, version: l.current_version, version_id: v ? v.id : null, unit: null, missing: [], parts: [] };
+        if (!v) lk.missing = ['version:' + l.item_id + '/' + l.current_version];   // the item's current version row is missing: unpriced, never a crash
+        else if (!snap) lk.missing = ['snapshot'];
         else {
           const uc = unitCost(v.data, snap.data, cfg);
           lk.unit = uc.unit; lk.missing = uc.missing;
           lk.parts = uc.parts.map((p, i) => smallCrew(v.data.parts[i]) ? { kind: p.kind, cost: p.cost, hide: true } : { kind: p.kind, cost: p.cost });
           for (const p of v.data.parts) if (p.kind === 'material') { const m = mat(p.material_id); if (m && m.stale && !stale.includes(p.material_id)) stale.push(p.material_id); }
         }
+        if (v) itemVersions.push({ row_id: r.id, item_id: l.item_id, version: l.current_version, version_id: v.id, share: l.share });
         for (const m of lk.missing) if (!missing.includes(m)) missing.push(m);
         if (lk.unit === null || du === null) du = null; else du += l.share * lk.unit;
         o.links.push(lk);
@@ -174,7 +178,12 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       } catch (e) { if (e.code !== 'bad_input' && e.code !== 'no_convergence') throw e; error = e.message; }
     }
     if (result) { const by = new Map(result.rows.map(x => [x.id, x])); for (const o of rows) { const x = by.get(o.id); if (x) { o.rate = x.rate; o.amount = x.amount; } } }
-    return { snap, settings: s, inputs, margin, rows, hidden, applied, blocking, result, error, itemVersions };
+    // a price that leaves out rows or unanswered hidden items is not the tender's price: say so
+    const excludedRows = rows.filter(o => !o.is_heading && o.direct_unit === null).map(o => o.id);
+    const unansweredHidden = hidden.filter(h => h.status === null).map(h => h.id);
+    const complete = !excludedRows.length && !unansweredHidden.length;
+    if (result) result.partial = !complete;
+    return { snap, settings: s, inputs, margin, rows, hidden, applied, blocking, result, error, itemVersions, complete, excludedRows, unansweredHidden };
   }
   // role view of breakdown rows: qs/viewer never see a small-trade labour part
   const viewRows = (rows, role) => rows.map(r => ({ ...r, links: r.links.map(l => ({ ...l, parts: l.parts.map(p => {
@@ -234,9 +243,11 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         need(me, 'admin', 'qs'); mustDraft(t);
         const b = await readBody(req), n = cleanInfo(b, t, me);
         mustDraft(tenderRow(t.id));
-        db.prepare('UPDATE tenders SET ref=?, title=?, client=?, kind=?, M=?, adv_pct=?, ret_pct=?, collection_days=?, retention_months=?, margin_pct=?, submit_date=? WHERE id=?')
-          .run(n.ref, n.title, n.client, n.kind, n.M, n.adv_pct, n.ret_pct, n.collection_days, n.retention_months, n.margin_pct, n.submit_date, t.id);
-        audit(me, 'update', 'tenders', t.id, { before: Object.fromEntries(INFO.map(k => [k, t[k]])), after: n });
+        tx(() => {
+          db.prepare('UPDATE tenders SET ref=?, title=?, client=?, kind=?, M=?, adv_pct=?, ret_pct=?, collection_days=?, retention_months=?, margin_pct=?, submit_date=? WHERE id=?')
+            .run(n.ref, n.title, n.client, n.kind, n.M, n.adv_pct, n.ret_pct, n.collection_days, n.retention_months, n.margin_pct, n.submit_date, t.id);
+          audit(me, 'update', 'tenders', t.id, { before: Object.fromEntries(INFO.map(k => [k, t[k]])), after: n });
+        });
         return reply(res, 200, tenderView(tenderRow(t.id)));
       }
       if (method === 'DELETE') {
@@ -264,6 +275,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const latest = latestId();
       return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: t.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
         newer_snapshot: latest !== null && latest !== t.snapshot_id, margin_pct: c.margin, inputs: c.inputs, result: c.result, error: c.error,
+        complete: c.complete, excluded_rows: c.excludedRows, unanswered_hidden: c.unansweredHidden,
         rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking });
     }
     if (parts.length === 3 && method === 'POST' && ['submit', 'return', 'send', 'reprice', 'approve', 'revise'].includes(sub)) return workflow(sub, req, res, t, me);
@@ -274,9 +286,11 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const wp = b.winner_price === undefined ? null : nonNegField(b.winner_price, 'winner_price');
       if (b.result === 'won' && wp !== null) bad('winner_price is recorded only for a lost tender');
       const cur = tenderRow(t.id);
-      if (!FROZEN_STATUSES.includes(cur.status)) conflict(`tender is ${cur.status}: a result needs an approved or sent tender`);
-      db.prepare('UPDATE tenders SET status=?, result=?, winner_price=? WHERE id=?').run(b.result, b.result, wp, t.id);
-      audit(me, 'result', 'tenders', t.id, { from: cur.status, result: b.result, winner_price: wp });
+      if (cur.status !== 'sent') conflict(`tender is ${cur.status}: a result is recorded only for a sent tender, once`);   // won/lost are final
+      tx(() => {
+        db.prepare("UPDATE tenders SET status=?, result=?, winner_price=? WHERE id=? AND status='sent'").run(b.result, b.result, wp, t.id);
+        audit(me, 'result', 'tenders', t.id, { from: cur.status, result: b.result, winner_price: wp });
+      });
       return reply(res, 200, tenderView(tenderRow(t.id)));
     }
 
@@ -313,8 +327,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         out.push({ no: text(cell(row, cols.no)), description: text(cell(row, cols.desc)), unit: text(cell(row, cols.unit)), qty });
       });
       if (!out.length) bad(`no rows found after header row ${b.header_row} in sheet "${sheet.name}"`);   // a wrong header_row must not wipe the BOQ
-      tx(() => {
-        db.prepare("DELETE FROM row_links WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=? AND source='import')").run(t.id);
+      const linksRemoved = tx(() => {
+        const removed = Number(db.prepare("DELETE FROM row_links WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=? AND source='import')").run(t.id).changes);
         db.prepare("DELETE FROM takeoff_lines WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=? AND source='import')").run(t.id);
         db.prepare("DELETE FROM tender_rows WHERE tender_id=? AND source='import'").run(t.id);
         const ins = db.prepare("INSERT INTO tender_rows(tender_id,seq,no,description,unit,qty,is_heading,source) VALUES(?,?,?,?,?,?,?,'import')");
@@ -322,9 +336,10 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         // take-off rows keep their order, after the imported rows
         const upd = db.prepare('UPDATE tender_rows SET seq=? WHERE id=?');
         db.prepare("SELECT id FROM tender_rows WHERE tender_id=? AND source='takeoff' ORDER BY seq, id").all(t.id).forEach((r, i) => upd.run(out.length + i + 1, r.id));
-        audit(me, 'import', 'tenders', t.id, { sheet: sheet.name, header_row: b.header_row, cols, rows: out.length, headings: out.filter(r => r.qty === null).length });
+        audit(me, 'import', 'tenders', t.id, { sheet: sheet.name, header_row: b.header_row, cols, rows: out.length, headings: out.filter(r => r.qty === null).length, links_removed: removed });
+        return removed;
       });
-      return reply(res, 200, { ok: 1, rows: out.length });
+      return reply(res, 200, { ok: 1, rows: out.length, links_removed: linksRemoved });
     }
 
     if (sub === 'rows') return rowsApi(req, res, t, me, subId, sub2, sub2Id, parts.length);
@@ -336,8 +351,10 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
   async function workflow(sub, req, res, t, me) {
     const move = (from, to, action) => {
       if (t.status !== from) conflict(`tender is ${t.status}: ${action} needs ${from}`);
-      db.prepare('UPDATE tenders SET status=? WHERE id=? AND status=?').run(to, t.id, from);
-      audit(me, action, 'tenders', t.id, { from, to });
+      tx(() => {
+        db.prepare('UPDATE tenders SET status=? WHERE id=? AND status=?').run(to, t.id, from);
+        audit(me, action, 'tenders', t.id, { from, to });
+      });
       return reply(res, 200, tenderView(tenderRow(t.id)));
     };
     if (sub === 'submit') { need(me, 'admin', 'qs'); return move('draft', 'submitted', 'submit'); }
@@ -348,10 +365,13 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const latest = latestId();
       if (latest === null) bad('no cost snapshot yet');
       const old = compute(t), next = compute({ ...t, snapshot_id: latest });
-      db.prepare('UPDATE tenders SET snapshot_id=? WHERE id=?').run(latest, t.id);
-      const out = { old_snapshot_id: t.snapshot_id, snapshot_id: latest, old_P: old.result ? old.result.P : null, new_P: next.result ? next.result.P : null };
-      audit(me, 'reprice', 'tenders', t.id, out);
-      return reply(res, 200, out);
+      const out = { old_snapshot_id: t.snapshot_id, snapshot_id: latest, old_P: old.result ? old.result.P : null, new_P: next.result ? next.result.P : null,
+        old_complete: old.complete, new_complete: next.complete };
+      tx(() => {
+        db.prepare("UPDATE tenders SET snapshot_id=? WHERE id=? AND status='draft'").run(latest, t.id);
+        audit(me, 'reprice', 'tenders', t.id, out);
+      });
+      return reply(res, 200, { ...out, blocking: next.blocking });
     }
     if (sub === 'approve') {
       need(me, 'admin');
@@ -444,8 +464,10 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       }
       if ('manual_unit' in body) nr.manual_unit = nonNegField(body.manual_unit, 'manual_unit');
       if (nr.is_heading && (nr.manual_unit !== null || db.prepare('SELECT 1 FROM row_links WHERE row_id=?').get(row.id))) bad('a heading row has no price: remove its links and manual unit first');
-      db.prepare('UPDATE tender_rows SET no=?, description=?, unit=?, qty=?, is_heading=?, manual_unit=? WHERE id=?').run(nr.no, nr.description, nr.unit, nr.qty, nr.is_heading, nr.manual_unit, row.id);
-      audit(me, 'update', 'tender_rows', row.id, { tender_id: t.id, before: row, after: nr });
+      tx(() => {
+        db.prepare('UPDATE tender_rows SET no=?, description=?, unit=?, qty=?, is_heading=?, manual_unit=? WHERE id=?').run(nr.no, nr.description, nr.unit, nr.qty, nr.is_heading, nr.manual_unit, row.id);
+        audit(me, 'update', 'tender_rows', row.id, { tender_id: t.id, before: row, after: nr });
+      });
       return reply(res, 200, db.prepare('SELECT * FROM tender_rows WHERE id=?').get(row.id));
     }
     if (sub2 === undefined && method === 'DELETE') {
@@ -530,8 +552,11 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const h = { name_ar: text(b.name_ar), name_en: text(b.name_en), kind: b.kind };
       if (!h.name_ar && !h.name_en) bad('a name is required');
       if (!HIDDEN_KINDS.includes(h.kind)) bad('kind must be one of ' + HIDDEN_KINDS.join(', '));
-      const id = Number(db.prepare('INSERT INTO tender_hidden(tender_id,template_id,name_ar,name_en,kind) VALUES(?,NULL,?,?,?)').run(t.id, h.name_ar, h.name_en, h.kind).lastInsertRowid);
-      audit(me, 'create', 'tender_hidden', id, { tender_id: t.id, ...h });
+      const id = tx(() => {
+        const hid = Number(db.prepare('INSERT INTO tender_hidden(tender_id,template_id,name_ar,name_en,kind) VALUES(?,NULL,?,?,?)').run(t.id, h.name_ar, h.name_en, h.kind).lastInsertRowid);
+        audit(me, 'create', 'tender_hidden', hid, { tender_id: t.id, ...h });
+        return hid;
+      });
       return reply(res, 200, { id });
     }
     if (hidStr === undefined || n !== 4) return false;
@@ -539,8 +564,10 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     if (!h) bad('hidden item not found', 404);
     if (method === 'DELETE') {
       if (h.template_id !== null) bad("a checklist item cannot be deleted: answer it 'na' instead");
-      db.prepare('DELETE FROM tender_hidden WHERE id=?').run(h.id);
-      audit(me, 'delete', 'tender_hidden', h.id, h);
+      tx(() => {
+        db.prepare('DELETE FROM tender_hidden WHERE id=?').run(h.id);
+        audit(me, 'delete', 'tender_hidden', h.id, h);
+      });
       return reply(res, 200, { ok: 1 });
     }
     if (method !== 'PUT') return false;
@@ -558,8 +585,10 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const req2 = { fixed: ['amount'], monthly: ['amount'], pct: ['pct'], locked: ['amount', 'months', 'bank_fee_pct', 'loss_pct'] }[h.kind];
       for (const f of req2) if (nh[f] === null) bad(`${f} is required when a ${h.kind} item applies`);
     }
-    db.prepare('UPDATE tender_hidden SET status=?, amount=?, pct=?, months=?, bank_fee_pct=?, loss_pct=?, note=? WHERE id=?').run(nh.status, nh.amount, nh.pct, nh.months, nh.bank_fee_pct, nh.loss_pct, nh.note, h.id);
-    audit(me, 'update', 'tender_hidden', h.id, { tender_id: t.id, before: h, after: nh });
+    tx(() => {
+      db.prepare('UPDATE tender_hidden SET status=?, amount=?, pct=?, months=?, bank_fee_pct=?, loss_pct=?, note=? WHERE id=?').run(nh.status, nh.amount, nh.pct, nh.months, nh.bank_fee_pct, nh.loss_pct, nh.note, h.id);
+      audit(me, 'update', 'tender_hidden', h.id, { tender_id: t.id, before: h, after: nh });
+    });
     return reply(res, 200, db.prepare('SELECT * FROM tender_hidden WHERE id=?').get(h.id));
   }
 
@@ -582,12 +611,17 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     if (!HIDDEN_KINDS.includes(n.kind)) bad('kind must be one of ' + HIDDEN_KINDS.join(', '));
     // existing tenders hold their own copies: nothing here changes them
     if (!prev) {
-      const id = Number(db.prepare('INSERT INTO hidden_templates(name_ar,name_en,kind,sort,active) VALUES(?,?,?,?,?)').run(n.name_ar, n.name_en, n.kind, n.sort, n.active).lastInsertRowid);
-      audit(me, 'create', 'hidden_templates', id, n);
+      const id = tx(() => {
+        const tid = Number(db.prepare('INSERT INTO hidden_templates(name_ar,name_en,kind,sort,active) VALUES(?,?,?,?,?)').run(n.name_ar, n.name_en, n.kind, n.sort, n.active).lastInsertRowid);
+        audit(me, 'create', 'hidden_templates', tid, n);
+        return tid;
+      });
       return reply(res, 200, { id });
     }
-    db.prepare('UPDATE hidden_templates SET name_ar=?, name_en=?, kind=?, sort=?, active=? WHERE id=?').run(n.name_ar, n.name_en, n.kind, n.sort, n.active, prev.id);
-    audit(me, 'update', 'hidden_templates', prev.id, { before: prev, after: n });
+    tx(() => {
+      db.prepare('UPDATE hidden_templates SET name_ar=?, name_en=?, kind=?, sort=?, active=? WHERE id=?').run(n.name_ar, n.name_en, n.kind, n.sort, n.active, prev.id);
+      audit(me, 'update', 'hidden_templates', prev.id, { before: prev, after: n });
+    });
     return reply(res, 200, db.prepare('SELECT * FROM hidden_templates WHERE id=?').get(prev.id));
   }
 
