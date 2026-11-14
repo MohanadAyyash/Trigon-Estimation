@@ -54,6 +54,8 @@ assert.throws(wr("'quoted"), /apostrophe/);
 const one = sheetBody => buildZip([{ name: 'xl/workbook.xml', data: WB(['Sheet1']) }, { name: 'xl/_rels/workbook.xml.rels', data: RELS(1) }, { name: 'xl/worksheets/sheet1.xml', data: SHEET(sheetBody) }]);
 assert.throws(() => readXlsx(one('<row r="7"><c r="D7"><f>A1*B1</f></c></row>')), /formula without cached value at Sheet1!D7 .* Excel first/);
 assert.throws(() => readXlsx(one('<row r="7"><c r="D7"><f>A1*B1</f><v></v></c></row>')), /formula without cached value at Sheet1!D7/);
+assert.deepStrictEqual(readXlsx(one('<row r="1"><c r="A1" t="str"><f>IF(B1="","",B1)</f><v></v></c></row>')).sheets[0].rows, [['']], 'formula returning "" is a valid cached value');
+assert.throws(() => readXlsx(one('<row r="9"><c r="B9"/><c><f>A1</f></c></row>')), /formula without cached value at Sheet1!C9 /, 'ref derived when r attribute is missing');
 assert.deepStrictEqual(readXlsx(one('<row r="1"><c r="A1"><f>1+2</f><v>3</v></c></row>')).sheets[0].rows, [[3]]);
 assert.throws(() => readXlsx(buildZip([{ name: 'xl/workbook.xml', data: WB(['S']).replace(/<sheet /g, '<x:sheet ') }])), /^Error: no sheets found in workbook$/);
 
