@@ -112,7 +112,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     drawings: Number(db.prepare('DELETE FROM drawings WHERE tender_id=?').run(tid).changes),
   });
   const workers = { alive: 0, peak: 0, started: 0 };   // test hook: parse workers alive now / at most / ever started
-  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, _workers: workers };
+  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, _workers: workers, _summaries: () => summaries };   // _ = test hooks
 
   // ---- upload: stream to a temp file while hashing; 413 the moment the limit is passed -----------------------
   // a received file is held until its drawing row is written; a file that ends with no drawing row (the tender was
@@ -236,12 +236,27 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   };
   // true when the stored summary was written by this parser version (never reuse another version's numbers)
   const summaryCurrent = async sha => { try { return (await loadSummary(sha)).version === PARSER_VERSION; } catch (e) { return false; } };
+  // parse the stored .dxf again (shared queue). A failure is recorded on the drawings that were 'ready', so later views
+  // answer with it at once instead of queueing the same parse again.
+  async function reparse(sha) {
+    const r = await parseSha(sha);
+    if (!r.ok) {
+      const error = plain(r.error).slice(0, 500);
+      try {
+        tx(() => {
+          for (const d of db.prepare("SELECT id FROM drawings WHERE sha256=? AND status='ready'").all(sha))
+            if (db.prepare("UPDATE drawings SET status='failed', error=? WHERE id=? AND status='ready'").run(error, d.id).changes) audit('system', 'parse_failed', 'drawings', d.id, { error });
+        });
+      } catch (e) { console.error('drawings: could not record the failed re-parse of drawing file ' + sha, e); }
+      bad('the drawing could not be read again: ' + error, 409);
+    }
+  }
   async function readSummary(sha) {
     if (summaries.has(sha)) { const v = summaries.get(sha); summaries.delete(sha); summaries.set(sha, v); return v; }
-    let v = await loadSummary(sha);
-    if (v.version !== PARSER_VERSION) {   // written by another parser version: parse the file again
-      const r = await parseSha(sha);
-      if (!r.ok) bad('the drawing could not be read again: ' + plain(r.error), 409);
+    let v = null;
+    try { v = await loadSummary(sha); } catch (e) { if (!(e && e.status === 409) || !fs.existsSync(dxfFile(sha))) throw e; }   // missing summary: rebuild it when the .dxf is still there
+    if (!v || v.version !== PARSER_VERSION) {   // missing, or written by another parser version: parse the file again
+      await reparse(sha);
       v = await loadSummary(sha);
       if (v.version !== PARSER_VERSION) bad('the parsed drawing is out of date: upload the drawing again', 409);
     }

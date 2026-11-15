@@ -362,7 +362,8 @@ server.listen(0, async () => {
         if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
       }
       const sha = db.prepare('SELECT sha256 FROM drawings WHERE id=?').get(bid).sha256;
-      fs.unlinkSync(path.join(process.env.DATA_DIR, 'drawings', sha + '.summary.json.gz'));
+      // summary and .dxf both gone (with only the summary missing the server rebuilds it, see test-drawings.js)
+      for (const e of ['.summary.json.gz', '.dxf']) fs.unlinkSync(path.join(process.env.DATA_DIR, 'drawings', sha + e));
       const nErr = errors.length;
       await page.goto(`${origin}/#/tender/${dwg}/drawings/${bid}`);
       await page.waitForSelector(D + ' #dw-panel-error');

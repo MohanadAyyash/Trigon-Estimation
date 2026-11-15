@@ -286,6 +286,48 @@ server.listen(0, async () => {
       assert.strictEqual(w.started - started, 0);
     }
 
+    // ---- a missing summary is rebuilt from the stored .dxf; with the .dxf gone too: 409 and no parse ----------
+    {
+      const w = ctx.drawings._workers;
+      const up = async (name, body) => { const r = await upload(tid, name, Buffer.from(body), qs); assert.strictEqual(r.s, 202); assert.strictEqual((await waitDone(r.j.id, qs)).status, 'ready'); return r.j.id; };
+      const shaOf = id => db.prepare('SELECT sha256 FROM drawings WHERE id=?').get(id).sha256;
+      const rm = (sha, ...ext) => { for (const e of ext) fs.rmSync(path.join(DDIR, sha + e), { force: true }); };
+      const id1 = await up('rebuild', FIXTURE.replace('NOTE', 'NOTE-REBUILD')), sha1 = shaOf(id1);
+      assert.strictEqual((await call('PUT', `drawings/${id1}/units`, { units: 'm' }, qs)).s, 200);
+      const before = (await call('GET', `drawings/${id1}/layers`, null, qs)).j;
+      rm(sha1, '.summary.json.gz', '.json.gz'); ctx.drawings._summaries().clear();   // as after a restart: nothing in memory
+      let started = w.started;
+      const again = await call('GET', `drawings/${id1}/layers`, null, qs);
+      assert.strictEqual(again.s, 200, JSON.stringify(again.j));
+      assert.deepStrictEqual(again.j.layers, before.layers, 'the rebuilt summary gives the same totals');
+      assert.strictEqual(w.started - started, 1, 'rebuilt by one parse');
+      assert.ok(fs.existsSync(path.join(DDIR, sha1 + '.summary.json.gz')) && fs.existsSync(path.join(DDIR, sha1 + '.json.gz')), 'both caches rewritten');
+      // the .dxf is gone as well: the old 409, and no worker starts, however often it is asked
+      const id2 = await up('rebuild gone', FIXTURE.replace('NOTE', 'NOTE-GONE')), sha2 = shaOf(id2);
+      rm(sha2, '.summary.json.gz', '.json.gz', '.dxf'); ctx.drawings._summaries().clear();
+      started = w.started;
+      for (let i = 0; i < 2; i++) {
+        const g = await call('GET', `drawings/${id2}`, null, qs);
+        assert.strictEqual(g.s, 409, JSON.stringify(g.j)); assert.match(g.j.error, /upload the drawing again/);
+      }
+      assert.strictEqual(w.started - started, 0, 'no worker without a .dxf');
+      // a stored .dxf that no longer parses: the first view records the failure, later views do not queue it again
+      const id3 = await up('rebuild corrupt', FIXTURE.replace('NOTE', 'NOTE-BAD')), sha3 = shaOf(id3);
+      rm(sha3, '.summary.json.gz', '.json.gz'); ctx.drawings._summaries().clear();
+      fs.writeFileSync(path.join(DDIR, sha3 + '.dxf'), FIXTURE.slice(0, FIXTURE.indexOf('0\nEOF')));
+      started = w.started;
+      const f1 = await call('GET', `drawings/${id3}`, null, qs);
+      assert.strictEqual(f1.s, 409, JSON.stringify(f1.j)); assert.match(f1.j.error, /truncated/);
+      assert.strictEqual(w.started - started, 1);
+      const row = db.prepare('SELECT status, error FROM drawings WHERE id=?').get(id3);
+      assert.strictEqual(row.status, 'failed'); assert.match(row.error, /truncated/);
+      assert.ok(!row.error.includes(process.env.DATA_DIR), 'no server path in the message');
+      const f2 = await call('GET', `drawings/${id3}`, null, qs);
+      assert.strictEqual(f2.s, 200); assert.strictEqual(f2.j.status, 'failed');
+      assert.strictEqual((await call('GET', `drawings/${id3}/layers`, null, qs)).s, 409);
+      assert.strictEqual(w.started - started, 1, 'a recorded failure is not parsed again');
+    }
+
     // ---- a corrupt file → failed with the parser's message, audited --------------------------------------
     {
       const trunc = FIXTURE.slice(0, FIXTURE.indexOf('0\nEOF'));
