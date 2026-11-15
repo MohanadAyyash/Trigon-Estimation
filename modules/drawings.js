@@ -36,6 +36,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'incomplete')) db.exec('ALTER TABLE measurements ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0');
   // 1 = saved with confirm_duplicate: its layer (or block) had possible duplicates, counted in the total
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'duplicate')) db.exec('ALTER TABLE measurements ADD COLUMN duplicate INTEGER NOT NULL DEFAULT 0');
+  // the layer metric or block count the qty was computed from (before width/depth/factor), for the formula shown with it;
+  // NULL on measurements saved before this column (the UI then derives it from qty and the factors)
+  if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'base')) db.exec('ALTER TABLE measurements ADD COLUMN base REAL');
   const DIR = path.join(DATA_DIR, 'drawings');
   fs.mkdirSync(DIR, { recursive: true });
   // temp uploads left by a stopped server are never valid: remove them
@@ -88,15 +91,15 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
-    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,created,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,base,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     let n = 0;
     for (const m of db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(oldTid)) {
       // never drop or detach a measurement silently: a broken link stops the revision
       if (!dmap.has(m.drawing_id)) bad(`measurement ${m.id}: its drawing is not in this tender`, 409);
       if (m.row_id !== null && !rowIdMap.has(m.row_id)) bad(`measurement ${m.id}: its row is not in this tender`, 409);
       insM.run(dmap.get(m.drawing_id), newTid, m.row_id === null ? null : rowIdMap.get(m.row_id), m.tool, m.layer, m.block, m.metric, m.nested, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.created, m.created_by);
+        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.base, m.created, m.created_by);
       n++;
     }
     // a copy taken while its file was still parsing gets its own result once the caller's transaction is over
@@ -432,9 +435,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap);
-      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,created,created_by)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.layer, m.block, m.metric, m.nested ? 1 : 0, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, handles, ch.uomConfirmed, incomplete ? 1 : 0, duplicates ? 1 : 0, new Date().toISOString(), me.username).lastInsertRowid);
+      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,base,created,created_by)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.layer, m.block, m.metric, m.nested ? 1 : 0, m.width, m.depth, m.factor, m.label, m.color,
+        m.qty, m.qty_unit, handles, ch.uomConfirmed, incomplete ? 1 : 0, duplicates ? 1 : 0, base, new Date().toISOString(), me.username).lastInsertRowid);
       const sum = summaryOf(m);
       audit(me, 'measure', 'measurements', id, sum);
       if (ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', id, { ...sum, row_unit: ch.row.unit });

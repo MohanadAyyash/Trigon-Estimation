@@ -693,7 +693,19 @@
   // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink
   function measurementList(ms, rows, editable) {
     const src = m => [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
-    const how = m => metricLabel(m.metric) + [m.width, m.depth].filter(fin).map(x => ' × ' + fmtQ(x)).join('') + (fin(m.factor) && m.factor !== 1 ? ' × ' + fmtQ(m.factor) : '');
+    // spec 5.6: the formula with its inputs, "<metric> <base> <unit> × width w × depth d × factor f = qty unit" (width/depth
+    // only when given, factor only when not 1). A measurement saved before `base` was stored derives it from qty when every
+    // factor is known; otherwise only the qty is shown.
+    const how = m => {
+      const w = m.width === null || m.width === undefined ? 1 : m.width, d = m.depth === null || m.depth === undefined ? 1 : m.depth, f = m.factor;
+      const known = [w, d, f].every(x => fin(x) && x > 0);
+      const base = fin(m.base) ? m.base : known && fin(m.qty) ? m.qty / (w * d * f) : null;
+      const tail = fin(m.qty) ? ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : '';
+      if (base === null) return metricLabel(m.metric) + tail;
+      const unit = m.metric === 'count' ? 'nr' : m.metric === 'area' ? 'm2' : 'm';
+      return metricLabel(m.metric) + ' ' + (m.metric === 'count' ? fmtQ(base) : fmt2(base)) + ' ' + unit + (fin(m.width) ? ' × ' + t('f_width') + ' ' + fmtQ(m.width) : '')
+        + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '') + (fin(f) && f !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(f) : '') + tail;
+    };
     const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null];
     const del = m => editable ? h('button', { class: 'small danger m-delete', onclick: async ev => {
       if (!confirm(t('m_delete_confirm'))) return;
@@ -712,7 +724,7 @@
       return h('div', null, h('div', { class: 'row' }, rs, go), msg, cb.el);
     };
     const line = (m, last) => h('tr', { 'data-measurement': String(m.id), 'data-row': m.row_id === null ? null : String(m.row_id) },
-      h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', null, how(m)),
+      h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m)),
       h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, del(m)));
     const heads = [t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
     return h('section', { class: 'card', id: 'dw-measurements' }, h('h2', null, t('measurements')),

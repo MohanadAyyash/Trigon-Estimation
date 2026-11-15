@@ -439,6 +439,9 @@ server.listen(0, async () => {
       // take-off row in m2: × width 0.5 → 2.5 m2; a length (m) on it → 400, and confirm_uom cannot override a known unit
       const m2 = await ok(measure({ row_id: rM2, ...kerb, width: 0.5 }), 'width');
       near(m2.qty, 2.5, 'KERB × 0.5'); assert.strictEqual(m2.qty_unit, 'm2'); near(await qtyOf(rM2), 2.5, 'row m2');
+      // the base (the layer metric before width/depth/factor) is stored for the formula shown with the measurement
+      near(db.prepare('SELECT base FROM measurements WHERE id=?').get(m2.id).base, 5, 'base stored');
+      near((await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === m2.id).base, 5, 'base listed');
       for (const extra of [{}, { confirm_uom: true }]) {
         r = await measure({ row_id: rM2, tool: 'dxf_layer', layer: 'KERB', metric: 'closed_perimeter', ...extra });
         assert.strictEqual(r.s, 400, 'known unit mismatch ' + JSON.stringify(extra)); assert.deepStrictEqual(r.j, { error: 'unit mismatch — add width/depth', row_unit: 'm2', qty_unit: 'm' });
@@ -735,9 +738,10 @@ server.listen(0, async () => {
         const o = before[i];
         assert.strictEqual(x.drawing_id, ndr[odr.findIndex(d => d.id === o.drawing_id)].id, 'drawing remapped');
         assert.strictEqual(x.row_id, o.row_id === null ? null : nBySeq.get(seqOf.get(o.row_id)), 'row remapped');
-        for (const k of ['tool', 'layer', 'block', 'metric', 'nested', 'width', 'depth', 'factor', 'qty', 'qty_unit', 'uom_confirmed', 'incomplete', 'duplicate']) assert.strictEqual(x[k], o[k], k);
+        for (const k of ['tool', 'layer', 'block', 'metric', 'nested', 'width', 'depth', 'factor', 'qty', 'qty_unit', 'uom_confirmed', 'incomplete', 'duplicate', 'base']) assert.strictEqual(x[k], o[k], k);
       });
       assert.ok(nm.some(x => x.duplicate === 1), 'the duplicate flag is carried into the Rev');
+      assert.ok(nm.some(x => x.base === 5), 'the base is carried into the Rev');
       assert.strictEqual(nm.filter(x => x.row_id === null).length, 1, 'an unlinked measurement stays unlinked');
       assert.deepStrictEqual(db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(T).map(x => ({ ...x })), before, 'original measurements unchanged');
       for (const o of oRows) assert.strictEqual(nRows.find(x => x.seq === o.seq).qty, o.qty, 'Rev row qty = original');

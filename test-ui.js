@@ -313,6 +313,9 @@ server.listen(0, async () => {
     // legacy data (before the one-unit rule): a row measured in two units is shown as mixed, never summed
     const legacy = db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,metric,qty,qty_unit,created) VALUES(?,?,?,'dxf_layer','KERB',?,?,?,?)");
     legacy.run(dId, dwg, legacyRow, 'area', 3, 'm2', new Date().toISOString()); legacy.run(dId, dwg, legacyRow, 'open_length', 2, 'm', new Date().toISOString());
+    // a volume: KERB 5 m × width 0.5 × depth 0.2 × factor 2 = 1 m3 (its formula is checked in the measurement list below)
+    const faceRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '7', description: 'Test kerb bedding', unit: 'm3' }, admin), 'm3 row')).id;
+    await ok(call('POST', `drawings/${dId}/measurements`, { row_id: faceRow, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', width: 0.5, depth: 0.2, factor: 2, confirm_overlap: true }, admin), 'm3 measurement');
 
     // Quantities: the take-off row qty is the measurement; the imported row keeps 95 and shows measured 100 with a warning badge
     await page.click('#tab-quantities'); await page.waitForSelector('#tab-body-quantities');
@@ -334,6 +337,12 @@ server.listen(0, async () => {
 
     // delete a measurement from the list → the row qty goes back to 0
     await page.click('#tab-drawings'); await page.waitForSelector(`${D} #dw-measurements tr[data-row="${kerbRow}"]`);
+    // every measurement shows its formula with the inputs; one saved before the base column derives it from qty
+    const formula = async r => (await page.textContent(`${D} #dw-measurements tr[data-row="${r}"] td.m-formula`)).trim();
+    assert.strictEqual(await formula(faceRow), 'open length 5.00 m × width 0.5 × depth 0.2 × factor 2 = 1.00 m3');
+    assert.strictEqual(await formula(kerbRow), 'open length 5.00 m = 5.00 m', 'no width/depth/factor: base and qty only');
+    assert.deepStrictEqual(await page.$$eval(`${D} #dw-measurements tr[data-row="${legacyRow}"] td.m-formula`, x => x.map(e => e.textContent.trim())),
+      ['area 3.00 m2 = 3.00 m2', 'open length 2.00 m = 2.00 m'], 'legacy rows (no base): derived from qty');
     await page.click(`${D} #dw-measurements tr[data-row="${kerbRow}"] .m-delete`);
     await page.waitForFunction(r => !document.querySelector(`#dw-measurements tr[data-row="${r}"]`), kerbRow);
     assert.strictEqual((await call('GET', `tenders/${dwg}/rows`, null, admin)).j.find(r => r.id === kerbRow).qty, 0, 'row qty after delete');
