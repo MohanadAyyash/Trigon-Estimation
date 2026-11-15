@@ -404,7 +404,7 @@ const stT = sumOf(sumDoc, 'mm');
 near(byL(stT, 'KERB').open_length, 5); near(byL(stT, 'KERB').closed_perimeter, 4); near(byL(stT, 'KERB').area, 1);
 near(byL(stT, 'ASPHALT').area, 100); assert.strictEqual(byL(stT, 'ASPHALT').closed_perimeter, 0); // R3
 assert.deepStrictEqual(byL(stT, 'MH').blocks, [{ name: 'MH1', top: 2, nested: 0 }]);
-assert.deepStrictEqual(stT.warnings, []);
+assert.deepStrictEqual(stT.warnings, [{ code: 'possible_duplicate', detail: { layer: 'MH', count: 1, block: 'MH1' } }]); // both MH1 inserts sit at the same point
 const unT = byL(stT, 'UNUSED'); assert.deepStrictEqual([unT.off, unT.frozen, unT.open_length, unT.area, unT.entities, unT.blocks], [true, true, 0, 0, 0, []]);
 assert.ok(byL(stT, 'أسفلت')); assert.strictEqual(byL(stT, 'EMPTY').area, 1e-6);
 assert.deepStrictEqual(stT.layers.map(l => l.layer), [...stT.layers.map(l => l.layer)].sort((a, b) => (a < b ? -1 : 1)));
@@ -423,6 +423,14 @@ const nestT = sumOf([...sec('BLOCKS', [[0, 'BLOCK'], [2, 'IN'], [70, 0], [10, 0]
   [0, 'BLOCK'], [2, 'OUT'], [70, 0], [10, 0], [20, 0], [0, 'INSERT'], [5, 'N1'], [8, '0'], [2, 'IN'], [10, 0], [20, 0], [0, 'ENDBLK']]), ...ents([...insert('O1', 'OUT', 'B'), ...insert('O2', 'IN', 'B'), ...lwp('F', sq(0, 0, 10), true, 'B')])], 'ft');
 assert.deepStrictEqual(byL(nestT, 'B').blocks, [{ name: 'IN', top: 1, nested: 1 }, { name: 'OUT', top: 1, nested: 0 }]);
 near(byL(nestT, 'B').area, 100 * 0.3048 * 0.3048); near(byL(nestT, 'B').open_length, 20 * 0.3048);
+// unknown / inherited unit names throw (no NaN metrics)
+for (const bad of ['constructor', 'toString', '__proto__', 'yd']) assert.throws(() => layerTable([], [], bad), /unknown unit/, bad);
+// stacked identical INSERTs: counted (not merged) and warned; different points are not
+const stk = sumOf(sumDoc.slice(0, 0).concat(sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]), ents([...insert('S1', 'MH1', 'MH'), ...insert('S2', 'MH1', 'MH')])), 'm');
+assert.deepStrictEqual(byL(stk, 'MH').blocks, [{ name: 'MH1', top: 2, nested: 0 }]);
+assert.deepStrictEqual(stk.warnings, [{ code: 'possible_duplicate', detail: { layer: 'MH', count: 1, block: 'MH1' } }]);
+const stk2 = sumOf(sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]).concat(ents([...insert('S1', 'MH1', 'MH'), ...insert('S2', 'MH1', 'MH', [[10, 5], [20, 0]])])), 'm');
+assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').blocks[0].top, 2);
 // performance: 100,000 LINEs over 20 layers
 {
   const parts = ['0\nSECTION\n2\nENTITIES'];
@@ -434,7 +442,8 @@ near(byL(nestT, 'B').area, 100 * 0.3048 * 0.3048); near(byL(nestT, 'B').open_len
   const ms = performance.now() - t0;
   console.log('perf 100k LINEs parse+flatten+layerTable ms:', Math.round(ms));
   assert.ok(ms < 15000, 'perf ' + ms);
-  assert.strictEqual(t.layers.length, 21); assert.strictEqual(t.layers.find(l => l.layer === '0').entities, 0); // parseDxf always lists layer 0 assert.deepStrictEqual(t.warnings, []);
+  assert.strictEqual(t.layers.length, 21); assert.strictEqual(t.layers.find(l => l.layer === '0').entities, 0); // parseDxf always lists layer 0
+  assert.deepStrictEqual(t.warnings, []);
   assert.strictEqual(t.layers.reduce((a, l) => a + l.entities, 0), 100000);
   assert.strictEqual(t.layers.reduce((a, l) => a + l.open_length, 0), 500000);
   for (const l of t.layers.filter(l => l.layer !== '0')) assert.strictEqual(l.open_length, 25000);
