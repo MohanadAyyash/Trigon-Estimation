@@ -161,6 +161,43 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   assert.throws(() => TV.previewTotal(R, all, 'volume', 1), /metric/);
 }
 
+// ---- preview = the saved quantity: previewTotal agrees with the server's selectionTotals for every metric ----
+{
+  const { selectionTotals, METRICS } = require('./lib/dxf/select.js');
+  const insertRC = (h, name, layer, x, y, cols, rows) => [...insert(h, name, layer, x, y), [70, cols], [71, rows], [44, 10], [45, 5]];
+  const d = parseDxf(dxf([...sec('BLOCKS', [...block('B', []), ...block('BL', line('BL1', '0', 0, 0, 1, 0))]), ...ents([
+    ...hatch('HA', [hpoly(sq(0, 0, 10)), hpoly(sq(4, 4, 2))], 'H'), ...lwp('PL', sq(20, 0, 7), true, 'P'),
+    ...line('L1', 'K', 0, 50, 3000, 50), ...line('L2', 'K', 0, 60, 1234.5, 60), ...lwp('OP', [[0, 70], [10, 70], [10, 80]], false, 'K'),
+    ...insertRC('MI', 'B', 'MH', 100, 100, 3, 2), ...insert('IN', 'B', 'MH', 200, 200), ...insertRC('MB', 'BL', 'MH', 300, 300, 2, 2),
+    [0, 'MTEXT'], [5, 'T'], [8, 'TX'], [10, 60], [20, 60], [1, 'NOTE'], [0, 'MLINE'], [5, 'M1'], [8, 'K']])]));
+  const flat = flatten(d, { withSegs: true }), buf = buildRender(d, flat), R = TV.decodeRender(buf.buffer, buf.byteOffset);
+  assert.deepStrictEqual(R.handles, flat.map(e => e.handle));
+  assert.strictEqual(new Set(R.handles).size, R.n, 'handles unique in this fixture');
+  const all = Array.from({ length: R.n }, (_, i) => i), f = 0.001;
+  for (const sel of [all, all.filter(i => i % 2 === 0), all.filter(i => i % 3 === 1)]) {
+    for (const metric of METRICS) {
+      const p = TV.previewTotal(R, sel, metric, f), s = selectionTotals(flat, sel.map(i => R.handles[i]), metric);
+      const want = metric === 'area' ? s.base * f * f : metric === 'count' ? s.base : s.base * f;
+      if (metric === 'area') near(p.value, want, 1e-9 * Math.max(1, Math.abs(want)), metric);
+      else assert.strictEqual(p.value, want, metric + ' over ' + sel.length + ' entities');
+      assert.strictEqual(p.used, s.used, metric + ' used');
+    }
+  }
+  assert.strictEqual(TV.previewTotal(R, all, 'closed_perimeter', 1).value, 28, 'the hatch has no perimeter: only the polyline');
+  assert.strictEqual(TV.previewTotal(R, all, 'count', 1).value, 6 + 1 + 4, 'MINSERT counts rows × cols');
+  for (const bad of [0, -1, NaN, Infinity, '1', null, undefined]) assert.throws(() => TV.previewTotal(R, all, 'area', bad), /unit factor/);
+}
+
+// ---- hit ties: two exact copies → the topmost (drawn last, highest index) ----
+{
+  const R = load(ents([...line('C1', '0', 0, 0, 10, 0), ...line('C2', '0', 0, 0, 10, 0), ...line('X', '0', 0, 5, 10, 5)]));
+  const G = TV.buildGrid(R), on = allOn(R);
+  assert.strictEqual(TV.hitTest(G, R, 5, 0.01, 0.1, on), 1, 'exact copies: the topmost wins');
+  assert.strictEqual(TV.hitTest(G, R, 5, 0, 0.1, on), 1);
+  const Q = load(ents([...lwp('Q1', sq(0, 0, 10), true), ...lwp('Q2', sq(0, 0, 10), true)])), GQ = TV.buildGrid(Q);
+  assert.strictEqual(TV.hitTest(GQ, Q, 5, 5, 0.1, allOn(Q)), 1, 'inside two exact copies: the topmost');
+}
+
 // ---- performance: 100k lines ----
 {
   const side = 317, list = [];   // ~100k short lines on a 10 km square

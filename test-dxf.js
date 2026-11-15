@@ -603,7 +603,11 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     near(r.P(1)[0][0], 100, 1e-4); near(r.P(1)[0][1], 200, 1e-4);
     near(r.P(2)[1][0], 100, 1e-4); near(r.P(2)[1][1], 202, 1e-4);   // rotated 90°: (7,6) - base → (0,2)
     near(r.P(3)[0][0], 3, 1e-5); near(r.P(3)[0][1], 4, 1e-5);
-    assert.strictEqual(r.len[0], 0); assert.ok(Number.isNaN(r.area[0]));
+    assert.deepStrictEqual(r.len, [1, 1, 2, 0], 'insert markers: len = count; text: 0'); assert.ok(Number.isNaN(r.area[0]));
+    // an MINSERT marker carries rows × cols in len (what a count adds up); a HATCH has no perimeter: len NaN
+    const m = render([...sec('BLOCKS', block('B0', [])), ...ents([...insert('MI', 'B0', 'MH', [[70, 3], [71, 2], [44, 10], [45, 5]]), ...hatch('HP', [hpoly(sq(0, 0, 10))], 0, 'H')])]).r;
+    assert.deepStrictEqual(m.kind, [2, 1]); assert.strictEqual(m.len[0], 6);
+    assert.ok(Number.isNaN(m.len[1]), 'HATCH: len NaN'); near(m.area[1], 100);
   }
   // dropped → kind 4 with no points; handles round-trip in order
   {

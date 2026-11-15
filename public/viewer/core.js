@@ -13,7 +13,7 @@
 'use strict';
 (function () {
 const VERSION = 2;
-const KIND_OPEN = 0, KIND_CLOSED = 1, KIND_DROPPED = 4;
+const KIND_OPEN = 0, KIND_CLOSED = 1, KIND_INSERT = 2, KIND_DROPPED = 4;
 const LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
 // ---- display file ----
@@ -213,8 +213,8 @@ function visible(G, R, rect, layerOn) {
   return sortIdx(out);
 }
 
-// the entity nearest the world point: an edge (or a point entity) within tol wins; else the smallest closed shape
-// the point is inside; -1 when none
+// the entity nearest the world point: an edge (or a point entity) within tol wins (equal distances: the topmost, i.e.
+// the highest index, drawn last); else the smallest closed shape the point is inside; -1 when none
 function hitTest(G, R, wx, wy, tol, layerOn) {
   const px = wx - G.ox, py = wy - G.oy, bb = G.bb, t2 = tol * tol;
   let best = -1, bestD = Infinity, inIdx = -1, inArea = Infinity;
@@ -228,10 +228,10 @@ function hitTest(G, R, wx, wy, tol, layerOn) {
     } else {
       forSegs(R, i, G.ox, G.oy, (x0, y0, x1, y1) => { const v = segDist2(px, py, x0, y0, x1, y1); if (v < d2) d2 = v; });
     }
-    if (d2 <= t2) { if (d2 < bestD) { bestD = d2; best = i; } return; }
+    if (d2 <= t2) { if (d2 < bestD || (d2 === bestD && i > best)) { bestD = d2; best = i; } return; }   // a tie: the topmost
     if (R.kind[i] === KIND_CLOSED && R.count[i] > 2 && inside(R, i, G.ox, G.oy, px, py)) {
       const ar = (bb[4 * i + 2] - bb[4 * i]) * (bb[4 * i + 3] - bb[4 * i + 1]);
-      if (ar < inArea) { inArea = ar; inIdx = i; }
+      if (ar < inArea || (ar === inArea && i > inIdx)) { inArea = ar; inIdx = i; }
     }
   });
   return best >= 0 ? best : inIdx;
@@ -271,15 +271,17 @@ function snap(G, R, wx, wy, tol, layerOn) {
   return best;
 }
 
-// display-only live total of a selection (drawing units × unitFactor, area × unitFactor²); used = entities counted
+// display-only live total of a selection (drawing units × unitFactor, area × unitFactor²); used = entities counted.
+// Mirrors lib/dxf/select.js through the display file's len: a HATCH's len is NaN (no perimeter), an insert marker's len
+// is its count (rows × cols for an MINSERT).
 const METRICS = { open_length: 1, closed_perimeter: 1, area: 1, count: 1 };
 function previewTotal(R, indices, metric, unitFactor) {
   if (!METRICS[metric]) throw new Error('previewTotal: unknown metric ' + metric);
+  if (typeof unitFactor !== 'number' || !Number.isFinite(unitFactor) || unitFactor <= 0) throw new Error('previewTotal: unit factor must be a number > 0');
   let sum = 0, used = 0;
   for (let k = 0; k < indices.length; k++) {
     const i = indices[k], kind = R.kind[i];
-    if (metric === 'count') { if (kind === 2) { sum++; used++; } continue; }
-    if (metric === 'open_length' ? kind !== KIND_OPEN : kind !== KIND_CLOSED) continue;
+    if (metric === 'count' ? kind !== KIND_INSERT : metric === 'open_length' ? kind !== KIND_OPEN : kind !== KIND_CLOSED) continue;
     const v = metric === 'area' ? R.area[i] : R.len[i];
     if (v !== v) continue;
     sum += v; used++;
