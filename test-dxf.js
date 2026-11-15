@@ -234,7 +234,8 @@ const ee = fl(ents(hatch('H8', [[[92, 1], [93, 1], [72, 3], [10, 0], [20, 0], [1
 near(ee.area, 2 * Math.PI);
 // an edge loop that does not close is excluded with a warning, never measured
 const gapDoc = parseDxf(dxf(ents(hatch('HG', [[[92, 1], [93, 2], [72, 1], [10, 0], [20, 0], [11, 1], [21, 0], [72, 1], [10, 5], [20, 5], [11, 0], [21, 1], [97, 0]]]))));
-assert.deepStrictEqual(flatten(gapDoc), []);
+const dropOf = (h, layer, type) => ({ handle: h, layer, type, kind: 'dropped', length: 0, area: null, block: null, depth: 0, count: 1, approx: false, bbox: null, geomKey: null });
+assert.deepStrictEqual(flatten(gapDoc), [dropOf('HG', 'H', 'HATCH')]);
 assert.ok(gapDoc.warnings.some(w => w.code === 'hatch_open_loop' && w.detail === 'HG'));
 
 // text
@@ -263,7 +264,7 @@ assert.notStrictEqual(key(lwp('a', [[0, 0, 0.5], [2, 0]], false)), key(lwp('b', 
 // rulings: 3D / mesh / polyface POLYLINE excluded with a warning
 for (const f of [8, 16, 64]) {
   const d = parseDxf(dxf(ents([[0, 'POLYLINE'], [5, 'P3'], [8, '0'], [70, f], ...v(0, 0), ...v(1, 1), [0, 'SEQEND'], ...line('ok', '0', 0, 0, 1, 0)])));
-  assert.deepStrictEqual(flatten(d).map(e => e.handle), ['ok']);
+  assert.deepStrictEqual(flatten(d).map(e => [e.handle, e.kind]), [['P3', 'dropped'], ['ok', 'open']]);
   assert.ok(d.warnings.some(w => w.code === 'unsupported_polyline' && w.detail === 'P3'), 'flag ' + f);
 }
 // incomplete LWPOLYLINE pair, bad numbers name the entity
@@ -294,7 +295,7 @@ assert.deepStrictEqual(mline.bbox, [1, 0, 2, 0]);
 const mins = fl([...sec('BLOCKS', B1), ...ents(insert('MI', 'B1', 'K', [[10, 5], [210, 0], [220, 0], [230, -1]]))]).find(f => f.type === 'LINE');
 assert.deepStrictEqual(mins.bbox, [-6, 0, -5, 0]);
 const npDoc = parseDxf(dxf(ents([[0, 'CIRCLE'], [5, 'NP'], [8, '0'], [10, 0], [20, 0], [40, 1], [210, 1], [220, 0], [230, 0]])));
-assert.deepStrictEqual(flatten(npDoc), []);
+assert.deepStrictEqual(flatten(npDoc), [dropOf('NP', '0', 'CIRCLE')]);
 assert.ok(npDoc.warnings.some(w => w.code === 'nonplanar' && w.detail === 'NP'));
 
 // ELLIPSE is in WCS: extrusion (0,0,-1) reverses the minor axis, the centre is not mirrored
@@ -302,7 +303,7 @@ const me = fl(ents([[0, 'ELLIPSE'], [5, 'ME'], [8, '0'], [10, 0], [20, 0], [11, 
 near(me.length, 9.688448220547676 / 4, 1e-8); near(me.bbox[0], 0); near(me.bbox[1], -1); near(me.bbox[2], 2); near(me.bbox[3], 0);
 // hatch spline edges are not measured: excluded with a warning
 const hsDoc = parseDxf(dxf(ents(hatch('HS', [[[92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0]]]))));
-assert.deepStrictEqual(flatten(hsDoc), []);
+assert.deepStrictEqual(flatten(hsDoc), [dropOf('HS', 'H', 'HATCH')]);
 assert.ok(hsDoc.warnings.some(w => w.code === 'unsupported_hatch_edge' && w.detail === 'HS'));
 
 // ---- Task 2 fix round 1 ----
@@ -318,7 +319,7 @@ const geoMm = fl(ents(hatch('G2', [gapSq(500000000, 2700000000, 1e-7)])))[0];
 near(geoMm.area, 100, 1e-3);
 for (const [h, x, y] of [['G3', 0, 0], ['G4', 500000, 2700000], ['G5', 500000000, 2700000000]]) {
   const { d, f } = flDoc(ents(hatch(h, [gapSq(x, y, 0.001)])));
-  assert.deepStrictEqual(f, [], h); assert.ok(warned(d, 'hatch_open_loop', h), h);
+  assert.deepStrictEqual(f, [dropOf(h, 'H', 'HATCH')], h); assert.ok(warned(d, 'hatch_open_loop', h), h);
 }
 near(fl(ents(lwp('GP', sq(500000, 2700000, 10), true)))[0].area, 100, 1e-6);
 near(fl(ents(lwp('GQ', [[500000, 2700000, 1], [500002, 2700000, 1]], true)))[0].area, Math.PI, 1e-6);
@@ -352,7 +353,7 @@ assert.ok(!warned(flDoc(ents(line('Z2', '0', 0, 0, 3, 4))).d, 'z_ignored', 'Z2')
 const zs = flDoc(ents([[0, 'SPLINE'], [5, 'Z3'], [8, '0'], [71, 1], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [30, 0], [10, 3], [20, 4], [30, 2]]));
 near(zs.f[0].length, 5); assert.ok(warned(zs.d, 'z_ignored', 'Z3'));
 const h0 = flDoc(ents(hatch('H0', [])));
-assert.deepStrictEqual(h0.f, []); assert.ok(warned(h0.d, 'hatch_no_boundary', 'H0'));
+assert.deepStrictEqual(h0.f, [dropOf('H0', 'H', 'HATCH')]); assert.ok(warned(h0.d, 'hatch_no_boundary', 'H0'));
 for (const r of [0, -0.5, 1.5]) assert.throws(() => fl(ents([[0, 'ELLIPSE'], [5, 'ER'], [10, 0], [20, 0], [11, 2], [21, 0], [40, r]])), /ELLIPSE ER/, String(r));
 near(fl(ents([[0, 'ELLIPSE'], [5, 'E1'], [10, 0], [20, 0], [11, 2], [21, 0], [40, 1]]))[0].area, 4 * Math.PI);
 
@@ -376,7 +377,7 @@ assert.strictEqual(kh.f[0].area, null); assert.strictEqual(kh.f[1].area, null); 
 assert.deepStrictEqual(kh.d.warnings, [{ code: 'self_intersecting', detail: 'KH' }, { code: 'self_intersecting', detail: 'KHH' }]);
 // empty boundary loops are skipped; only empty loops -> hatch_no_boundary
 const emp = flDoc(ents([...hatch('EL', [[[92, 1], [93, 0], [97, 0]], hpoly(sq(0, 0, 10))]), ...hatch('EA', [[[92, 1], [93, 0], [97, 0]], [[92, 2], [72, 0], [73, 1], [93, 0], [97, 0]]])]));
-assert.strictEqual(emp.f.length, 1); near(emp.f[0].area, 100);
+assert.deepStrictEqual(emp.f.map(f => f.kind), ['closed', 'dropped']); near(emp.f[0].area, 100);
 assert.ok(warned(emp.d, 'hatch_no_boundary', 'EA')); assert.ok(!emp.d.warnings.some(w => w.detail === 'EL'));
 
 // ---- Task 2 fix round 3: crossings through a shared collinear stretch ----
@@ -447,6 +448,47 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   assert.strictEqual(t.layers.reduce((a, l) => a + l.entities, 0), 100000);
   assert.strictEqual(t.layers.reduce((a, l) => a + l.open_length, 0), 500000);
   for (const l of t.layers.filter(l => l.layer !== '0')) assert.strictEqual(l.open_length, 25000);
+}
+
+// ---- final review item 1: shapes the parser cannot measure are counted against their layer (dropped) ----
+{
+  // the probe: a closed 10 x 10 and a HATCH with a spline edge on ASPHALT. The hatch is not measured: dropped 1, area stays 100
+  const splineHatch = hatch('HS1', [[[92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0]]], 0, 'ASPHALT');
+  const pr = sumOf(ents([...lwp('SQ', sq(0, 0, 10), true, 'ASPHALT'), ...splineHatch]), 'm');
+  const a = byL(pr, 'ASPHALT');
+  near(a.area, 100); assert.strictEqual(a.dropped, 1); assert.strictEqual(a.area_excluded, 0); assert.strictEqual(a.approx, 0); assert.strictEqual(a.entities, 1);
+  assert.strictEqual(byL(sumOf(ents([...lwp('SQ', sq(0, 0, 10), true, 'ASPHALT')]), 'm'), 'ASPHALT').dropped, 0, 'nothing dropped → 0');
+  assert.strictEqual(byL(sumOf(ents(splineHatch), null), 'ASPHALT').dropped, null, 'no units → no numbers');
+  // each dropped kind: unsupported polyline, nonplanar entity, open hatch loop, hatch without boundary
+  const kinds = sumOf(ents([[0, 'POLYLINE'], [5, 'P3'], [8, 'K'], [70, 16], ...v(0, 0), ...v(1, 1), [0, 'SEQEND'],
+    [0, 'CIRCLE'], [5, 'NP'], [8, 'K'], [10, 0], [20, 0], [40, 1], [210, 1], [220, 0], [230, 0], ...hatch('H0', [], 0, 'K'),
+    ...hatch('HG', [[[92, 1], [93, 2], [72, 1], [10, 0], [20, 0], [11, 1], [21, 0], [72, 1], [10, 5], [20, 5], [11, 0], [21, 1], [97, 0]]], 0, 'K')]), 'mm');
+  assert.strictEqual(byL(kinds, 'K').dropped, 4); assert.strictEqual(byL(kinds, 'K').entities, 0);
+  // a nonplanar INSERT: its own layer gets the drop (counted per instance), the block is not counted and its content not measured
+  const npi = parseDxf(dxf([...sec('BLOCKS', B1), ...ents(insert('NI', 'B1', 'MH', [[70, 2], [71, 1], [44, 5], [210, 1], [220, 0], [230, 0]]))]));
+  const npf = flatten(npi);
+  assert.deepStrictEqual(npf, [{ handle: 'NI', layer: 'MH', type: 'INSERT', kind: 'dropped', length: 0, area: null, block: 'B1', depth: 0, count: 2, approx: false, bbox: null, geomKey: null }]);
+  assert.ok(warned(npi, 'nonplanar', 'NI'));
+  const npt = byL(layerTable(npf, npi.layers, 'm'), 'MH');
+  assert.strictEqual(npt.dropped, 2); assert.deepStrictEqual(npt.blocks, []);
+  // a dropped shape inside a block: placeholder per instance on the resolved layer; the insert bbox ignores it
+  const inb = fl([...sec('BLOCKS', block('BH', [...line('L', '0', 0, 0, 1, 0), ...hatch('HX', [], 0, '0')])), ...ents(insert('IB', 'BH', 'TOP'))]);
+  assert.deepStrictEqual(inb.map(f => [f.handle, f.layer, f.kind]), [['IB', 'TOP', 'insert'], ['IB/L', 'TOP', 'open'], ['IB/HX', 'TOP', 'dropped']]);
+  assert.deepStrictEqual(inb[0].bbox, [0, 0, 1, 0]);
+  // unsupported entity types: an MLINE on KERB is dropped on KERB (model space and inside a block on its resolved layer);
+  // annotation (DIMENSION, LEADER, ATTRIB, XLINE, POINT…) is ignored and listed, never counted as a shape not measured
+  const ml = parseDxf(dxf([...sec('BLOCKS', block('BM', [[0, 'MLINE'], [5, 'MB'], [8, '0']])), ...ents([...line('K1', 'KERB', 0, 0, 5, 0), [0, 'MLINE'], [5, 'M1'], [8, 'KERB'],
+    [0, 'DIMENSION'], [5, 'D1'], [8, 'KERB'], [0, 'LEADER'], [5, 'D2'], [8, 'KERB'], [0, 'XLINE'], [5, 'X1'], [8, 'KERB'], [0, 'POINT'], [5, 'PT'], [8, 'KERB'],
+    ...insert('IM', 'BM', 'WALL')])]));
+  assert.deepStrictEqual({ ...ml.ignored }, { MLINE: 1, DIMENSION: 1, LEADER: 1, XLINE: 1, POINT: 1 }, 'ignored types still listed');
+  const mlf = flatten(ml);
+  assert.deepStrictEqual(mlf.filter(f => f.kind === 'dropped').map(f => [f.handle, f.layer, f.type]), [['M1', 'KERB', 'MLINE'], ['IM/MB', 'WALL', 'MLINE']]);
+  const mlt = layerTable(mlf, ml.layers, 'm');
+  assert.strictEqual(byL(mlt, 'KERB').dropped, 1); near(byL(mlt, 'KERB').open_length, 5); assert.strictEqual(byL(mlt, 'WALL').dropped, 1);
+  assert.deepStrictEqual(byL(mlt, 'WALL').blocks, [{ name: 'BM', top: 1, nested: 0 }]);
+  // attributes after an INSERT are annotation too
+  const att = parseDxf(dxf([...sec('BLOCKS', block('BA', [])), ...ents([...insert('IA', 'BA', 'MH', [[66, 1]]), [0, 'ATTRIB'], [5, 'AT'], [8, 'MH'], [0, 'SEQEND'], [5, 'SQ'], [8, 'MH']])]));
+  assert.strictEqual(byL(layerTable(flatten(att), att.layers, 'm'), 'MH').dropped, 0, 'ATTRIB is not a shape');
 }
 
 console.log('ok test-dxf');

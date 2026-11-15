@@ -198,13 +198,13 @@ server.listen(0, async () => {
     const lwp = (hd, pts, layer) => [[0, 'LWPOLYLINE'], [5, hd], [8, layer], [90, pts.length], [70, 1], ...pts.flatMap(([x, y]) => [[10, x], [20, y]])];
     const ins = (hd, x) => [[0, 'INSERT'], [5, hd], [8, 'MH'], [2, 'MH1'], [10, x], [20, 0]];
     const FIX = dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
-      ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 5], ...layerRec('KERB'), ...layerRec('MH'), ...layerRec('أسفلت'), ...layerRec('CURVE'), ...layerRec('BOW'), [0, 'ENDTAB']]),
+      ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 6], ...layerRec('KERB'), ...layerRec('MH'), ...layerRec('أسفلت'), ...layerRec('CURVE'), ...layerRec('BOW'), ...layerRec('DROP'), [0, 'ENDTAB']]),
       ...dsec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
       ...dsec('ENTITIES', [[0, 'LINE'], [5, 'K1'], [8, 'KERB'], [10, 0], [20, 0], [30, 0], [11, 3000], [21, 4000], [31, 500],
         ...lwp('A1', [[0, 0], [10000, 0], [10000, 10000], [0, 10000]], 'أسفلت'), ...ins('M1', 0), ...ins('M2', 5000), ...ins('M3', 0),
         ...lwp('B1', [[20000, 0], [22000, 0], [22000, 2000], [20000, 2000]], 'BOW'), ...lwp('B2', [[0, 20000], [1000, 21000], [1000, 20000], [0, 21000]], 'BOW'),
         [0, 'SPLINE'], [5, 'S1'], [8, 'CURVE'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3000], [20, 4000],
-        [0, 'XLINE'], [5, 'X1'], [8, 'KERB']])]);
+        [0, 'XLINE'], [5, 'X1'], [8, 'KERB'], ...lwp('Q1', [[40000, 0], [42000, 0], [42000, 2000], [40000, 2000]], 'DROP'), [0, 'MLINE'], [5, 'QM'], [8, 'DROP']])]);
     const { writeXlsx } = require('./lib/xlsx.js');
     const dwg = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Drawings' }, admin), 'drawings tender')).id;
     await ok(call('POST', `tenders/${dwg}/import`, { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Test asphalt', 'm2', 95], ['3', 'Test legacy row', 'm2', 10]] }]).toString('base64'),
@@ -237,6 +237,8 @@ server.listen(0, async () => {
     assert.ok((await page.textContent(D + ' tr[data-layer="MH"] td.notes')).includes('MH1: possible duplicates: 1 (counted in the total)'), 'duplicate warning next to its layer');
     assert.ok((await page.textContent(D + ' tr[data-layer="CURVE"] td.notes')).includes('approximated curves: 1'), 'approx tag next to its layer');
     assert.ok((await page.textContent(D + ' tr[data-layer="BOW"] td.notes')).includes('shapes excluded from area: 1'), 'area_excluded tag next to its layer');
+    assert.ok((await page.textContent(D + ' tr[data-layer="DROP"] td.notes')).includes('shapes not measured: 1'), 'dropped tag next to its layer');
+    assert.ok(!(await page.textContent(D + ' tr[data-layer="KERB"] td.notes')).includes('not measured'), 'annotation (XLINE) is not a dropped shape');
     assert.ok((await page.textContent(D + ' #dw-warnings li[data-code="z_ignored"]')).includes('Height (Z) differences ignored'), 'drawing warning in plain words');
 
     // link KERB open length to the take-off row (m)

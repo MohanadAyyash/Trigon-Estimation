@@ -222,7 +222,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   }
   // the raw table scaled to metres: lengths × f, areas × f²; counts as they are. No units → no numbers (as layerTable).
   function scaledTable(raw, unit) {
-    if (unit === null) return { layers: raw.layers.map(l => ({ layer: l.layer, off: l.off, frozen: l.frozen, open_length: null, closed_perimeter: null, area: null, area_excluded: null, blocks: null, entities: null, approx: null })), warnings: [] };
+    if (unit === null) return { layers: raw.layers.map(l => ({ layer: l.layer, off: l.off, frozen: l.frozen, open_length: null, closed_perimeter: null, area: null, area_excluded: null, blocks: null, entities: null, approx: null, dropped: null })), warnings: [] };
     if (!hasUnit(unit)) throw new Error('unknown unit ' + unit);
     const f = UNIT_TO_M[unit];
     return { layers: raw.layers.map(l => ({ ...l, open_length: l.open_length * f, closed_perimeter: l.closed_perimeter * f, area: l.area * f * f })), warnings: raw.warnings };
@@ -370,19 +370,20 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const layer = lt.layers.find(l => l.layer === m.layer);
     if (!layer) bad('layer not found in this drawing: ' + m.layer);
     let base, handles, incomplete = null;
+    // shapes on the layer that the parser could not measure (dropped): no metric of that layer is the whole story
+    const dropped = layer.dropped || 0;
     if (m.tool === 'dxf_layer') {
       base = layer[m.metric]; handles = layer.entities;
       // closed shapes left out of the area, or approximated curves: the layer total is not the whole story
       const area_excluded = m.metric === 'area' ? layer.area_excluded || 0 : 0, approx = layer.approx || 0;
-      if (area_excluded || approx) {
-        if (!m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', area_excluded, approx });
-        incomplete = { area_excluded, approx };
-      }
+      if (area_excluded || approx || dropped) incomplete = { area_excluded, approx, dropped };
     } else {
+      if (dropped) incomplete = { area_excluded: 0, approx: 0, dropped };
       const bl = (layer.blocks || []).find(x => x.name === m.block);
       if (!bl) bad(`block ${m.block} not found on layer ${m.layer}`);
       base = bl.top + (m.nested ? bl.nested : 0); handles = base;
     }
+    if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', ...incomplete });
     if (!finNum(base) || !(base > 0)) bad(`nothing to measure: ${m.layer} ${m.block ? m.block + ' ' : ''}${m.metric} is ${base}`);
     m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
     if (!Number.isFinite(m.qty)) bad('the quantity is out of range');

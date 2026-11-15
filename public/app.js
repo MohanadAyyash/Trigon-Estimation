@@ -607,6 +607,7 @@
       const notes = h('td', { class: 'notes' }, l.off ? h('span', { class: 'tag' }, t('dw_off')) : null, l.frozen ? h('span', { class: 'tag' }, t('dw_frozen')) : null,
         l.area_excluded > 0 ? h('span', { class: 'tag warn-tag' }, t('dw_area_excluded', { n: l.area_excluded })) : null,
         l.approx > 0 ? h('span', { class: 'tag warn-tag' }, t('dw_approx', { n: l.approx })) : null,
+        l.dropped > 0 ? h('span', { class: 'tag warn-tag' }, t('dw_dropped', { n: l.dropped })) : null,
         (dups.get(l.layer) || []).map(x => h('span', { class: 'tag warn-tag' }, x.block ? t('dw_block_duplicates', { block: x.block, n: x.count }) : t('dw_duplicates', { n: x.count }))));
       tr.append(h('td', { class: 'layer-name' }, h('span', { dir: 'auto' }, l.layer)), cell('open_length'), cell('closed_perimeter'), cell('area'), blocks, notes);
       return tr;
@@ -632,7 +633,7 @@
     let box = false;
     if (e.status === 409 && j.error === 'unit mismatch') box = addConfirm('confirm_uom', t('lk_confirm_uom', { row: j.row_unit || '', qty: j.qty_unit || '' }));
     else if (e.status === 409 && j.error === 'already measured on this row') box = addConfirm('confirm_overlap', t('lk_confirm_overlap'));
-    else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0 }));
+    else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0, c: j.dropped || 0 }));
     else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
     if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
   }

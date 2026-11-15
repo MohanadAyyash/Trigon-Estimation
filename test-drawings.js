@@ -317,11 +317,15 @@ server.listen(0, async () => {
       // the Task 4 fixture plus an ASPHALT layer (one 10 m square = 100 m2) and a second MH1 insert; BOW: a 2 m square and a
       // self-intersecting bowtie (no area: excluded); CURVE: a SPLINE (approximated)
       const FIX5 = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
-        ...tables([layerRec('KERB'), layerRec('MH'), layerRec('ASPHALT'), layerRec('BOW'), layerRec('CURVE')]),
+        ...tables([layerRec('KERB'), layerRec('MH'), layerRec('ASPHALT'), layerRec('BOW'), layerRec('CURVE'), layerRec('DROP'), layerRec('DROPB')]),
         ...sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
         ...sec('ENTITIES', [...lwp('K1', sq(0, 0, 1000), true, 'KERB'), ...line('K2', 'KERB', 0, 0, 3000, 4000), ...ins5('M1', 0, 0), ...ins5('M2', 5000, 0),
           ...lwp('A1', sq(0, 0, 10000), true, 'ASPHALT'), ...lwp('B1', sq(20000, 0, 2000), true, 'BOW'), ...lwp('B2', [[0, 20000], [1000, 21000], [1000, 20000], [0, 21000]], true, 'BOW'),
-          [0, 'SPLINE'], [5, 'S1'], [8, 'CURVE'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3000], [20, 4000]])]);
+          [0, 'SPLINE'], [5, 'S1'], [8, 'CURVE'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3000], [20, 4000],
+          // DROP: a 2 m square and a HATCH with a spline edge (not measured: dropped); DROPB: an MH1 insert and an MLINE (unsupported: dropped)
+          ...lwp('Q1', sq(40000, 0, 2000), true, 'DROP'), [0, 'HATCH'], [5, 'QH'], [8, 'DROP'], [10, 0], [20, 0], [30, 0], [210, 0], [220, 0], [230, 1], [2, 'SOLID'], [70, 1], [71, 0],
+          [91, 1], [92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0], [75, 0], [76, 1], [98, 0],
+          [0, 'INSERT'], [5, 'QI'], [8, 'DROPB'], [2, 'MH1'], [10, 0], [20, 50000], [0, 'MLINE'], [5, 'QM'], [8, 'DROPB']])]);
       const { writeXlsx } = require('./lib/xlsx.js');
       const boq = rows => ({ file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ...rows] }]).toString('base64'), sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } });
       const BOQ = boq([['1', 'ROADS', null, null], ['1.1', 'ASPHALT surfacing', 'm2', 95], ['1.2', 'Mobilisation', 'LS', 1]]);
@@ -432,7 +436,7 @@ server.listen(0, async () => {
         assert.strictEqual(lyr.find(l => l.layer === 'BOW').area_excluded, 1); assert.ok(lyr.find(l => l.layer === 'CURVE').approx > 0);
         const rA = await newRow('Paving', 'm2'), rC = await newRow('Edge', 'm');
         r = await measure({ row_id: rA, tool: 'dxf_layer', layer: 'BOW', metric: 'area' });
-        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 1, approx: 0 });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 1, approx: 0, dropped: 0 });
         assert.strictEqual(await qtyOf(rA), 0, 'refused: nothing saved');
         assert.strictEqual(audits('measure_incomplete_confirmed').length, 0);
         const bi = await ok(measure({ row_id: rA, tool: 'dxf_layer', layer: 'BOW', metric: 'area', confirm_incomplete: true }), 'confirm_incomplete area');
@@ -446,7 +450,7 @@ server.listen(0, async () => {
         near(ci.qty, 5, 'spline length');
         const ia = audits('measure_incomplete_confirmed');
         assert.strictEqual(ia.length, 2);
-        assert.deepStrictEqual(ia[0], { drawing_id: D, row_id: rA, layer: 'BOW', metric: 'area', area_excluded: 1, approx: 0 }, 'counts only');
+        assert.deepStrictEqual(ia[0], { drawing_id: D, row_id: rA, layer: 'BOW', metric: 'area', area_excluded: 1, approx: 0, dropped: 0 }, 'counts only');
         const vr = await rowsOf(T);
         assert.strictEqual(vr.find(x => x.id === rA).measured_incomplete, true); assert.strictEqual(vr.find(x => x.id === rC).measured_incomplete, true);
         assert.strictEqual(vr.find(x => x.id === rM2).measured_incomplete, false);
@@ -457,6 +461,27 @@ server.listen(0, async () => {
         await ok(call('PUT', `measurements/${bi.id}`, { row_id: rA2 }, qs), 'relink incomplete');
         assert.strictEqual(db.prepare('SELECT incomplete FROM measurements WHERE id=?').get(bi.id).incomplete, 1);
         assert.strictEqual((await rowsOf(T)).find(x => x.id === rA2).measured_incomplete, true);
+        // shapes on the layer that were not measured (dropped): every metric, a block count too, needs confirm_incomplete
+        const dl = lyr.find(l => l.layer === 'DROP'), db2 = lyr.find(l => l.layer === 'DROPB');
+        assert.strictEqual(dl.dropped, 1); near(dl.area, 4, 'DROP area: the square only'); assert.strictEqual(dl.area_excluded, 0); assert.strictEqual(dl.approx, 0);
+        assert.strictEqual(db2.dropped, 1); assert.deepStrictEqual(db2.blocks, [{ name: 'MH1', top: 1, nested: 0 }]);
+        assert.strictEqual(lyr.find(l => l.layer === 'KERB').dropped, 0);
+        const rNr2 = await newRow('Manholes (drop)', 'nr');
+        for (const [rowId, b] of [[rA, { tool: 'dxf_layer', layer: 'DROP', metric: 'area' }], [rC, { tool: 'dxf_layer', layer: 'DROP', metric: 'closed_perimeter' }],
+          [rNr2, { tool: 'dxf_blocks', layer: 'DROPB', block: 'MH1', metric: 'count' }]]) {
+          r = await measure({ row_id: rowId, ...b });
+          assert.strictEqual(r.s, 409, 'dropped ' + b.metric); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 0, approx: 0, dropped: 1 }, b.metric);
+        }
+        const before3 = await qtyOf(rA);
+        const dd = await ok(measure({ row_id: rA, tool: 'dxf_layer', layer: 'DROP', metric: 'area', confirm_incomplete: true }), 'confirm dropped');
+        near(dd.qty, 4, 'DROP area'); assert.strictEqual(dd.incomplete, true); near(await qtyOf(rA), before3 + 4, 'row qty');
+        const dc = await ok(measure({ row_id: rNr2, tool: 'dxf_blocks', layer: 'DROPB', block: 'MH1', metric: 'count', confirm_incomplete: true }), 'confirm dropped count');
+        assert.strictEqual(dc.qty, 1); assert.strictEqual(dc.incomplete, true);
+        assert.deepStrictEqual(audits('measure_incomplete_confirmed').slice(-2), [{ drawing_id: D, row_id: rA, layer: 'DROP', metric: 'area', area_excluded: 0, approx: 0, dropped: 1 },
+          { drawing_id: D, row_id: rNr2, layer: 'DROPB', metric: 'count', area_excluded: 0, approx: 0, dropped: 1 }]);
+        assert.strictEqual((await rowsOf(T)).find(x => x.id === rNr2).measured_incomplete, true);
+        for (const id of [dd.id, dc.id]) await ok(call('DELETE', `measurements/${id}`, null, qs), 'tidy');
+        await ok(call('DELETE', `tenders/${T}/rows/${rNr2}`, null, qs), 'tidy row');
         // tidy up: these rows are not part of the checks below
         for (const id of [bi.id, bp.id, ci.id]) await ok(call('DELETE', `measurements/${id}`, null, qs), 'tidy');
         for (const id of [rA, rA2, rC]) await ok(call('DELETE', `tenders/${T}/rows/${id}`, null, qs), 'tidy row');
