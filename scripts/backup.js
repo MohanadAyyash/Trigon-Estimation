@@ -32,11 +32,14 @@ try {
   if (fs.existsSync(from)) {
     fs.mkdirSync(to, { recursive: true });
     for (const f of fs.readdirSync(from).filter(f => /^[0-9a-f]{64}\.dxf$/.test(f))) {
-      const dest = path.join(to, f);
-      if (fs.existsSync(dest)) continue;
-      fs.rmSync(dest + '.tmp', { force: true });   // a leftover from an interrupted run
-      fs.copyFileSync(path.join(from, f), dest + '.tmp');
-      fs.renameSync(dest + '.tmp', dest);
+      try {   // one bad file must not stop the rest
+        const dest = path.join(to, f);
+        // content-addressed: a copy of a different size is damaged and is replaced (via .tmp, never deleted first)
+        if (fs.existsSync(dest) && fs.statSync(dest).size === fs.statSync(path.join(from, f)).size) continue;
+        fs.rmSync(dest + '.tmp', { force: true });   // a leftover from an interrupted run
+        fs.copyFileSync(path.join(from, f), dest + '.tmp');
+        fs.renameSync(dest + '.tmp', dest);
+      } catch (e) { note('drawing backup of ' + f, e); }
     }
   }
 } catch (e) { note('drawings backup', e); }

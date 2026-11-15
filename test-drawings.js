@@ -328,6 +328,38 @@ server.listen(0, async () => {
       assert.strictEqual(w.started - started, 1, 'a recorded failure is not parsed again');
     }
 
+    // ---- Fix round 1: unreadable summary rebuilt; old summary + no .dxf; transient failures do not stick ---------
+    {
+      const w = ctx.drawings._workers;
+      const up = async (name, body) => { const r = await upload(tid, name, Buffer.from(body), qs); assert.strictEqual(r.s, 202); assert.strictEqual((await waitDone(r.j.id, qs)).status, 'ready'); return r.j.id; };
+      const shaOf = id => db.prepare('SELECT sha256 FROM drawings WHERE id=?').get(id).sha256;
+      const P = (sha, e) => path.join(DDIR, sha + e), clear = () => ctx.drawings._summaries().clear();
+      // a corrupt summary file is treated like a missing one
+      const id1 = await up('garbled', FIXTURE.replace('NOTE', 'NOTE-GARBLED')), sha1 = shaOf(id1);
+      fs.writeFileSync(P(sha1, '.summary.json.gz'), 'not gzip at all'); clear();
+      let started = w.started;
+      assert.strictEqual((await call('GET', `drawings/${id1}/layers`, null, qs)).s, 200, 'garbled summary rebuilt');
+      assert.strictEqual(w.started - started, 1);
+      // an old-version summary with the .dxf gone: 409, no worker
+      const stale = sha => { const v = JSON.parse(zlib.gunzipSync(fs.readFileSync(P(sha, '.summary.json.gz')))); v.version = 1; fs.writeFileSync(P(sha, '.summary.json.gz'), zlib.gzipSync(JSON.stringify(v))); };
+      const id2 = await up('old gone', FIXTURE.replace('NOTE', 'NOTE-OLDGONE')), sha2 = shaOf(id2);
+      stale(sha2); fs.rmSync(P(sha2, '.dxf')); clear(); started = w.started;
+      const g = await call('GET', `drawings/${id2}/layers`, null, qs);
+      assert.strictEqual(g.s, 409, JSON.stringify(g.j)); assert.match(g.j.error, /upload the drawing again/);
+      assert.strictEqual(w.started - started, 0, 'no worker without a .dxf');
+      assert.strictEqual(db.prepare('SELECT status FROM drawings WHERE id=?').get(id2).status, 'ready');
+      // a transient failure (the result cannot be saved): 409 with the message, the drawing stays ready, and works once the cause is gone
+      const id3 = await up('transient', FIXTURE.replace('NOTE', 'NOTE-TRANSIENT')), sha3 = shaOf(id3);
+      fs.rmSync(P(sha3, '.summary.json.gz')); clear();
+      const realWrite = fs.promises.writeFile;   // the disk is full while the result is saved
+      fs.promises.writeFile = async () => { throw Object.assign(new Error('no space'), { code: 'ENOSPC' }); };
+      let t1; try { t1 = await call('GET', `drawings/${id3}/layers`, null, qs); } finally { fs.promises.writeFile = realWrite; }
+      assert.strictEqual(t1.s, 409, JSON.stringify(t1.j)); assert.match(t1.j.error, /could not save the parse result \(ENOSPC\)/);
+      assert.strictEqual(db.prepare('SELECT status FROM drawings WHERE id=?').get(id3).status, 'ready', 'transient: status unchanged');
+      clear();
+      assert.strictEqual((await call('GET', `drawings/${id3}/layers`, null, qs)).s, 200, 'recovers once the cause is gone');
+    }
+
     // ---- a corrupt file → failed with the parser's message, audited --------------------------------------
     {
       const trunc = FIXTURE.slice(0, FIXTURE.indexOf('0\nEOF'));

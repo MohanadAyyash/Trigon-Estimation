@@ -177,7 +177,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (busy || !queue.length) return;
     busy = true;
     const job = queue.shift();
-    runWorker(job.sha).then(job.resolve, e => job.resolve({ ok: false, error: String(e && e.message || e) })).finally(() => { busy = false; pump(); });
+    runWorker(job.sha).then(job.resolve, e => job.resolve({ ok: false, transient: true, error: String(e && e.message || e) })).finally(() => { busy = false; pump(); });
   };
   const enqueue = sha => new Promise(resolve => { queue.push({ sha, resolve }); pump(); });
   // settles only after the worker has exited, so the next one never overlaps it
@@ -187,10 +187,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       const set = r => { if (!result) result = r; };
       const w = new Worker(WORKER, { workerData: { file: dxfFile(sha) }, resourceLimits: { maxOldGenerationSizeMb: HEAP_MB } });
       workers.alive++; workers.started++; workers.peak = Math.max(workers.peak, workers.alive);
-      const timer = setTimeout(() => { set({ ok: false, error: 'parse timed out' }); w.terminate(); }, PARSE_TIMEOUT_MS);
-      w.on('message', m => { set(m && typeof m === 'object' ? m : { ok: false, error: 'bad parser reply' }); w.terminate(); });
-      w.on('error', e => set({ ok: false, error: e && e.code === 'ERR_WORKER_OUT_OF_MEMORY' ? TOO_LARGE : 'the parser stopped unexpectedly: ' + (e && e.message || e) }));
-      w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, error: 'the parser stopped unexpectedly (exit code ' + code + ')' }); });
+      const timer = setTimeout(() => { set({ ok: false, transient: true, error: 'parse timed out' }); w.terminate(); }, PARSE_TIMEOUT_MS);
+      w.on('message', m => { set(m && typeof m === 'object' ? (m.ok === false && /^(the stored drawing file is missing|could not read the stored)/.test(String(m.error)) ? { ...m, transient: true } : m) : { ok: false, transient: true, error: 'bad parser reply' }); w.terminate(); });
+      w.on('error', e => set({ ok: false, transient: true, error: e && e.code === 'ERR_WORKER_OUT_OF_MEMORY' ? TOO_LARGE : 'the parser stopped unexpectedly: ' + (e && e.message || e) }));
+      w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, transient: true, error: 'the parser stopped unexpectedly (exit code ' + code + ')' }); });
     });
   }
   async function writeGz(bytes, dest) {
@@ -201,12 +201,12 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   function parseSha(sha) {
     if (inflight.has(sha)) return inflight.get(sha);
     const p = enqueue(sha).then(async r => {
-      if (!r.ok) return { ok: false, error: String(r.error || 'parse failed') };
+      if (!r.ok) return { ok: false, transient: !!r.transient, error: String(r.error || 'parse failed') };
       try { await writeGz(r.cache, cacheFile(sha)); await writeGz(r.summary, summaryFile(sha)); }
-      catch (e) { return { ok: false, error: 'could not save the parse result (' + (e.code || 'error') + ')' }; }
+      catch (e) { return { ok: false, transient: true, error: 'could not save the parse result (' + (e.code || 'error') + ')' }; }
       summaries.delete(sha);
       return { ok: true, suggested_units: r.suggested_units ?? null };
-    }).catch(e => ({ ok: false, error: String(e && e.message || e) })).finally(() => inflight.delete(sha));
+    }).catch(e => ({ ok: false, transient: true, error: String(e && e.message || e) })).finally(() => inflight.delete(sha));
     inflight.set(sha, p);
     return p;
   }
@@ -242,7 +242,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const r = await parseSha(sha);
     if (!r.ok) {
       const error = plain(r.error).slice(0, 500);
-      try {
+      // only a deterministic failure (the file itself cannot be parsed) is recorded; a timeout, out-of-memory, crash or
+      // save error may pass on a later try, so the status stays as it is
+      if (!r.transient) try {
         tx(() => {
           for (const d of db.prepare("SELECT id FROM drawings WHERE sha256=? AND status='ready'").all(sha))
             if (db.prepare("UPDATE drawings SET status='failed', error=? WHERE id=? AND status='ready'").run(error, d.id).changes) audit('system', 'parse_failed', 'drawings', d.id, { error });
@@ -253,9 +255,11 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   }
   async function readSummary(sha) {
     if (summaries.has(sha)) { const v = summaries.get(sha); summaries.delete(sha); summaries.set(sha, v); return v; }
+    const gone = () => bad('the parsed drawing is missing: upload the drawing again', 409);
     let v = null;
-    try { v = await loadSummary(sha); } catch (e) { if (!(e && e.status === 409) || !fs.existsSync(dxfFile(sha))) throw e; }   // missing summary: rebuild it when the .dxf is still there
-    if (!v || v.version !== PARSER_VERSION) {   // missing, or written by another parser version: parse the file again
+    try { v = await loadSummary(sha); } catch (e) { if (!fs.existsSync(dxfFile(sha))) gone(); }   // missing or unreadable summary: rebuild it when the .dxf is still there
+    if (!v || v.version !== PARSER_VERSION) {   // missing, unreadable, or written by another parser version: parse the file again
+      if (!fs.existsSync(dxfFile(sha))) bad('the parsed drawing is out of date: upload the drawing again', 409);
       await reparse(sha);
       v = await loadSummary(sha);
       if (v.version !== PARSER_VERSION) bad('the parsed drawing is out of date: upload the drawing again', 409);

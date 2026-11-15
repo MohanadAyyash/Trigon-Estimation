@@ -94,7 +94,21 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
   assert.notStrictEqual(r.status, 0, 'a failed drawings copy exits non-zero');
   assert.ok(fs.existsSync(path.join(out, today)), 'the database copy is kept');
   assert.strictEqual(fs.existsSync(path.join(bd, n1)), false, 'no half-written drawing under the real name');
-  assert.ok(/backup failed/.test(fs.readFileSync(path.join(out, 'backup-errors.log'), 'utf8')), 'logged');
+  assert.ok(/drawing backup of 1{64}\.dxf failed/.test(fs.readFileSync(path.join(out, 'backup-errors.log'), 'utf8')), 'logged');
+  assert.strictEqual(fs.readFileSync(path.join(bd, n2), 'utf8'), 'two', 'a bad first file does not stop the rest');
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+// a damaged copy (different size) is replaced via .tmp; an intact one is left alone
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-backup-'));
+  const db = new DatabaseSync(path.join(dir, 'estimation.db'));
+  db.exec("CREATE TABLE t(x TEXT)"); db.close();
+  const dd = path.join(dir, 'drawings'), bd = path.join(dir, 'backups', 'drawings'), f = '9'.repeat(64) + '.dxf';
+  fs.mkdirSync(dd); fs.mkdirSync(bd, { recursive: true });
+  fs.writeFileSync(path.join(dd, f), 'complete drawing content'); fs.writeFileSync(path.join(bd, f), 'complete dra');
+  const r = run(dir); assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(fs.readFileSync(path.join(bd, f), 'utf8'), 'complete drawing content', 'truncated copy repaired');
+  assert.deepStrictEqual(fs.readdirSync(bd), [f], 'no .tmp left');
   fs.rmSync(dir, { recursive: true, force: true });
 }
 console.log('backup ok');
