@@ -320,6 +320,9 @@ server.listen(0, async () => {
     // Quantities: the take-off row qty is the measurement; the imported row keeps 95 and shows measured 100 with a warning badge
     await page.click('#tab-quantities'); await page.waitForSelector('#tab-body-quantities');
     assert.strictEqual(Number((await page.textContent(`#row-${kerbRow} td.qty`)).trim()), 5, 'take-off row qty 5 from the drawing');
+    assert.strictEqual((await page.textContent(`#row-${kerbRow} td.measured .from-drawings`)).trim(), 'includes 5 m from drawings', 'take-off row: what the drawings contribute');
+    assert.strictEqual((await page.textContent(`#row-${faceRow} td.measured .from-drawings`)).trim(), 'includes 1 m3 from drawings');
+    assert.strictEqual(await page.$(`#row-${asphRow} td.measured .from-drawings`), null, 'an imported row shows measured vs client instead');
     const mtxt = await page.textContent(`#row-${asphRow} td.measured`);
     assert.ok(mtxt.includes('100') && mtxt.includes('+5.26 %'), 'measured qty and diff on the imported row: ' + mtxt);
     assert.ok(await page.$(`#row-${asphRow} td.measured .tag.bad`), 'diff above 5 % in the warning colour');

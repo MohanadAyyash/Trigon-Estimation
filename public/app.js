@@ -380,6 +380,9 @@
     else if (units.length === 1 && r.source === 'import') {
       out.push(h('span', { class: 'num' }, fmtQ(r.measured_qty) + ' ' + (r.measured_unit || '')));
       if (fin(r.measured_diff_pct)) out.push(h('span', { class: 'tag' + (r.measure_diff ? ' bad' : ''), title: t('measured_diff_title') }, diffTxt(r.measured_diff_pct)));
+    } else if (units.length === 1 && r.source === 'takeoff' && fin(r.measured_qty)) {
+      // a take-off row's qty already holds its measurements: say how much of it comes from drawings
+      out.push(h('span', { class: 'small muted from-drawings' }, t('q_from_drawings', { q: fmtQ(r.measured_qty) + ' ' + (r.measured_unit || '') })));
     }
     if (r.measured_incomplete) out.push(h('span', { class: 'tag bad' }, t('measured_incomplete')));
     if (r.measured_duplicate) out.push(h('span', { class: 'tag bad' }, t('measured_duplicate')));
