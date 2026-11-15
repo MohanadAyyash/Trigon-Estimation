@@ -630,6 +630,7 @@
       t('partial_detail', { rows: p.excluded_rows.length, hidden: p.unanswered_hidden.length })));
     else if (st === 'blocked') box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('blocked_banner')), ' ', t('blocked_detail')));
     if (p.blocking.length) box.append(blockingList(id, p));
+    if ((p.snapshot_warnings || []).length) box.append(snapshotWarnings(p.snapshot_warnings));
 
     if (r) {
       box.append(threeNumbers(r, st));
@@ -676,32 +677,45 @@
     if (r) { const s = scheduleTable(r); if (s) box.append(s); }
   }
 
+  // warnings of the cost snapshot this price uses: approval needs them acknowledged
+  function snapshotWarnings(ws, listId) {
+    return h('section', { class: 'card warnings' }, h('h2', null, t('snapshot_warnings_title') + ' (' + ws.length + ')'),
+      h('ul', { id: listId || 'snapshot-warnings' }, ws.map(w => h('li', null, h('code', null, w.code), w.detail ? ' — ' + w.detail : ''))),
+      h('p', { class: 'muted small' }, t('snapshot_warnings_note')));
+  }
+
   function approvePanel(ctx, p, repriceAt) {
     const onlyStale = p.blocking.length > 0 && p.blocking.every(b => b.code === 'snapshot_stale');
     const margin = inp('ap-margin', p.margin_pct, { class: 'w-num', inputmode: 'decimal' });
     const override = onlyStale ? h('input', { type: 'checkbox', id: 'ap-override' }) : null;
     const can = !!p.result && p.complete && (!p.blocking.length || onlyStale);
+    const ack = (p.snapshot_warnings || []).length ? h('input', { type: 'checkbox', id: 'ap-ack' }) : null;
+    let same = true;
     const msg = h('div');
     // a typed margin that differs from the margin of the numbers shown must be priced first
     const changed = h('div', { id: 'ap-margin-changed', class: 'warn', hidden: true }, t('approve_margin_changed'), ' ',
       h('button', { class: 'small', id: 'ap-reprice', onclick: async ev => { ev.target.disabled = true; try { await repriceAt(margin.value); } catch (e) { fail(e); ev.target.disabled = false; } } }, t('approve_price_at_margin')));
-    const btn = h('button', { id: 'ap-approve', disabled: !can, onclick: async ev => {
+    const btn = h('button', { id: 'ap-approve', disabled: !can || !!ack, onclick: async ev => {
         const b = { margin_pct: p.margin_pct };
         if (override) b.override_stale = override.checked;
+        if (ack) b.ack_warnings = ack.checked;
         ev.target.disabled = true;
         try { await api('POST', `tenders/${ctx.id}/approve`, b); flash(t('approved_ok'), 'ok'); rerender(); }
         catch (e) {
           fail(e); ev.target.disabled = false;
           if (e.body && e.body.blocking) msg.replaceChildren(blockingList(ctx.id, { ...p, blocking: e.body.blocking }, 'approve-blocking'));
+          if (e.body && e.body.warnings) msg.replaceChildren(snapshotWarnings(e.body.warnings, 'approve-warnings'));
         }
       } }, t('approve'));
+    const refresh = () => { btn.disabled = !can || !same || (!!ack && !ack.checked); };
     margin.addEventListener('input', () => {
-      const same = pnum(margin.value) === p.margin_pct;
+      same = pnum(margin.value) === p.margin_pct;
       changed.hidden = same;
-      btn.disabled = !can || !same;
+      refresh();
     });
+    if (ack) ack.addEventListener('change', refresh);
     return card(t('approve_title'),
-      h('div', { class: 'form-grid' }, field(t('margin_pct'), margin), override ? field(t('override_stale'), override, 'check') : null),
+      h('div', { class: 'form-grid' }, field(t('margin_pct'), margin), override ? field(t('override_stale'), override, 'check') : null, ack ? field(t('ack_warnings'), ack, 'check') : null),
       changed, onlyStale ? h('p', { class: 'warn' }, t('override_stale_note')) : null,
       !can ? h('p', { class: 'err' }, t('approve_blocked')) : null, btn, msg);
   }
@@ -711,6 +725,7 @@
       t('approved_by') + ': ' + (f.approved_by || '—') + ' · ' + (fmtTime(f.approved_at) || '') + ' · ' + t('snapshot_date') + ': ' + (fmtTime(f.snapshot_created) || '—') + ' · ' + t('margin_pct') + ': ' + pctTxt(f.margin_pct)),
     );
     if (f.override_stale) box.append(h('p', { class: 'warn' }, t('approved_on_stale')));
+    if ((f.snapshot_warnings || []).length) box.append(h('p', { class: 'warn', id: 'frozen-warnings' }, t('approved_with_warnings') + ': ', f.snapshot_warnings.map((c, i) => [i ? ', ' : '', h('code', null, c)])));
     box.append(threeNumbers(f, 'complete'), card(t('waterfall'), waterfall(f), costTable(f)), ohCompare(f));
     const s = scheduleTable(f); if (s) box.append(s);
   }

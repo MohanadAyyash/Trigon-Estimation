@@ -9,7 +9,7 @@ const near = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) <
 const day = n => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);   // a date n days before now
 const b64 = rows => writeXlsx(rows).toString('base64');
 const SNAP = {
-  oh_monthly: 20000, w_monthly: 500000, months_covered: 12,
+  work_days: 26, work_hours: 8, oh_monthly: 20000, w_monthly: 500000, months_covered: 12,
   trades: [{ trade: 'Foreman', group: 'Site', rate: 40, headcount: 1, overridden: false }, { trade: 'Labourer', group: 'Site', rate: 15, headcount: 4, overridden: false }],
   groups: [{ group: 'Site', rate: 20, headcount: 5 }], equipment: [{ id: 'asset:3', name: 'Test Excavator', rate: 120, source: 'owned', overridden: false }],
   po_prices: [], unmapped: { categories: [], designations: [] }, warnings: [],

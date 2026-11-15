@@ -137,6 +137,10 @@ server.listen(0, async () => {
     await ok(call('POST', `tenders/${full}/submit`, null, admin), 'submit');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
     await page.click('#tab-summary'); await page.waitForSelector(`#summary[data-tender="${full}"] #ap-approve`);
+    // the snapshot has a warning: it is listed, and approval waits for the acknowledgement
+    assert.ok((await page.textContent('#snapshot-warnings')).includes('short_history'), 'snapshot warnings listed on the Summary');
+    assert.strictEqual(await page.isEnabled('#ap-approve'), false, 'approve waits for the warnings acknowledgement');
+    await page.check('#ap-ack');
     assert.strictEqual(await page.isEnabled('#ap-approve'), true, 'approve enabled at the shown margin');
     await page.fill('#ap-margin', '20');
     assert.ok(await page.isVisible('#ap-margin-changed'), 'changed margin warns');
@@ -145,9 +149,11 @@ server.listen(0, async () => {
     await page.waitForSelector('#whatif-note');
     const at20 = (await call('GET', `tenders/${full}/price?margin_pct=20`, null, admin)).j.result.P;
     assert.strictEqual((await page.textContent('#num-P')).trim(), f2(at20), 'priced at the typed margin');
+    await page.check('#ap-ack');
     assert.strictEqual(await page.isEnabled('#ap-approve'), true, 'approve enabled once priced at that margin');
     await page.click('#ap-approve');
     await page.waitForSelector('#summary .banner-ok');
+    assert.ok((await page.textContent('#frozen-warnings')).includes('short_history'), 'frozen Summary shows the acknowledged warnings');
     const ap = (await call('GET', `tenders/${full}`, null, admin)).j;
     assert.strictEqual(ap.status, 'approved'); assert.strictEqual(ap.margin_pct, 20); assert.strictEqual(ap.approved_P, at20, 'approved P is the P that was shown');
 

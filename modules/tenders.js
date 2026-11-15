@@ -5,6 +5,7 @@ const { unitCost, snapshotHours } = require('../lib/unitcost');
 const { priceTender } = require('../lib/pricing');
 const { writeXlsx } = require('../lib/xlsx');
 const { round2 } = require('../lib/money');
+const { viewSnapshot } = require('../lib/costs');
 
 const DAY = 86400000, MAX = 1e12, MAX_MONTHS = 1200;
 const KINDS = ['rta', 'direct'];
@@ -145,7 +146,9 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     };
     const mats = new Map(), versions = new Map();
     const mat = id => { if (!mats.has(id)) mats.set(id, snap ? ctx.costs.materialPrice(id, snap.data, now) : null); return mats.get(id); };
+    // the bound snapshot's warnings (raw; a view filters them per role) plus warnings about how it is used
     const wh = snapshotHours(snap && snap.data, s.work_hours), snapWarnings = [];
+    if (snap) for (const w of snap.data.warnings || []) snapWarnings.push({ code: w.code, detail: w.detail ?? null });
     if (snap && wh.fallback) snapWarnings.push({ code: 'snapshot_no_work_hours', detail: 'work hours from settings: ' + s.work_hours });
     const cfg = { work_hours: wh.hours, materialPrice: id => { const m = mat(id); return m ? m.rate : null; } };
     const version = (itemId, v) => {
@@ -220,6 +223,12 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     return hide && role !== 'admin' ? { kind: q.kind, cost: null, hidden: true } : q;
   }) })) }));
   const viewFrozen = (f, role) => ({ ...f, rows: viewRows(f.rows, role) });
+  // role view of a priced tender's snapshot warnings: non-admin roles get payroll-related warnings without their detail
+  const viewWarnings = (c, role) => {
+    if (!c.snap || role === 'admin') return c.snapWarnings;
+    const own = viewSnapshot({ warnings: c.snap.data.warnings || [] }, role).warnings.map(w => ({ code: w.code, detail: w.detail ?? null }));
+    return own.concat(c.snapWarnings.slice(own.length));
+  };
   const latestId = () => { const l = ctx.costs.latest(); return l ? l.id : null; };
 
   // ---- import -------------------------------------------------------------------------------------------
@@ -316,7 +325,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: w.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
         newer_snapshot: latest !== null && latest !== w.snapshot_id, margin_pct: c.margin, inputs: c.inputs, result: c.result, error: c.error,
         complete: c.complete, excluded_rows: c.excludedRows, unanswered_hidden: c.unansweredHidden,
-        rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking, snapshot_warnings: c.snapWarnings });
+        rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking, snapshot_warnings: viewWarnings(c, me.role) });
     }
     if (sub === 'export' && parts.length === 3 && method === 'GET') return exportApi(res, url, t, me);
     if (parts.length === 3 && method === 'POST' && ['submit', 'return', 'send', 'reprice', 'approve', 'revise'].includes(sub)) return workflow(sub, req, res, t, me);
@@ -483,6 +492,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const margin = b.margin_pct === undefined ? undefined : pctField(b.margin_pct, 'margin_pct');
       if (margin === null) bad('margin_pct must be a number ≥ 0 and < 100');
       if (b.override_stale !== undefined && typeof b.override_stale !== 'boolean') bad('override_stale must be true or false');
+      if (b.ack_warnings !== undefined && typeof b.ack_warnings !== 'boolean') bad('ack_warnings must be true or false');
       const cur = tenderRow(t.id);
       if (cur.status !== 'submitted') conflict(`tender is ${cur.status}: approve needs submitted`);
       const c = compute(cur, margin), override = b.override_stale === true;
@@ -490,12 +500,16 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       const blocking = c.blocking.filter(x => !(override && x.code === 'snapshot_stale'));
       if (blocking.length) conflict('pricing is blocked', blocking);
       if (!c.result) bad(c.error);
+      // a snapshot with warnings (missing EOS, short history, bad ERP rows…) may understate costs: the admin must say they read them
+      const warnCodes = c.snapWarnings.map(w => w.code), ack = warnCodes.length > 0 && b.ack_warnings === true;
+      if (warnCodes.length && !ack) return reply(res, 409, { error: 'the cost data has warnings: read them and acknowledge to approve', warnings: c.snapWarnings });
       const at = new Date().toISOString(), s = c.settings;
       const frozen = { ...c.result, rows: c.rows, hidden: c.hidden, item_versions: c.itemVersions, snapshot_id: c.snap.id, snapshot_created: c.snap.created,
-        margin_pct: c.margin, finance_rate_pct: s.finance_rate_pct, min_profit_pct: s.min_profit_pct, inputs: c.inputs, override_stale: override && stale, approved_by: me.username, approved_at: at };
+        margin_pct: c.margin, finance_rate_pct: s.finance_rate_pct, min_profit_pct: s.min_profit_pct, inputs: c.inputs, override_stale: override && stale, snapshot_warnings: warnCodes, approved_by: me.username, approved_at: at };
       tx(() => {
         db.prepare("UPDATE tenders SET status='approved', margin_pct=?, approved_by=?, approved_at=?, frozen=? WHERE id=? AND status='submitted'").run(c.margin, me.username, at, JSON.stringify(frozen), t.id);
         audit(me, override && stale ? 'approve_stale' : 'approve', 'tenders', t.id, { P: frozen.P, margin_pct: c.margin, snapshot_id: c.snap.id, snapshot_created: c.snap.created });
+        if (ack) audit(me, 'approve_ack_warnings', 'tenders', t.id, { codes: warnCodes, snapshot_id: c.snap.id });
       });
       return reply(res, 200, { id: t.id, status: 'approved', frozen: viewFrozen(frozen, me.role) });
     }

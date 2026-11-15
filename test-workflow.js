@@ -181,6 +181,28 @@ server.listen(0, async () => {
     assert.strictEqual(rpE.old_complete, false); assert.strictEqual(rpE.new_complete, false);
     assert.ok(rpE.blocking.some(b => b.code === 'hidden_unanswered' && b.hidden_id === E.hidden[0].id));
 
+    // ---- snapshot warnings: shown with the price, approval needs an explicit acknowledgement --------------------------
+    const warnSnap = addSnap({ ...SNAP, warnings: [{ code: 'short_history', detail: '11 month(s) of bills' }, { code: 'eos_missing', detail: 'Foreman' }] });
+    const K = await makeTender(false);
+    assert.strictEqual((await call('GET', `tenders/${K.id}`, null, qs)).j.snapshot_id, warnSnap);
+    const kA = await ok(call('GET', `tenders/${K.id}/price`, null, admin), 'price K admin');
+    assert.deepStrictEqual(kA.snapshot_warnings, [{ code: 'short_history', detail: '11 month(s) of bills' }, { code: 'eos_missing', detail: 'Foreman' }]);
+    const kQ = await ok(call('GET', `tenders/${K.id}/price`, null, qs), 'price K qs');
+    assert.deepStrictEqual(kQ.snapshot_warnings, [{ code: 'short_history', detail: '11 month(s) of bills' }, { code: 'eos_missing', detail: null }], 'qs: payroll warning without its detail');
+    await ok(call('POST', `tenders/${K.id}/submit`, null, qs), 'submit K');
+    const kNoAck = await call('POST', `tenders/${K.id}/approve`, { margin_pct: 12 }, admin);
+    assert.strictEqual(kNoAck.s, 409, 'warnings need an acknowledgement'); assert.ok(kNoAck.j.error);
+    assert.deepStrictEqual(kNoAck.j.warnings.map(w => w.code), ['short_history', 'eos_missing']);
+    assert.strictEqual((await call('POST', `tenders/${K.id}/approve`, { margin_pct: 12, ack_warnings: 'yes' }, admin)).s, 400, 'ack_warnings must be a boolean');
+    assert.strictEqual((await call('POST', `tenders/${K.id}/approve`, { margin_pct: 12, ack_warnings: false }, admin)).s, 409);
+    assert.strictEqual((await call('GET', `tenders/${K.id}`, null, qs)).j.status, 'submitted', 'nothing frozen without the acknowledgement');
+    const kAp = await ok(call('POST', `tenders/${K.id}/approve`, { margin_pct: 12, ack_warnings: true }, admin), 'approve K with ack');
+    assert.deepStrictEqual(kAp.frozen.snapshot_warnings, ['short_history', 'eos_missing'], 'frozen record keeps the warning codes');
+    const ackRow = db.prepare("SELECT detail FROM audit_log WHERE entity='tenders' AND action='approve_ack_warnings' AND entity_id=?").get(String(K.id));
+    assert.ok(ackRow, 'acknowledgement audited'); assert.deepStrictEqual(JSON.parse(ackRow.detail).codes, ['short_history', 'eos_missing']);
+    assert.ok(audited('approve', K.id));
+    assert.deepStrictEqual((await call('GET', `tenders/${K.id}/price`, null, qs)).j.frozen.snapshot_warnings, ['short_history', 'eos_missing']);
+
     // ---- work hours come from the tender's snapshot, never from today's setting -------------------------------------
     const W = await makeTender(false);
     const w0 = await ok(call('GET', `tenders/${W.id}/price`, null, admin), 'price W');
