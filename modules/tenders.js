@@ -6,6 +6,7 @@ const { priceTender } = require('../lib/pricing');
 const { writeXlsx } = require('../lib/xlsx');
 const { round2 } = require('../lib/money');
 const { viewSnapshot } = require('../lib/costs');
+const { normUom } = require('../lib/units');
 
 const DAY = 86400000, MAX = 1e12, MAX_MONTHS = 1200;
 const KINDS = ['rta', 'direct'];
@@ -95,6 +96,38 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
   const tenderRow = id => id === null ? null : db.prepare('SELECT * FROM tenders WHERE id=?').get(id);
   const mustDraft = t => { if (t.status !== 'draft') conflict(`tender is ${t.status}: only a draft can be changed`); };
   const tenderView = t => { const { frozen, ...v } = t; return { ...v, approved_P: frozen ? JSON.parse(frozen).P : null }; };
+
+  // ---- measured quantities (drawings.js) ---------------------------------------------------------------
+  // A take-off row's qty = its take-off lines + its measurements. A measurement counts when its unit is the row's
+  // normalised unit or the mismatch was confirmed (uom_confirmed); any other one stops the write, never silently left out.
+  const rowMeasurements = rowId => ctx.drawings ? ctx.drawings.rowMeasurements(rowId) : [];
+  function recomputeTakeoffQty(rowId) {
+    const row = db.prepare('SELECT * FROM tender_rows WHERE id=?').get(rowId);
+    if (!row || row.source !== 'takeoff' || row.is_heading) return null;   // an imported row's qty is the client's: never changed
+    const u = normUom(row.unit);
+    let qty = takeoffQty(db.prepare('SELECT * FROM takeoff_lines WHERE row_id=?').all(row.id));
+    for (const m of rowMeasurements(row.id)) {
+      if (m.qty_unit !== u && !m.uom_confirmed) conflict(`measurement ${m.id} is in ${m.qty_unit} but the row is in ${row.unit}: relink or remove it`);
+      qty += m.qty;
+    }
+    if (!Number.isFinite(qty) || qty < 0) bad(`take-off total would be ${qty}: deductions exceed the measured quantity`);
+    db.prepare('UPDATE tender_rows SET qty=? WHERE id=?').run(qty, row.id);
+    return qty;
+  }
+  ctx.tenders = { recomputeTakeoffQty };
+  // measured vs client qty. measured_qty only when one unit (else null, see measured_units); the difference only for an
+  // imported row measured in its own unit with a non-zero qty
+  const measuredView = r => {
+    const m = ctx.drawings ? ctx.drawings.rowMeasuredQty(r.id) : null;
+    const v = { measured_qty: m ? m.qty : null, measured_unit: m ? m.unit : null, measured_units: m ? m.units : [], measured_diff_pct: null, measure_diff: false };
+    if (m && r.source === 'import' && !r.is_heading && m.unit !== null && m.unit === normUom(r.unit) && finNum(r.qty) && r.qty !== 0) {
+      v.measured_diff_pct = (m.qty - r.qty) / r.qty * 100;
+      v.measure_diff = Math.abs(v.measured_diff_pct) > 5;
+    }
+    return v;
+  };
+  const measureWarnings = t => db.prepare("SELECT * FROM tender_rows WHERE tender_id=? AND source='import' AND is_heading=0 ORDER BY seq, id").all(t.id)
+    .map(r => ({ row_id: r.id, v: measuredView(r) })).filter(x => x.v.measure_diff).map(x => ({ row_id: x.row_id, diff_pct: x.v.measured_diff_pct }));
 
   // ---- validation -----------------------------------------------------------------------------------
   // a number field: null/'' clears it, otherwise num() must parse it and `check` must pass
@@ -293,12 +326,15 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (method === 'DELETE') {
         need(me, 'admin', 'qs'); mustDraft(t);
         tx(() => {
+          mustDraft(tenderRow(t.id));
+          // its drawings and measurements rows go too; the files stay (shared by sha256)
+          const dr = ctx.drawings ? ctx.drawings.deleteForTender(t.id) : { drawings: 0, measurements: 0 };
           db.prepare('DELETE FROM takeoff_lines WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=?)').run(t.id);
           db.prepare('DELETE FROM row_links WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=?)').run(t.id);
           db.prepare('DELETE FROM tender_rows WHERE tender_id=?').run(t.id);
           db.prepare('DELETE FROM tender_hidden WHERE tender_id=?').run(t.id);
           db.prepare('DELETE FROM tenders WHERE id=?').run(t.id);
-          audit(me, 'delete', 'tenders', t.id, tenderView(t));
+          audit(me, 'delete', 'tenders', t.id, { ...tenderView(t), drawings_deleted: dr.drawings, measurements_deleted: dr.measurements });
         });
         return reply(res, 200, { ok: 1 });
       }
@@ -327,7 +363,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: w.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
         newer_snapshot: latest !== null && latest !== w.snapshot_id, margin_pct: c.margin, inputs: c.inputs, result: c.result, error: c.error,
         complete: c.complete, excluded_rows: c.excludedRows, unanswered_hidden: c.unansweredHidden,
-        rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking, snapshot_warnings: viewWarnings(c, me.role) });
+        rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking, snapshot_warnings: viewWarnings(c, me.role), measure_warnings: measureWarnings(t) });
     }
     if (sub === 'export' && parts.length === 3 && method === 'GET') return exportApi(res, url, t, me);
     if (parts.length === 3 && method === 'POST' && ['submit', 'return', 'send', 'reprice', 'approve', 'revise'].includes(sub)) return workflow(sub, req, res, t, me);
@@ -379,7 +415,9 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         out.push({ no: text(cell(row, cols.no)), description: text(cell(row, cols.desc)), unit: text(cell(row, cols.unit)), qty });
       });
       if (!out.length) bad(`no rows found after header row ${b.header_row} in sheet "${sheet.name}"`);   // a wrong header_row must not wipe the BOQ
-      const linksRemoved = tx(() => {
+      const done = tx(() => {
+        // measurements of the replaced rows are kept, unlinked: the user relinks them to the new rows
+        const unlinked = ctx.drawings ? ctx.drawings.unlinkRows(db.prepare("SELECT id FROM tender_rows WHERE tender_id=? AND source='import'").all(t.id).map(r => r.id)) : 0;
         const removed = Number(db.prepare("DELETE FROM row_links WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=? AND source='import')").run(t.id).changes);
         db.prepare("DELETE FROM takeoff_lines WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=? AND source='import')").run(t.id);
         db.prepare("DELETE FROM tender_rows WHERE tender_id=? AND source='import'").run(t.id);
@@ -388,10 +426,10 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         // take-off rows keep their order, after the imported rows
         const upd = db.prepare('UPDATE tender_rows SET seq=? WHERE id=?');
         db.prepare("SELECT id FROM tender_rows WHERE tender_id=? AND source='takeoff' ORDER BY seq, id").all(t.id).forEach((r, i) => upd.run(out.length + i + 1, r.id));
-        audit(me, 'import', 'tenders', t.id, { sheet: sheet.name, header_row: b.header_row, cols, rows: out.length, headings: out.filter(r => r.qty === null).length, links_removed: removed });
-        return removed;
+        audit(me, 'import', 'tenders', t.id, { sheet: sheet.name, header_row: b.header_row, cols, rows: out.length, headings: out.filter(r => r.qty === null).length, links_removed: removed, measurements_unlinked: unlinked });
+        return { removed, unlinked };
       });
-      return reply(res, 200, { ok: 1, rows: out.length, links_removed: linksRemoved });
+      return reply(res, 200, { ok: 1, rows: out.length, links_removed: done.removed, measurements_unlinked: done.unlinked });
     }
 
     if (sub === 'rows') return rowsApi(req, res, t, me, subId, sub2, sub2Id, parts.length);
@@ -533,13 +571,17 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         const insRow = db.prepare('INSERT INTO tender_rows(tender_id,seq,no,description,unit,qty,is_heading,manual_unit,source) VALUES(?,?,?,?,?,?,?,?,?)');
         const insLink = db.prepare('INSERT INTO row_links(row_id,item_id,share) SELECT ?, item_id, share FROM row_links WHERE row_id=? ORDER BY rowid');
         const insLine = db.prepare('INSERT INTO takeoff_lines(row_id,description,l,w,d,count,deduct) SELECT ?, description, l, w, d, count, deduct FROM takeoff_lines WHERE row_id=? ORDER BY id');
+        const rowIdMap = new Map();
         for (const r of db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(t.id)) {
           const rid = Number(insRow.run(nid, r.seq, r.no, r.description, r.unit, r.qty, r.is_heading, r.manual_unit, r.source).lastInsertRowid);
           insLink.run(rid, r.id); insLine.run(rid, r.id);
+          rowIdMap.set(r.id, rid);
         }
+        // the drawings (same files) and measurements, on the new row ids
+        const cl = ctx.drawings ? ctx.drawings.cloneForTender(t.id, nid, rowIdMap) : { drawings: 0, measurements: 0 };
         db.prepare(`INSERT INTO tender_hidden(tender_id,template_id,name_ar,name_en,kind,status,amount,pct,months,bank_fee_pct,loss_pct,note)
           SELECT ?, template_id, name_ar, name_en, kind, status, amount, pct, months, bank_fee_pct, loss_pct, note FROM tender_hidden WHERE tender_id=? ORDER BY id`).run(nid, t.id);
-        audit(me, 'revise', 'tenders', nid, { from: t.id, rev, root_id: t.root_id, snapshot_id: snapId });
+        audit(me, 'revise', 'tenders', nid, { from: t.id, rev, root_id: t.root_id, snapshot_id: snapId, drawings_copied: cl.drawings, measurements_copied: cl.measurements });
         return nid;
       });
       return reply(res, 200, { id });
@@ -554,7 +596,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (method === 'GET') {
         const linkQ = db.prepare('SELECT l.item_id, l.share, i.code, i.unit AS uom, i.name_ar, i.name_en FROM row_links l JOIN items i ON i.id=l.item_id WHERE l.row_id=? ORDER BY l.rowid');
         const lineQ = db.prepare('SELECT * FROM takeoff_lines WHERE row_id=? ORDER BY id');
-        return reply(res, 200, db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(t.id).map(r => ({ ...r, links: linkQ.all(r.id), lines: lineQ.all(r.id) })));
+        return reply(res, 200, db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(t.id).map(r => ({ ...r, links: linkQ.all(r.id), lines: lineQ.all(r.id), ...measuredView(r) })));
       }
       if (method === 'POST') {
         need(me, 'admin', 'qs'); mustDraft(t);
@@ -591,6 +633,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if ('manual_unit' in body) nr.manual_unit = nonNegField(body.manual_unit, 'manual_unit');
       if (nr.is_heading && (nr.manual_unit !== null || db.prepare('SELECT 1 FROM row_links WHERE row_id=?').get(row.id))) bad('a heading row has no price: remove its links and manual unit first');
       tx(() => {
+        // measurements were checked against the row's unit: it cannot change under them, nor the row become a heading
+        if ((nr.is_heading || normUom(nr.unit) !== normUom(row.unit)) && ctx.drawings && ctx.drawings.hasMeasurements(row.id)) conflict('the row has measurements: remove them before changing its unit or making it a heading');
         db.prepare('UPDATE tender_rows SET no=?, description=?, unit=?, qty=?, is_heading=?, manual_unit=? WHERE id=?').run(nr.no, nr.description, nr.unit, nr.qty, nr.is_heading, nr.manual_unit, row.id);
         audit(me, 'update', 'tender_rows', row.id, { tender_id: t.id, before: row, after: nr });
       });
@@ -598,6 +642,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     }
     if (sub2 === undefined && method === 'DELETE') {
       tx(() => {
+        if (ctx.drawings && ctx.drawings.hasMeasurements(row.id)) conflict('remove its measurements first');
         db.prepare('DELETE FROM takeoff_lines WHERE row_id=?').run(row.id);
         db.prepare('DELETE FROM row_links WHERE row_id=?').run(row.id);
         db.prepare('DELETE FROM tender_rows WHERE id=?').run(row.id);
@@ -645,9 +690,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       // write, then recompute the row qty in the same transaction; a negative total is refused
       const save = (fn, action, detail) => tx(() => {
         const lid = fn();
-        const qty = takeoffQty(db.prepare('SELECT * FROM takeoff_lines WHERE row_id=?').all(row.id));
-        if (!Number.isFinite(qty) || qty < 0) bad(`take-off total would be ${qty}: deductions exceed the measured quantity`);
-        db.prepare('UPDATE tender_rows SET qty=? WHERE id=?').run(qty, row.id);
+        const qty = recomputeTakeoffQty(row.id);   // lines + measurements; a negative total is refused
         audit(me, action, 'takeoff_lines', lid, { tender_id: t.id, row_id: row.id, ...detail, row_qty: qty });
         return { id: lid, row_qty: qty };
       });
