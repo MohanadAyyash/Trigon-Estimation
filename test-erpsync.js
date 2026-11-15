@@ -115,6 +115,27 @@ assert.strictEqual(ro.has_project, false); assert.strictEqual(ro.log_hours_12m, 
 assert.deepStrictEqual(raw.hires, [{ key: 31, name: 'Test Crane Hire', type: 'equipment', basis: 'day', rate: 1000, base_hours: 10 }]);
 assert.deepStrictEqual(raw.projects, [{ contract_value: 1000000, start_date: '2026-01-01', end_date: '2027-01-01' }]);
 
+// ---- bad amounts: passed through as null with a warning (never dropped silently, never read as 0) ----
+{
+  const d = fx();
+  d.eos_provisions.push({ id: 50, month: '2026-09', employee_id: 11, amount: null });
+  d.bills.push({ id: 60, date: '2026-10-05', project_id: null, category: 'fuel', amount: 'n/a' });
+  d.equipment_logs.push({ asset_id: 21, date: '2026-10-06', hours: null, cost: 300 }, { asset_id: 21, date: '2026-10-08', hours: 3, cost: null },
+    { asset_id: 23, date: '2026-10-07', hours: 4, cost: null });
+  const r = readErp(fresh(d), { now });
+  const badEos = r.eos.find(e => e.amount === null);
+  assert.ok(badEos && badEos.id === 50 && badEos.month === '2026-09', 'bad EOS row kept with amount null');
+  assert.strictEqual(r.eos.length, 2);
+  const badBill = r.bills.find(b => b.amount === null);
+  assert.ok(badBill && badBill.id === 60, 'bad bill kept with amount null');
+  const ex2 = r.assets.find(a => a.key === 21), ro2 = r.assets.find(a => a.key === 23);
+  assert.strictEqual(ex2.log_hours_12m, 10, 'a log row with missing hours or cost is left out, not counted as 0');
+  assert.strictEqual(ex2.log_cost_12m, 500);
+  assert.strictEqual(ro2.log_hours_12m, 0); assert.strictEqual(ro2.log_cost_12m, 0);
+  assert.deepStrictEqual(r.warnings, [{ code: 'bad_eos_amount', id: 50 }, { code: 'bad_bill_amount', id: 60 }, { code: 'bad_po_items', id: 4 },
+    { code: 'bad_equipment_log', detail: 'asset:21' }, { code: 'bad_equipment_log', detail: 'asset:23' }]);
+}
+
 // ---- empty ERP ----
 const empty = readErp(fresh({}), { now });
 assert.strictEqual(empty.earliest_bill, null); assert.deepStrictEqual(empty.payroll, []);

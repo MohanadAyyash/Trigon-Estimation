@@ -79,6 +79,26 @@ const equip = (s, id) => s.equipment.find(e => e.id === id);
 assert.strictEqual(snap.work_days, 26); assert.strictEqual(snap.work_hours, 8);
 assert.strictEqual(buildSnapshot(fixture(), cfg({ work_hours: 'x' })).work_hours, null, 'a bad work_hours is stored as null, never guessed');
 
+// bad ERP amounts (lib/erpsync.js passes them as null with a warning): excluded, flagged once
+{
+  const r = fixture();
+  r.bills.push({ id: 60, date: '2026-05-05', category: 'Rent', amount: null, has_project: false });
+  r.eos.push({ id: 70, month: '2026-09', employee_key: 1, amount: null });
+  r.warnings.push({ code: 'bad_bill_amount', id: 60 }, { code: 'bad_eos_amount', id: 70 }, { code: 'bad_equipment_log', detail: 'asset:3' });
+  const s = buildSnapshot(r, cfg());
+  near(s.oh_parts.bills, 120000, 'bad bill excluded'); near(s.oh_monthly, 15000, 'OH unchanged by a bad bill');
+  assert.deepStrictEqual(s.warnings.filter(w => ['bad_bill_amount', 'bad_eos_amount', 'bad_equipment_log'].includes(w.code)),
+    [{ code: 'bad_bill_amount', detail: 'id 60' }, { code: 'bad_eos_amount', detail: 'id 70' }, { code: 'bad_equipment_log', detail: 'asset:3' }], 'each flagged once');
+  // without the reader's warnings (another caller), the builder flags them itself
+  const r2 = fixture();
+  r2.bills.push({ id: 61, date: '2026-05-05', category: 'Rent', amount: null, has_project: false });
+  r2.eos.push({ id: 71, month: '2026-09', employee_key: 1, amount: 'x' });
+  const s2 = buildSnapshot(r2, cfg());
+  assert.ok(s2.warnings.some(w => w.code === 'bad_bill_amount' && w.detail === 'id 61'), 'bad bill flagged by the builder');
+  assert.ok(s2.warnings.some(w => w.code === 'bad_eos_amount' && w.detail === 'id 71'), 'bad EOS flagged by the builder');
+  assert.ok(!('detail' in viewSnapshot(s2, 'qs').warnings.find(w => w.code === 'bad_eos_amount')), 'EOS warning detail hidden from qs');
+}
+
 // trades and groups
 near(trade(snap, 'Mason').rate, 17.3077, 'Mason rate');
 near(trade(snap, 'Foreman').rate, 33.1731, 'Foreman rate');
