@@ -75,6 +75,10 @@ const trade = (s, n) => s.trades.find(t => t.trade === n);
 const group = (s, n) => s.groups.find(g => g.group === n);
 const equip = (s, id) => s.equipment.find(e => e.id === id);
 
+// the work days/hours the rates were built on are stored, so later pricing uses the same hours
+assert.strictEqual(snap.work_days, 26); assert.strictEqual(snap.work_hours, 8);
+assert.strictEqual(buildSnapshot(fixture(), cfg({ work_hours: 'x' })).work_hours, null, 'a bad work_hours is stored as null, never guessed');
+
 // trades and groups
 near(trade(snap, 'Mason').rate, 17.3077, 'Mason rate');
 near(trade(snap, 'Foreman').rate, 33.1731, 'Foreman rate');

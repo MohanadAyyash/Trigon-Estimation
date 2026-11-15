@@ -1,5 +1,5 @@
 // Item library (rate analysis): sections, items, immutable versions, unit cost from the latest cost snapshot.
-const { unitCost } = require('../lib/unitcost');
+const { unitCost, snapshotHours } = require('../lib/unitcost');
 
 const SEED = [
   ['Excavation', 'الحفر'], ['Backfill & compaction', 'الردم والدمك'], ['Sub-base', 'الطبقة التحتية'], ['Road base', 'طبقة الأساس'],
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
 
   // ---- pricing --------------------------------------------------------------------
   function priceItems(rows, role) {
-    const snap = ctx.costs.latest(), cfg = { work_hours: getSettings().work_hours, materialPrice: id => { const m = ctx.costs.materialPrice(id, snap && snap.data, new Date()); return m ? m.rate : null; } };
+    const snap = ctx.costs.latest(), cfg = { work_hours: snapshotHours(snap && snap.data, getSettings().work_hours).hours, materialPrice: id => { const m = ctx.costs.materialPrice(id, snap && snap.data, new Date()); return m ? m.rate : null; } };
     const trades = new Map(((snap && snap.data.trades) || []).map(t => [t.trade, t]));
     return rows.map(it => {
       const vr = db.prepare('SELECT data FROM item_versions WHERE item_id=? AND version=?').get(it.id, it.current_version), data = JSON.parse(vr.data);

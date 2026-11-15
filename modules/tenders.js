@@ -1,7 +1,7 @@
 // Tenders: BOQ import, take-off, links to library items, hidden-cost checklist, pricing, QS -> admin approval, revisions.
 // Spec 5.6-5.8 and 7. Editing is allowed only in draft; an approved price is frozen and never recomputed.
 const { readXlsx } = require('../lib/xlsx');
-const { unitCost } = require('../lib/unitcost');
+const { unitCost, snapshotHours } = require('../lib/unitcost');
 const { priceTender } = require('../lib/pricing');
 const { writeXlsx } = require('../lib/xlsx');
 const { round2 } = require('../lib/money');
@@ -145,7 +145,9 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     };
     const mats = new Map(), versions = new Map();
     const mat = id => { if (!mats.has(id)) mats.set(id, snap ? ctx.costs.materialPrice(id, snap.data, now) : null); return mats.get(id); };
-    const cfg = { work_hours: s.work_hours, materialPrice: id => { const m = mat(id); return m ? m.rate : null; } };
+    const wh = snapshotHours(snap && snap.data, s.work_hours), snapWarnings = [];
+    if (snap && wh.fallback) snapWarnings.push({ code: 'snapshot_no_work_hours', detail: 'work hours from settings: ' + s.work_hours });
+    const cfg = { work_hours: wh.hours, materialPrice: id => { const m = mat(id); return m ? m.rate : null; } };
     const version = (itemId, v) => {
       const k = itemId + ':' + v;
       if (!versions.has(k)) { const r = db.prepare('SELECT id, data FROM item_versions WHERE item_id=? AND version=?').get(itemId, v); versions.set(k, r ? { id: r.id, data: JSON.parse(r.data) } : null); }
@@ -210,7 +212,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     const unansweredHidden = hidden.filter(h => h.status === null).map(h => h.id);
     const complete = !excludedRows.length && !unansweredHidden.length;
     if (result) result.partial = !complete;
-    return { snap, settings: s, inputs, margin, rows, hidden, applied, blocking, result, error, itemVersions, complete, excludedRows, unansweredHidden };
+    return { snap, settings: s, inputs, margin, rows, hidden, applied, blocking, result, error, itemVersions, complete, excludedRows, unansweredHidden, snapWarnings };
   }
   // role view of breakdown rows: qs/viewer never see a small-trade labour part
   const viewRows = (rows, role) => rows.map(r => ({ ...r, links: r.links.map(l => ({ ...l, parts: l.parts.map(p => {
@@ -314,7 +316,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       return reply(res, 200, { tender_id: t.id, status: t.status, snapshot_id: w.snapshot_id, snapshot_created: c.snap ? c.snap.created : null,
         newer_snapshot: latest !== null && latest !== w.snapshot_id, margin_pct: c.margin, inputs: c.inputs, result: c.result, error: c.error,
         complete: c.complete, excluded_rows: c.excludedRows, unanswered_hidden: c.unansweredHidden,
-        rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking });
+        rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking, snapshot_warnings: c.snapWarnings });
     }
     if (sub === 'export' && parts.length === 3 && method === 'GET') return exportApi(res, url, t, me);
     if (parts.length === 3 && method === 'POST' && ['submit', 'return', 'send', 'reprice', 'approve', 'revise'].includes(sub)) return workflow(sub, req, res, t, me);

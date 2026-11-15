@@ -6,7 +6,7 @@ const { server, db } = require('./server.js');
 
 const day = n => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 const SNAP = {
-  oh_monthly: 20000, w_monthly: 500000, months_covered: 12,
+  work_days: 26, work_hours: 8, oh_monthly: 20000, w_monthly: 500000, months_covered: 12,
   trades: [{ trade: 'Foreman', group: 'Site', rate: 40, headcount: 1, overridden: false }, { trade: 'Labourer', group: 'Site', rate: 15, headcount: 4, overridden: false }],
   groups: [{ group: 'Site', rate: 20, headcount: 5 }], equipment: [], po_prices: [], unmapped: { categories: [], designations: [] }, warnings: [],
 };
@@ -180,6 +180,25 @@ server.listen(0, async () => {
     const rpE = await ok(call('POST', `tenders/${E.id}/reprice`, null, qs), 'reprice partial');
     assert.strictEqual(rpE.old_complete, false); assert.strictEqual(rpE.new_complete, false);
     assert.ok(rpE.blocking.some(b => b.code === 'hidden_unanswered' && b.hidden_id === E.hidden[0].id));
+
+    // ---- work hours come from the tender's snapshot, never from today's setting -------------------------------------
+    const W = await makeTender(false);
+    const w0 = await ok(call('GET', `tenders/${W.id}/price`, null, admin), 'price W');
+    const libUnit = async () => (await call('GET', 'library/items', null, admin)).j.find(i => i.id === item).unit;
+    const lib0 = await libUnit();
+    await ok(call('PUT', 'settings', { work_hours: 10 }, admin), 'change work hours');
+    const w1 = await ok(call('GET', `tenders/${W.id}/price`, null, admin), 'price W after setting change');
+    assert.strictEqual(w1.result.P, w0.result.P, 'a settings change after the sync does not change the tender price');
+    assert.strictEqual(await libUnit(), lib0, 'library unit cost uses the snapshot hours too');
+    assert.ok(!w1.snapshot_warnings.some(w => w.code === 'snapshot_no_work_hours'));
+    // an old snapshot without stored hours: falls back to the setting and says so
+    const { work_days: _wd, work_hours: _wh, ...oldSnap } = SNAP;
+    addSnap(oldSnap);
+    const O = await makeTender(false);
+    const o1 = await ok(call('GET', `tenders/${O.id}/price`, null, admin), 'price on an old snapshot');
+    assert.ok(o1.snapshot_warnings.some(w => w.code === 'snapshot_no_work_hours'), 'old snapshot warned');
+    assert.strictEqual(o1.rows[0].links[0].parts[1].cost, 40 * 10 / 8, 'old snapshot: labour priced on the setting (10 h)');
+    await ok(call('PUT', 'settings', { work_hours: 8 }, admin), 'restore work hours');
     console.log('workflow ok'); process.exit(0);
   } catch (e) { console.error(e); process.exit(1); }
 });
