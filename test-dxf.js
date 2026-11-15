@@ -4,7 +4,7 @@ const { UNIT_TO_M, insunitsToUnit, normUom } = require('./lib/units.js');
 const { decodeDxf } = require('./lib/dxf/decode.js');
 const { parseDxf } = require('./lib/dxf/parse.js');
 
-const dxf = (pairs, eol = '\n') => pairs.map(([c, v]) => c + eol + v).join(eol) + eol;
+const dxf = (pairs, eol = '\n') => [...pairs, [0, 'EOF']].map(([c, v]) => c + eol + v).join(eol) + eol;
 const sec = (name, pairs) => [[0, 'SECTION'], [2, name], ...pairs, [0, 'ENDSEC']];
 const layerRec = (name, color = 7, flag = 0) => [[0, 'LAYER'], [2, name], [70, flag], [62, color], [6, 'CONTINUOUS']];
 const tables = layers => sec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, layers.length], ...layers.flat(), [0, 'ENDTAB']]);
@@ -64,11 +64,11 @@ const r12 = parseDxf(dxf([...sec('ENTITIES', [[0, 'POLYLINE'], [5, 'B1'], [8, 'P
 assert.strictEqual(r12.entities.length, 1);
 assert.strictEqual(r12.entities[0].type, 'POLYLINE');
 assert.strictEqual(r12.entities[0].closed, true);
-assert.deepStrictEqual(r12.entities[0].vertices, [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]]);
+assert.deepStrictEqual(r12.entities[0].vertices, [[0, 0, 0, 0], [10, 0, 0, 0], [10, 10, 0, 0], [0, 10, 0, 0]]);
 assert.strictEqual(r12.ignored.VERTEX, undefined);
 const open = parseDxf(dxf(sec('ENTITIES', [[0, 'POLYLINE'], [5, 'B2'], [8, 'P'], [70, 0], ...v(0, 0), [0, 'VERTEX'], [10, 1], [20, 1], [42, 0.5], [0, 'SEQEND']])));
 assert.strictEqual(open.entities[0].closed, false);
-assert.deepStrictEqual(open.entities[0].vertices, [[0, 0, 0], [1, 1, 0.5]]);
+assert.deepStrictEqual(open.entities[0].vertices, [[0, 0, 0, 0], [1, 1, 0.5, 0]]);
 
 // insunits, layer 0, layer flags
 assert.strictEqual(clean.header.insunits, 4);
@@ -100,5 +100,39 @@ assert.ok(blk.warnings.some(w => w.code === 'xref' && /X/.test(w.detail)));
 // repeated codes are kept in order
 const lw = parseDxf(dxf(sec('ENTITIES', [[0, 'LWPOLYLINE'], [5, 'LW'], [8, '0'], [90, 2], [70, 1], [10, 0], [20, 0], [10, 4], [20, 0], [42, 1]])));
 assert.deepStrictEqual(lw.entities[0].codes.filter(([c]) => c === 10 || c === 20).map(([c, x]) => c + ':' + x), ['10:0', '20:0', '10:4', '20:0']);
+
+// fix round 1
+const err = (fn, re) => assert.throws(fn, re);
+err(() => parseDxf(''), /not a DXF file/);
+err(() => parseDxf('hello'), /not a DXF file/);
+err(() => parseDxf('hello\nworld\n'), /not a DXF file/);
+const full = dxf(base);
+err(() => parseDxf(full.slice(0, full.indexOf('WALLS', full.indexOf('ENTITIES')) + 3)), /truncated \(no EOF\)/);
+err(() => parseDxf(full.replace(/(\n0\nEOF)+\n$/, "\n")), /truncated/);
+err(() => parseDxf(dxf(sec('ENTITIES', [[0, 'LINE']])).replace('\n0\nLINE', '\nxx\nLINE')), /line \d+/);
+// unparsable coordinates are errors, absent bulge is 0
+err(() => parseDxf(dxf(sec('ENTITIES', [[0, 'POLYLINE'], [5, 'PV'], [70, 0], [0, 'VERTEX'], [10, ''], [20, 1], [0, 'SEQEND']]))), /VERTEX|PV/);
+err(() => parseDxf(dxf(sec('ENTITIES', [[0, 'POLYLINE'], [5, 'PV'], [70, 0], [0, 'VERTEX'], [10, 1], [0, 'SEQEND']]))), /PV/);
+err(() => parseDxf(dxf(sec('ENTITIES', [[0, 'LWPOLYLINE'], [5, 'LQ'], [10, 'abc'], [20, 0]]))), /LQ/);
+err(() => parseDxf(dxf(sec('BLOCKS', [[0, 'BLOCK'], [2, 'BB'], [70, 0], [10, 'zz'], [20, 0], [0, 'ENDBLK']]))), /BB/);
+// vertex flags: polyface face records (128) and spline frame points (16) are skipped from vertices
+const fv = (x, y, f) => [[0, 'VERTEX'], [10, x], [20, y], [70, f]];
+const pf = parseDxf(dxf(sec('ENTITIES', [[0, 'POLYLINE'], [5, 'PF'], [70, 64], ...fv(0, 0, 64), ...fv(1, 0, 64), ...fv(1, 1, 64), ...fv(9, 9, 192), [0, 'VERTEX'], [10, 0], [20, 0], [70, 128], [71, 1], [72, 2], [73, 3], ...fv(2, 2, 16), ...fv(3, 3, 32), [0, 'SEQEND']])));
+assert.deepStrictEqual(pf.entities[0].vertices, [[0, 0, 0, 64], [1, 0, 0, 64], [1, 1, 0, 64], [3, 3, 0, 32]]);
+assert.ok(pf.entities[0].codes.some(([c, v]) => c === 70 && v === '64'));
+// prototype-safe names
+const pr = parseDxf(dxf([...sec('BLOCKS', [[0, 'BLOCK'], [2, '__proto__'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK'], [0, 'BLOCK'], [2, 'constructor'], [70, 0], [0, 'ENDBLK']]), ...sec('ENTITIES', [[0, '__proto__'], [5, 'Q'], [0, 'constructor']])]));
+assert.deepStrictEqual(Object.keys(pr.blocks), ['__proto__', 'constructor']);
+assert.strictEqual(pr.ignored.__proto__, 1); assert.strictEqual(pr.ignored.constructor, 1);
+assert.strictEqual(Object.getPrototypeOf(pr.ignored), null);
+assert.strictEqual(insunitsToUnit('constructor'), null);
+assert.ok(Object.isFrozen(UNIT_TO_M));
+// paper-space POLYLINE skips its VERTEX/SEQEND
+const pp = parseDxf(dxf(sec('ENTITIES', [[0, 'POLYLINE'], [5, 'PP'], [67, 1], [70, 0], ...v(0, 0), ...v(1, 1), [0, 'SEQEND'], ...line('K', '0', 0, 0, 1, 1)])));
+assert.strictEqual(pp.entities.length, 1); assert.strictEqual(pp.entities[0].handle, 'K');
+assert.deepStrictEqual(pp.ignored, Object.create(null));
+assert.strictEqual(pp.warnings.filter(w => w.code === 'paper_space').length, 1);
+// Uint8Array input
+assert.strictEqual(parseDxf(decodeDxf(new Uint8Array(Buffer.from(full)))).entities.length, 2);
 
 console.log('ok test-dxf');
