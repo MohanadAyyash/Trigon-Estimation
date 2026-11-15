@@ -227,6 +227,29 @@ server.listen(0, async () => {
       assert.ok(!dirFiles().some(f => f.includes('tmp')), 'no temp files left');
     }
 
+    // ---- the tender is deleted while the body arrives → 404; the new file is removed, a shared one kept --------
+    {
+      const port = server.address().port;
+      const slowUpload = (tenderId, name, data, between) => new Promise((res2, rej) => {
+        const q = http.request({ port, method: 'POST', path: `/api/tenders/${tenderId}/drawings?name=${name}`, headers: { cookie: qs, 'Content-Type': 'application/octet-stream', 'Content-Length': data.length } }, rs => {
+          let b = ''; rs.on('data', c => b += c); rs.on('end', () => res2({ s: rs.statusCode, j: JSON.parse(b) }));
+        });
+        q.on('error', rej);
+        q.write(data.subarray(0, 10));   // the route has passed its checks and is reading the body
+        setTimeout(() => { try { between(); q.end(data.subarray(10)); } catch (e) { rej(e); } }, 200);
+      });
+      for (const [what, body, kept] of [['new file', FIXTURE.replace('K2\n8\nKERB', 'K7\n8\nKERB'), false], ['shared file', FIXTURE, true]]) {
+        const gone = (await call('POST', 'tenders', { title: 'Test Gone', kind: 'rta' }, qs)).j.id;
+        const n0 = nDrawings();
+        const r = await slowUpload(gone, 'gone', Buffer.from(body), () => db.prepare('DELETE FROM tenders WHERE id=?').run(gone));
+        assert.strictEqual(r.s, 404, what + ': ' + JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'tender not found');
+        assert.strictEqual(nDrawings(), n0, what + ': no drawing row');
+        const sha = require('crypto').createHash('sha256').update(body).digest('hex');
+        assert.strictEqual(fs.existsSync(path.join(DDIR, sha + '.dxf')), kept, what + ': file ' + (kept ? 'kept (another drawing uses it)' : 'removed'));
+        assert.ok(!dirFiles().some(f => f.startsWith('tmp-')), what + ': no temp file');
+      }
+    }
+
     // ---- PARSER_VERSION: a summary written by an older parser is never reused: it is parsed again ---------------
     {
       const { PARSER_VERSION } = require('./lib/dxf/summary.js');

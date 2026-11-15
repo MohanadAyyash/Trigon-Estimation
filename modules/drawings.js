@@ -109,6 +109,16 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, _workers: workers };
 
   // ---- upload: stream to a temp file while hashing; 413 the moment the limit is passed -----------------------
+  // a received file is held until its drawing row is written; a file that ends with no drawing row (the tender was
+  // deleted or stopped being a draft while the body arrived) and no other holder, parse or row is removed
+  const holds = new Map();
+  const hold = sha => holds.set(sha, (holds.get(sha) || 0) + 1);
+  function release(sha, used) {
+    const n = (holds.get(sha) || 1) - 1;
+    if (n > 0) holds.set(sha, n); else holds.delete(sha);
+    if (used || n > 0 || inflight.has(sha) || db.prepare('SELECT 1 FROM drawings WHERE sha256=? LIMIT 1').get(sha)) return;
+    try { fs.unlinkSync(dxfFile(sha)); } catch (e) { /* gone already */ }
+  }
   const httpErr = (msg, status) => Object.assign(new Error(msg), { status });
   function receive(req) {
     const tmp = tmpName();
@@ -145,11 +155,12 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       out.on('finish', async () => {
         if (done) return; done = true;
         const sha = hash.digest('hex');
+        hold(sha);   // released by upload(): until then no clean-up removes this file
         try {
           // same content -> same name: keep one copy
           if (fs.existsSync(dxfFile(sha))) await fsp.unlink(tmp); else await place(tmp, dxfFile(sha));
           ok({ sha, bytes });
-        } catch (e) { await fsp.unlink(tmp).catch(() => {}); no(httpErr('could not store the upload (' + (e.code || 'error') + ')', 500)); }
+        } catch (e) { release(sha, true); await fsp.unlink(tmp).catch(() => {}); no(httpErr('could not store the upload (' + (e.code || 'error') + ')', 500)); }
       });
     });
   }
@@ -249,19 +260,25 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (name.length > 200) bad('name must be at most 200 characters');
     if (Number(req.headers['content-length']) > MAX_BYTES) bad('the drawing is larger than 100 MB', 413);
     const got = await receive(req);
-    const cur = tenderRow(t.id);
-    if (cur.status !== 'draft') bad(`tender is ${cur.status}: only a draft can be changed`, 409);   // changed while receiving
-    // the same file already parsed (and not being parsed again) -> reuse its cache, ready at once
-    const prev = !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && await summaryCurrent(got.sha)
-      ? db.prepare("SELECT suggested_units FROM drawings WHERE sha256=? AND status='ready' ORDER BY id DESC LIMIT 1").get(got.sha) : null;
-    const id = tx(() => {
-      const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,rev,created,created_by) VALUES(?,?,?,?,?,?,?,1,?,?)')
-        .run(t.id, 'dxf', name, got.sha, got.bytes, prev ? prev.suggested_units : null, prev ? 'ready' : 'parsing', new Date().toISOString(), me.username).lastInsertRowid);
-      audit(me, 'upload', 'drawings', did, { name, bytes: got.bytes, sha256: got.sha });
-      return did;
-    });
-    if (!prev) startParse(id, got.sha);
-    return reply(res, 202, { id });
+    let used = false;
+    try {
+      // the tender can be deleted or change status while the body arrives
+      const stillDraft = () => { const cur = tenderRow(t.id); if (!cur) bad('tender not found', 404); mustDraft(cur); };
+      stillDraft();
+      // the same file already parsed (and not being parsed again) -> reuse its cache, ready at once
+      const prev = !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && await summaryCurrent(got.sha)
+        ? db.prepare("SELECT suggested_units FROM drawings WHERE sha256=? AND status='ready' ORDER BY id DESC LIMIT 1").get(got.sha) : null;
+      const id = tx(() => {
+        stillDraft();
+        const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,rev,created,created_by) VALUES(?,?,?,?,?,?,?,1,?,?)')
+          .run(t.id, 'dxf', name, got.sha, got.bytes, prev ? prev.suggested_units : null, prev ? 'ready' : 'parsing', new Date().toISOString(), me.username).lastInsertRowid);
+        audit(me, 'upload', 'drawings', did, { name, bytes: got.bytes, sha256: got.sha });
+        return did;
+      });
+      used = true;
+      if (!prev) startParse(id, got.sha);
+      return reply(res, 202, { id });
+    } finally { release(got.sha, used); }
   }
 
   async function drawingApi(req, res, parts, me) {
