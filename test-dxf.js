@@ -335,9 +335,23 @@ assert.strictEqual(hdup.f[0].area, null); assert.ok(warned(hdup.d, 'hatch_loops_
 const okShape = flDoc(ents([...lwp('OK1', [[0, 0], [10, 0], [10, 10], [5, 5], [0, 10]], true), ...hatch('OK2', [hpoly(sq(0, 0, 10)), hpoly(sq(0, 0, 5))])]));
 near(okShape.f[0].area, 75); assert.strictEqual(okShape.f[1].area, null); // island lying along the outer edges: flagged (fix round 3 ruling)
 assert.deepStrictEqual(okShape.d.warnings, [{ code: 'hatch_loops_overlap', detail: 'OK2' }]);
-// 4. clockwise hatch edges: computed, but flagged approx and warned
+// 4. clockwise hatch edges: computed exactly, not approximated, no warning (convention verified, see the AutoCAD case below)
 const cw = flDoc(ents(hatch('H6', [quarter])));
-near(cw.f[0].area, Math.PI / 4); assert.strictEqual(cw.f[0].approx, true); assert.ok(warned(cw.d, 'hatch_cw_edge_unverified', 'H6'));
+near(cw.f[0].area, Math.PI / 4); assert.strictEqual(cw.f[0].approx, false); assert.deepStrictEqual(cw.d.warnings, []);
+// AutoCAD clockwise arc edge (ezdxf EDGE_HATCH): the edge values below were created by AutoCAD and are taken from the
+// MIT-licensed ezdxf test suite (tests/test_02_dxf_graphics/test_229b_hatch_extended.py), (c) 2015-2021 Manfred Moitzi.
+// True area: 10x10 square + half-ellipse bulge (3 x 1) - half-disc bite (r 1) = 100 + PI.
+const acad = [[92, 1], [93, 8],
+  [72, 3], [10, 10.0], [20, 5.0], [11, 3.0], [21, 0.0], [40, 0.3333333333333333], [50, 270], [51, 450], [73, 1],
+  [72, 1], [10, 10], [20, 6], [11, 10], [21, 10],
+  [72, 1], [10, 10], [20, 10], [11, 6], [21, 10],
+  [72, 2], [10, 5.0], [20, 10.0], [40, 1.0], [50, 360.0], [51, 540.0], [73, 0],
+  [72, 1], [10, 4], [20, 10], [11, 0], [21, 10],
+  [72, 1], [10, 0], [20, 10], [11, 0], [21, 0],
+  [72, 1], [10, 0], [20, 0], [11, 10], [21, 0],
+  [72, 1], [10, 10], [20, 0], [11, 10], [21, 4], [97, 0]];
+const ac = flDoc(ents(hatch('HA', [acad])));
+near(ac.f[0].area, 100 + Math.PI, 1e-9); assert.strictEqual(ac.f[0].approx, false); assert.deepStrictEqual(ac.d.warnings, []);
 assert.strictEqual(fl(ents(hatch('H5', [[[92, 1], [93, 1], ...arcEdge(0, 0, 1, 0, 360, 1), [97, 0]]])))[0].approx, false);
 // 5. expansion cap
 assert.throws(() => fl([...sec('BLOCKS', B1), ...ents(insert('BIG', 'B1', 'K', [[70, 32767], [71, 32767], [44, 1], [45, 1]]))]), /^Error: drawing expands to too many entities \(> 5,000,000\)$/);

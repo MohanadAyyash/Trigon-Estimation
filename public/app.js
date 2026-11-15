@@ -497,7 +497,7 @@
   const metricLabel = m => ({ open_length: t('mt_open_length'), closed_perimeter: t('mt_closed_perimeter'), area: t('mt_area'), count: t('mt_count') })[m] || m;
   const dwStatusLabel = s => ({ parsing: t('dws_parsing'), ready: t('dws_ready'), failed: t('dws_failed') })[s] || s;
   const warnLabel = c => ({ unsupported_polyline: t('wc_unsupported_polyline'), self_intersecting: t('wc_self_intersecting'), hatch_open_loop: t('wc_hatch_open_loop'),
-    hatch_cw_edge_unverified: t('wc_hatch_cw_edge_unverified'), hatch_no_boundary: t('wc_hatch_no_boundary'), hatch_loops_overlap: t('wc_hatch_loops_overlap'),
+    hatch_no_boundary: t('wc_hatch_no_boundary'), hatch_loops_overlap: t('wc_hatch_loops_overlap'),
     unsupported_hatch_edge: t('wc_unsupported_hatch_edge'), paper_space: t('wc_paper_space'), xref: t('wc_xref'), nonplanar: t('wc_nonplanar'),
     missing_block: t('wc_missing_block'), z_ignored: t('wc_z_ignored'), degenerate_arc: t('wc_degenerate_arc'), possible_duplicate: t('wc_possible_duplicate') })[c] || c;
   const rowText = r => [r.no, r.description].filter(Boolean).join(' — ') || '#' + r.id;
