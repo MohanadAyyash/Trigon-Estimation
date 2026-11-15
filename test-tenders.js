@@ -47,6 +47,9 @@ server.listen(0, async () => {
   const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
   try {
     const admin = (await call('POST', 'setup', { username: 'admin', password: 'secret12' })).ck;
+    // approve at the P the admin is shown (the server refuses if the price changed in between)
+    const shownP = async (id, margin) => { const r = (await call('GET', `tenders/${id}/price?margin_pct=${margin ?? ''}`, null, admin)).j; return r && r.result ? r.result.P : 0; };
+    const approve = async (id, body) => call('POST', `tenders/${id}/approve`, { expected_P: await shownP(id, body.margin_pct), ...body }, admin);
     const mk = async (u, role) => { await call('POST', 'users', { username: u, password: 'secret12', role }, admin); return (await call('POST', 'login', { username: u, password: 'secret12' })).ck; };
     const qs = await mk('qs1', 'qs'), viewer = await mk('view1', 'viewer');
 
@@ -451,7 +454,7 @@ server.listen(0, async () => {
     const beforeX = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, qs)).b).BOQ;
     await ok(call('POST', `tenders/${tid}/submit`, null, qs), 'submit');
     assert.strictEqual((await call('GET', `tenders/${tid}/price?snapshot=latest`, null, qs)).s, 409, 'reprice preview only for a draft');
-    const ap = await ok(call('POST', `tenders/${tid}/approve`, { margin_pct: 15 }, admin), 'approve');
+    const ap = await ok(approve(tid, { margin_pct: 15 }), 'approve');
     // what-if params on a frozen tender: ignored, the frozen result comes back
     const fr = await ok(call('GET', `tenders/${tid}/price?M=0&collection_days=-1`, null, qs), 'frozen price with what-if params');
     assert.strictEqual(fr.frozen.P, ap.frozen.P); assert.ok(!('result' in fr));

@@ -493,6 +493,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (margin === null) bad('margin_pct must be a number ≥ 0 and < 100');
       if (b.override_stale !== undefined && typeof b.override_stale !== 'boolean') bad('override_stale must be true or false');
       if (b.ack_warnings !== undefined && typeof b.ack_warnings !== 'boolean') bad('ack_warnings must be true or false');
+      if (!finNum(b.expected_P)) bad('expected_P (the price P shown when approving) must be a number');
       const cur = tenderRow(t.id);
       if (cur.status !== 'submitted') conflict(`tender is ${cur.status}: approve needs submitted`);
       const c = compute(cur, margin), override = b.override_stale === true;
@@ -503,6 +504,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       // a snapshot with warnings (missing EOS, short history, bad ERP rows…) may understate costs: the admin must say they read them
       const warnCodes = c.snapWarnings.map(w => w.code), ack = warnCodes.length > 0 && b.ack_warnings === true;
       if (warnCodes.length && !ack) return reply(res, 409, { error: 'the cost data has warnings: read them and acknowledge to approve', warnings: c.snapWarnings });
+      // the price moved since the admin saw it (an item, a row or a setting changed): approve only what was shown
+      if (Math.abs(c.result.P - b.expected_P) > 0.005) return reply(res, 409, { error: 'price changed', P: c.result.P });
       const at = new Date().toISOString(), s = c.settings;
       const frozen = { ...c.result, rows: c.rows, hidden: c.hidden, item_versions: c.itemVersions, snapshot_id: c.snap.id, snapshot_created: c.snap.created,
         margin_pct: c.margin, finance_rate_pct: s.finance_rate_pct, min_profit_pct: s.min_profit_pct, inputs: c.inputs, override_stale: override && stale, snapshot_warnings: warnCodes, approved_by: me.username, approved_at: at };

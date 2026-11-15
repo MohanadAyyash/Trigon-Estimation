@@ -696,7 +696,7 @@
     const changed = h('div', { id: 'ap-margin-changed', class: 'warn', hidden: true }, t('approve_margin_changed'), ' ',
       h('button', { class: 'small', id: 'ap-reprice', onclick: async ev => { ev.target.disabled = true; try { await repriceAt(margin.value); } catch (e) { fail(e); ev.target.disabled = false; } } }, t('approve_price_at_margin')));
     const btn = h('button', { id: 'ap-approve', disabled: !can || !!ack, onclick: async ev => {
-        const b = { margin_pct: p.margin_pct };
+        const b = { margin_pct: p.margin_pct, expected_P: p.result.P };
         if (override) b.override_stale = override.checked;
         if (ack) b.ack_warnings = ack.checked;
         ev.target.disabled = true;
@@ -705,6 +705,7 @@
           fail(e); ev.target.disabled = false;
           if (e.body && e.body.blocking) msg.replaceChildren(blockingList(ctx.id, { ...p, blocking: e.body.blocking }, 'approve-blocking'));
           if (e.body && e.body.warnings) msg.replaceChildren(snapshotWarnings(e.body.warnings, 'approve-warnings'));
+          if (e.body && fin(e.body.P)) msg.replaceChildren(h('p', { class: 'err', id: 'approve-price-changed' }, t('approve_price_changed') + ' ' + fmt2(e.body.P)));
         }
       } }, t('approve'));
     const refresh = () => { btn.disabled = !can || !same || (!!ack && !ack.checked); };

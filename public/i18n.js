@@ -81,7 +81,7 @@ const I18N = {
     override_stale: 'Approve on old cost data', override_stale_note: 'The cost data is older than allowed. Approving on it is recorded in the audit log.',
     approved_ok: 'Approved. The price is frozen.', frozen_price: 'Approved price — frozen.', approved_on_stale: 'Approved on old cost data (override recorded).',
     snapshot_warnings_title: 'Cost data warnings', snapshot_warnings_note: 'The company cost data behind this price has warnings: a cost may be understated. The admin must read them before approving.',
-    ack_warnings: 'I have read the cost data warnings', approved_with_warnings: 'Approved with cost data warnings (acknowledged)',
+    ack_warnings: 'I have read the cost data warnings', approve_price_changed: 'The price changed after it was shown (an item, row or setting changed). Reload the Summary and check it. New P:', approved_with_warnings: 'Approved with cost data warnings (acknowledged)',
     // costs
     no_snapshot_yet: 'No cost data yet. Set the ERP path in Settings and sync.', overhead: 'Company overhead', months_covered: 'Months covered',
     overridden: 'manual', oh_bills: 'Bills (period)', oh_payroll: 'Office payroll (period)', oh_depreciation: 'Depreciation (period)',
@@ -187,7 +187,7 @@ const I18N = {
     override_stale: 'الاعتماد على بيانات تكاليف قديمة', override_stale_note: 'بيانات التكاليف أقدم من المسموح. الاعتماد عليها يُسجَّل في سجل التدقيق.',
     approved_ok: 'تم الاعتماد. السعر مثبّت.', frozen_price: 'السعر المعتمد — مثبّت.', approved_on_stale: 'اعتُمد على بيانات تكاليف قديمة (التجاوز مسجّل).',
     snapshot_warnings_title: 'تحذيرات بيانات التكاليف', snapshot_warnings_note: 'بيانات تكاليف الشركة التي بُني عليها هذا السعر فيها تحذيرات: قد تكون إحدى التكاليف أقل من حقيقتها. يجب أن يقرأها المدير قبل الاعتماد.',
-    ack_warnings: 'قرأت تحذيرات بيانات التكاليف', approved_with_warnings: 'اعتُمد مع تحذيرات في بيانات التكاليف (تم الإقرار بها)',
+    ack_warnings: 'قرأت تحذيرات بيانات التكاليف', approve_price_changed: 'تغيّر السعر بعد عرضه (تغيّر بند أو صف أو إعداد). أعد تحميل الملخص وراجعه. السعر الجديد P:', approved_with_warnings: 'اعتُمد مع تحذيرات في بيانات التكاليف (تم الإقرار بها)',
     no_snapshot_yet: 'لا توجد بيانات تكاليف بعد. حدّد مسار الـ ERP في الإعدادات ثم زامن.', overhead: 'المصاريف العمومية', months_covered: 'الأشهر المحسوبة',
     overridden: 'يدوي', oh_bills: 'الفواتير (الفترة)', oh_payroll: 'رواتب المكتب (الفترة)', oh_depreciation: 'الإهلاك (الفترة)',
     oh_parts_note: 'مجاميع على الأشهر المحسوبة. العمومية / شهر = المجموع ÷ الأشهر.',

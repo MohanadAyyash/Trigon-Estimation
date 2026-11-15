@@ -23,6 +23,9 @@ server.listen(0, async () => {
   const audited = (action, id) => db.prepare("SELECT 1 FROM audit_log WHERE entity='tenders' AND action=? AND entity_id=?").get(action, String(id));
   try {
     const admin = (await call('POST', 'setup', { username: 'admin', password: 'secret12' })).ck;
+    // approve at the P the admin is shown (the server refuses if the price changed in between)
+    const shownP = async (id, margin) => { const r = (await call('GET', `tenders/${id}/price?margin_pct=${margin ?? ''}`, null, admin)).j; return r && r.result ? r.result.P : 0; };
+    const approve = async (id, body) => call('POST', `tenders/${id}/approve`, { expected_P: await shownP(id, body.margin_pct), ...body }, admin);
     const mk = async (u, role) => { await call('POST', 'users', { username: u, password: 'secret12', role }, admin); return (await call('POST', 'login', { username: u, password: 'secret12' })).ck; };
     const qs = await mk('qs1', 'qs'), viewer = await mk('view1', 'viewer');
 
@@ -57,10 +60,10 @@ server.listen(0, async () => {
     assert.strictEqual((await call('POST', `tenders/${A.id}/submit`, null, qs)).s, 409, 'submit twice');
     assert.strictEqual((await call('PUT', `tenders/${A.id}/hidden/${A.hidden[0].id}`, { status: 'na' }, qs)).s, 409, 'no edits while submitted');
     assert.strictEqual((await call('POST', `tenders/${A.id}/approve`, { margin_pct: 10 }, qs)).s, 403, 'qs cannot approve');
-    const blocked = await call('POST', `tenders/${A.id}/approve`, { margin_pct: 10 }, admin);
+    const blocked = await approve(A.id, { margin_pct: 10 });
     assert.strictEqual(blocked.s, 409); assert.ok(blocked.j.error);
     assert.deepStrictEqual(blocked.j.blocking, [{ code: 'hidden_unanswered', hidden_id: A.hidden[0].id }]);
-    assert.strictEqual((await call('POST', `tenders/${A.id}/approve`, { margin_pct: 100 }, admin)).s, 400, 'bad margin');
+    assert.strictEqual((await approve(A.id, { margin_pct: 100 })).s, 400, 'bad margin');
     assert.strictEqual((await call('POST', `tenders/${A.id}/return`, null, qs)).s, 403, 'only admin returns');
     await ok(call('POST', `tenders/${A.id}/return`, null, admin), 'return');
     assert.ok(audited('return', A.id));
@@ -70,7 +73,7 @@ server.listen(0, async () => {
     await ok(call('POST', `tenders/${A.id}/submit`, null, qs), 'submit again');
     const before = await ok(call('GET', `tenders/${A.id}/price?margin_pct=10`, null, admin), 'price before');
     assert.deepStrictEqual(before.blocking, []);
-    const ap = await ok(call('POST', `tenders/${A.id}/approve`, { margin_pct: 10 }, admin), 'approve');
+    const ap = await ok(approve(A.id, { margin_pct: 10 }), 'approve');
     assert.ok(ap.frozen.P > 0); assert.strictEqual(ap.frozen.P, before.result.P);
     assert.strictEqual(ap.frozen.snapshot_id, snap1); assert.strictEqual(ap.frozen.margin_pct, 10);
     assert.deepStrictEqual(ap.frozen.item_versions, [{ row_id: A.row, item_id: item, version: 1, version_id: v1id, share: 1 }]);
@@ -104,7 +107,7 @@ server.listen(0, async () => {
     assert.strictEqual((await call('POST', `tenders/${A.id}/import`, { file_b64: '' }, qs)).s, 409);
     assert.strictEqual((await call('POST', `tenders/${A.id}/reprice`, null, qs)).s, 409);
     assert.strictEqual((await call('DELETE', `tenders/${A.id}`, null, admin)).s, 409);
-    assert.strictEqual((await call('POST', `tenders/${A.id}/approve`, { margin_pct: 10 }, admin)).s, 409, 'approve twice');
+    assert.strictEqual((await approve(A.id, { margin_pct: 10 })).s, 409, 'approve twice');
     assert.strictEqual(db.prepare('SELECT frozen FROM tenders WHERE id=?').get(A.id).frozen, frozenRaw, 'frozen untouched');
 
     // ---- revise -------------------------------------------------------------------------------------------
@@ -152,10 +155,10 @@ server.listen(0, async () => {
     assert.strictEqual((await call('GET', `tenders/${C.id}`, null, qs)).j.snapshot_id, snap2);
     db.prepare('UPDATE snapshots SET created=? WHERE id=?').run(new Date(Date.now() - 8 * 86400000).toISOString(), snap2);
     await ok(call('POST', `tenders/${C.id}/submit`, null, qs), 'submit C');
-    const st = await call('POST', `tenders/${C.id}/approve`, { margin_pct: 12 }, admin);
+    const st = await approve(C.id, { margin_pct: 12 });
     assert.strictEqual(st.s, 409); assert.deepStrictEqual(st.j.blocking.map(b => b.code), ['snapshot_stale']);
-    assert.strictEqual((await call('POST', `tenders/${C.id}/approve`, { margin_pct: 12, override_stale: 'yes' }, admin)).s, 400);
-    const so = await ok(call('POST', `tenders/${C.id}/approve`, { margin_pct: 12, override_stale: true }, admin), 'approve stale');
+    assert.strictEqual((await approve(C.id, { margin_pct: 12, override_stale: 'yes' })).s, 400);
+    const so = await ok(approve(C.id, { margin_pct: 12, override_stale: true }), 'approve stale');
     assert.ok(so.frozen.P > 0); assert.strictEqual(so.frozen.override_stale, true);
     assert.ok(audited('approve_stale', C.id), 'audited as approve_stale');
 
@@ -190,13 +193,13 @@ server.listen(0, async () => {
     const kQ = await ok(call('GET', `tenders/${K.id}/price`, null, qs), 'price K qs');
     assert.deepStrictEqual(kQ.snapshot_warnings, [{ code: 'short_history', detail: '11 month(s) of bills' }, { code: 'eos_missing', detail: null }], 'qs: payroll warning without its detail');
     await ok(call('POST', `tenders/${K.id}/submit`, null, qs), 'submit K');
-    const kNoAck = await call('POST', `tenders/${K.id}/approve`, { margin_pct: 12 }, admin);
+    const kNoAck = await approve(K.id, { margin_pct: 12 });
     assert.strictEqual(kNoAck.s, 409, 'warnings need an acknowledgement'); assert.ok(kNoAck.j.error);
     assert.deepStrictEqual(kNoAck.j.warnings.map(w => w.code), ['short_history', 'eos_missing']);
-    assert.strictEqual((await call('POST', `tenders/${K.id}/approve`, { margin_pct: 12, ack_warnings: 'yes' }, admin)).s, 400, 'ack_warnings must be a boolean');
-    assert.strictEqual((await call('POST', `tenders/${K.id}/approve`, { margin_pct: 12, ack_warnings: false }, admin)).s, 409);
+    assert.strictEqual((await approve(K.id, { margin_pct: 12, ack_warnings: 'yes' })).s, 400, 'ack_warnings must be a boolean');
+    assert.strictEqual((await approve(K.id, { margin_pct: 12, ack_warnings: false })).s, 409);
     assert.strictEqual((await call('GET', `tenders/${K.id}`, null, qs)).j.status, 'submitted', 'nothing frozen without the acknowledgement');
-    const kAp = await ok(call('POST', `tenders/${K.id}/approve`, { margin_pct: 12, ack_warnings: true }, admin), 'approve K with ack');
+    const kAp = await ok(approve(K.id, { margin_pct: 12, ack_warnings: true }), 'approve K with ack');
     assert.deepStrictEqual(kAp.frozen.snapshot_warnings, ['short_history', 'eos_missing'], 'frozen record keeps the warning codes');
     const ackRow = db.prepare("SELECT detail FROM audit_log WHERE entity='tenders' AND action='approve_ack_warnings' AND entity_id=?").get(String(K.id));
     assert.ok(ackRow, 'acknowledgement audited'); assert.deepStrictEqual(JSON.parse(ackRow.detail).codes, ['short_history', 'eos_missing']);
@@ -221,6 +224,25 @@ server.listen(0, async () => {
     assert.ok(o1.snapshot_warnings.some(w => w.code === 'snapshot_no_work_hours'), 'old snapshot warned');
     assert.strictEqual(o1.rows[0].links[0].parts[1].cost, 40 * 10 / 8, 'old snapshot: labour priced on the setting (10 h)');
     await ok(call('PUT', 'settings', { work_hours: 8 }, admin), 'restore work hours');
+
+    // ---- approval freezes only the price the admin was shown ---------------------------------------------------------
+    addSnap(SNAP);
+    const G = await makeTender(false);
+    await ok(call('POST', `tenders/${G.id}/submit`, null, qs), 'submit G');
+    const gShown = (await ok(call('GET', `tenders/${G.id}/price?margin_pct=10`, null, admin), 'price G')).result.P;
+    for (const e of [undefined, null, 'abc', '12'])
+      assert.strictEqual((await call('POST', `tenders/${G.id}/approve`, { margin_pct: 10, expected_P: e }, admin)).s, 400, 'expected_P must be a number: ' + e);
+    // the linked item changes between viewing and approving: the price moved, approval refused
+    await ok(call('PUT', `library/items/${item}`, { parts: [{ kind: 'fixed', amount: 777 }] }, qs), 'edit item after view');
+    const moved = await call('POST', `tenders/${G.id}/approve`, { margin_pct: 10, expected_P: gShown }, admin);
+    assert.strictEqual(moved.s, 409, 'price changed since it was shown'); assert.strictEqual(moved.j.error, 'price changed');
+    const gNow = (await ok(call('GET', `tenders/${G.id}/price?margin_pct=10`, null, admin), 'price G now')).result.P;
+    assert.strictEqual(moved.j.P, gNow); assert.notStrictEqual(gNow, gShown);
+    assert.strictEqual((await call('GET', `tenders/${G.id}`, null, qs)).j.status, 'submitted', 'nothing frozen');
+    assert.strictEqual((await call('POST', `tenders/${G.id}/approve`, { margin_pct: 10, expected_P: gNow + 0.01 }, admin)).s, 409, 'more than 0.005 off');
+    const gAp = await ok(call('POST', `tenders/${G.id}/approve`, { margin_pct: 10, expected_P: gNow + 0.004 }, admin), 'approve at the shown price');
+    assert.strictEqual(gAp.frozen.P, gNow);
+    await ok(call('PUT', `library/items/${item}`, itemBody, qs), 'restore item');
     console.log('workflow ok'); process.exit(0);
   } catch (e) { console.error(e); process.exit(1); }
 });
