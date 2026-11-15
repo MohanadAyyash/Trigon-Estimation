@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
     if (!KINDS.includes(p.kind)) bad(`${w}.kind must be one of ${KINDS.join(', ')}`);
     if (p.kind === 'material') {
       if (!Number.isInteger(p.material_id) || !db.prepare('SELECT 1 FROM materials WHERE id=?').get(p.material_id)) bad(`${w}.material_id: material not found`);
-      return { kind: 'material', material_id: p.material_id, qty: nonNeg(p.qty, w + '.qty', MAX), waste_pct: nonNeg(p.waste_pct === undefined ? 0 : p.waste_pct, w + '.waste_pct') };
+      return { kind: 'material', material_id: p.material_id, qty: nonNeg(p.qty, w + '.qty', MAX), waste_pct: nonNeg(p.waste_pct, w + '.waste_pct') };   // required: a missing waste is never read as 0
     }
     if (p.kind === 'labour') {
       if (!Array.isArray(p.crew) || !p.crew.length) bad(`${w}.crew must be a non-empty list`);

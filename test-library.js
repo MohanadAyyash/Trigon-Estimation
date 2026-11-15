@@ -57,6 +57,10 @@ server.listen(0, async () => {
       { ...good, parts: [{ kind: 'material', material_id: 9999, qty: 1, waste_pct: 0 }] },
       { ...good, parts: [{ kind: 'material', material_id: mat, qty: -1, waste_pct: 0 }] },
       { ...good, parts: [{ kind: 'material', material_id: mat, qty: 1, waste_pct: -5 }] },
+      // waste % is required: a missing waste is never taken as 0
+      { ...good, parts: [{ kind: 'material', material_id: mat, qty: 1 }] },
+      { ...good, parts: [{ kind: 'material', material_id: mat, qty: 1, waste_pct: null }] },
+      { ...good, parts: [{ kind: 'material', material_id: mat, qty: 1, waste_pct: '5' }] },
       { ...good, parts: [{ kind: 'labour', crew: [{ trade: 'Foreman', count: 1 }], output_per_day: 0 }] },
       { ...good, parts: [{ kind: 'labour', crew: [], output_per_day: 5 }] },
       { ...good, parts: [{ kind: 'labour', crew: [{ trade: 'Foreman', count: 1.5 }], output_per_day: 5 }] },
