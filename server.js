@@ -127,7 +127,13 @@ async function api(req, res, url) {
       return send(res, 200, getSettings());
     }
   }
-  if (a === 'audit' && method === 'GET') { need(me, 'admin'); return send(res, 200, db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 500').all()); }
+  if (a === 'audit' && method === 'GET') {
+    need(me, 'admin');
+    const ex = url.searchParams.get('exclude');
+    if (ex !== null && ex !== 'sync') bad("exclude must be 'sync'");
+    // ?exclude=sync leaves out the hourly ERP sync rows (successful and failed) so the other changes are readable
+    return send(res, 200, db.prepare(`SELECT * FROM audit_log ${ex === 'sync' ? "WHERE action NOT IN ('sync','sync_failed') " : ''}ORDER BY id DESC LIMIT 500`).all());
+  }
   for (const m of MODULES) if (await m.handle(req, res, url, parts, me)) return;
   return send(res, 404, { error: 'not found' });
 }

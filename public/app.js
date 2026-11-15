@@ -192,6 +192,7 @@
       h('dl', { class: 'kv' },
         h('dt', null, t('last_good_sync')), h('dd', null, fmtTime(st && st.last_ok) || t('never')),
         h('dt', null, t('last_attempt')), h('dd', null, fmtTime(st && st.last_attempt) || '—'),
+        h('dt', null, t('snapshot_built')), h('dd', null, fmtTime(st && st.snapshot_created) || '—', st && st.last_checked ? h('small', { class: 'muted' }, ' ' + t('unchanged_since')) : null),
         h('dt', null, t('sync_state')), h('dd', null, !st ? '—' : st.last_error ? t('sync_failed') : st.stale ? t('costs_stale') : t('sync_ok'))),
       st && st.last_error ? h('p', { class: 'err' }, st.last_error) : null,
       isAdmin() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));

@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS material_po_links(material_id INTEGER NOT NULL, descr
 CREATE TABLE IF NOT EXISTS material_quotes(id INTEGER PRIMARY KEY AUTOINCREMENT, material_id INTEGER NOT NULL, date TEXT NOT NULL, supplier TEXT, rate REAL NOT NULL, created_by TEXT);
 CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
+  // last_checked: the last sync that read the same data again (no new row is written for unchanged data)
+  if (!db.prepare('PRAGMA table_info(snapshots)').all().some(c => c.name === 'last_checked')) db.exec('ALTER TABLE snapshots ADD COLUMN last_checked TEXT');
+  const tx = fn => { db.exec('BEGIN'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 
   // ---- config -----------------------------------------------------------------
   const getConfig = () => {
@@ -34,7 +37,8 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
   };
 
   // ---- snapshots --------------------------------------------------------------
-  const rowToSnap = r => r && r.ok === 1 ? { id: r.id, created: r.created, data: JSON.parse(r.data) } : null;
+  // checked: when this data was last confirmed by a sync (created, or a later sync that found the same data)
+  const rowToSnap = r => r && r.ok === 1 ? { id: r.id, created: r.created, checked: r.last_checked || r.created, data: JSON.parse(r.data) } : null;
   const latest = () => rowToSnap(db.prepare('SELECT * FROM snapshots WHERE ok=1 ORDER BY id DESC LIMIT 1').get());
   const get = id => rowToSnap(db.prepare('SELECT * FROM snapshots WHERE id=?').get(id));
 
@@ -54,14 +58,38 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
         json = JSON.stringify(buildSnapshot(raw, { ...getConfig(), work_days: s.work_days, work_hours: s.work_hours }));
       } catch (e) {
         const error = String(e && e.message || e);
-        db.prepare('INSERT INTO snapshots(created,ok,error,data) VALUES(?,0,?,NULL)').run(new Date().toISOString(), error);
-        audit(user, 'sync_failed', 'snapshots', null, { error });
+        tx(() => {
+          db.prepare('INSERT INTO snapshots(created,ok,error,data) VALUES(?,0,?,NULL)').run(new Date().toISOString(), error);
+          audit(user, 'sync_failed', 'snapshots', null, { error });
+        });
+        prune();
         return { ok: false, error };
       }
-      const id = Number(db.prepare('INSERT INTO snapshots(created,ok,error,data) VALUES(?,1,NULL,?)').run(new Date().toISOString(), json).lastInsertRowid);
-      audit(user, 'sync', 'snapshots', id, null);
-      return { ok: true, id };
+      // the same data as the latest snapshot: no new row and no audit row, only the check time
+      const last = db.prepare('SELECT id, data FROM snapshots WHERE ok=1 ORDER BY id DESC LIMIT 1').get();
+      let out;
+      if (last && last.data === json) {
+        db.prepare('UPDATE snapshots SET last_checked=? WHERE id=?').run(new Date().toISOString(), last.id);
+        out = { ok: true, id: last.id, unchanged: true };
+      } else {
+        out = tx(() => {
+          const id = Number(db.prepare('INSERT INTO snapshots(created,ok,error,data) VALUES(?,1,NULL,?)').run(new Date().toISOString(), json).lastInsertRowid);
+          audit(user, 'sync', 'snapshots', id, null);
+          return { ok: true, id };
+        });
+      }
+      prune();
+      return out;
     } finally { running = false; }
+  }
+
+  // ok snapshots older than 90 days that no tender (any status) uses, except the latest; failed rows older than 30 days
+  function prune() {
+    const ago = d => new Date(Date.now() - d * DAY).toISOString();
+    const keep = db.prepare('SELECT MAX(id) id FROM snapshots WHERE ok=1').get().id;
+    db.prepare(`DELETE FROM snapshots WHERE ok=1 AND created < ? AND id <> ?
+      AND id NOT IN (SELECT snapshot_id FROM tenders WHERE snapshot_id IS NOT NULL)`).run(ago(90), keep === null ? -1 : keep);
+    db.prepare('DELETE FROM snapshots WHERE ok=0 AND created < ?').run(ago(30));
   }
 
   let timer = null;
@@ -116,10 +144,16 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
       return r.ok ? reply(res, 200, { ok: 1, id: r.id }) : reply(res, 502, { error: r.error });
     }
     if (sub === 'status' && parts.length === 2 && method === 'GET') {
-      const ok = db.prepare('SELECT id, created FROM snapshots WHERE ok=1 ORDER BY id DESC LIMIT 1').get();
+      const ok = db.prepare('SELECT id, created, last_checked FROM snapshots WHERE ok=1 ORDER BY id DESC LIMIT 1').get();
       const last = db.prepare('SELECT created, ok, error FROM snapshots ORDER BY id DESC LIMIT 1').get();
-      const stale = !ok || (Date.now() - Date.parse(ok.created)) / DAY > getSettings().stale_days;
-      return reply(res, 200, { last_ok: ok ? ok.created : null, last_ok_id: ok ? ok.id : null, last_attempt: last ? last.created : null, last_error: last && !last.ok ? (me.role === 'admin' ? last.error : 'ERP sync failed') : null, stale });
+      // the last good sync is the last one that read good data: a new snapshot, or a check that found the same data
+      const okAt = ok ? ok.last_checked || ok.created : null;
+      // the newest row is a failure, unless a no-change sync confirmed the data after it
+      const failedLater = last && !last.ok && !(ok && ok.last_checked && ok.last_checked > last.created);
+      const stale = !ok || (Date.now() - Date.parse(okAt)) / DAY > getSettings().stale_days;
+      return reply(res, 200, { last_ok: okAt, last_ok_id: ok ? ok.id : null, snapshot_created: ok ? ok.created : null, last_checked: ok ? ok.last_checked : null,
+        last_attempt: [last && last.created, okAt].filter(Boolean).sort().pop() || null,
+        last_error: failedLater ? (me.role === 'admin' ? last.error : 'ERP sync failed') : null, stale });
     }
     if (sub === 'snapshot' && parts.length === 2 && method === 'GET') {
       const s = latest();

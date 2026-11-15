@@ -94,12 +94,63 @@ server.listen(0, async () => {
     ctx.costs.startScheduler();
     await new Promise(r => setTimeout(r, 100));
     assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots').get().n, rows, 'startScheduler does nothing when disabled');
-    // overlap guard: two concurrent syncs -> one runs, the other is refused, one row written
-    const fixed = new Date('2026-11-14T10:00:00Z');
-    const res2 = await Promise.all([ctx.costs.sync({ now: fixed }), ctx.costs.sync({ now: fixed })]);
+    // overlap guard: two concurrent syncs -> one runs, the other is refused, one row written (a later clock: new data)
+    const fixed = new Date('2026-11-14T10:00:00Z'), later = new Date('2026-12-14T10:00:00Z');
+    const res2 = await Promise.all([ctx.costs.sync({ now: later }), ctx.costs.sync({ now: later })]);
     assert.deepStrictEqual(res2.map(x => x.ok).sort(), [false, true], 'exactly one concurrent sync runs');
     assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots').get().n, rows + 1, 'only one row written');
     assert.strictEqual((await ctx.costs.sync({ now: fixed })).ok, true, 'guard released afterwards');
+
+    // ---- an unchanged ERP adds no snapshot and no audit row; the check time is kept --------------------------------
+    {
+      const n0 = db.prepare('SELECT COUNT(*) n FROM snapshots').get().n, a0 = db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='sync'").get().n;
+      const okId2 = ctx.costs.latest().id;
+      db.prepare('UPDATE snapshots SET created=? WHERE id=?').run(new Date(Date.now() - 10 * 86400000).toISOString(), okId2);   // its data is 10 days old
+      assert.strictEqual((await call('GET', 'costs/status', null, qs)).j.stale, true);
+      const same = await ctx.costs.sync({ now: fixed });
+      assert.deepStrictEqual({ ok: same.ok, id: same.id, unchanged: same.unchanged }, { ok: true, id: okId2, unchanged: true }, 'same data: no new snapshot');
+      assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots').get().n, n0, 'no row added');
+      assert.strictEqual(db.prepare("SELECT COUNT(*) n FROM audit_log WHERE action='sync'").get().n, a0, 'a no-change sync is not audited');
+      const chk = db.prepare('SELECT last_checked FROM snapshots WHERE id=?').get(okId2).last_checked;
+      assert.ok(chk && Date.now() - Date.parse(chk) < 60000, 'last_checked updated');
+      const st2 = (await call('GET', 'costs/status', null, qs)).j;
+      assert.strictEqual(st2.last_checked, chk); assert.strictEqual(st2.last_ok, chk, 'last good sync = last confirmed check');
+      assert.strictEqual(st2.stale, false, 'confirmed today: not stale');
+      assert.strictEqual(ctx.costs.get(okId2).checked, chk);
+    }
+
+    // ---- prune: old unreferenced ok snapshots (90 days) and old failed rows (30 days); the latest and tender-bound ones stay ----
+    {
+      const ago = d => new Date(Date.now() - d * 86400000).toISOString();
+      const ins = (created, ok) => Number(db.prepare('INSERT INTO snapshots(created,ok,error,data) VALUES(?,?,?,?)').run(created, ok, ok ? null : 'test failure', ok ? '{}' : null).lastInsertRowid);
+      const oldFree = ins(ago(100), 1), oldBound = ins(ago(100), 1), oldWon = ins(ago(120), 1), young = ins(ago(20), 1), failOld = ins(ago(40), 0), failYoung = ins(ago(10), 0);
+      db.prepare("INSERT INTO tenders(title,kind,status,snapshot_id,created) VALUES('Test Prune Draft','direct','draft',?,?)").run(oldBound, ago(1));
+      db.prepare("INSERT INTO tenders(title,kind,status,snapshot_id,created) VALUES('Test Prune Won','direct','won',?,?)").run(oldWon, ago(1));
+      const exists = id => !!db.prepare('SELECT 1 FROM snapshots WHERE id=?').get(id);
+      assert.strictEqual((await ctx.costs.sync({ now: later })).ok, true);   // new data: inserted, then pruned
+      assert.strictEqual(exists(oldFree), false, 'old unreferenced ok snapshot pruned');
+      assert.strictEqual(exists(oldBound), true, 'kept: bound to a draft tender');
+      assert.strictEqual(exists(oldWon), true, 'kept: bound to a won tender');
+      assert.strictEqual(exists(young), true, 'kept: younger than 90 days');
+      assert.strictEqual(exists(failOld), false, 'failed row older than 30 days pruned');
+      assert.strictEqual(exists(failYoung), true, 'recent failed row kept');
+      // the latest ok snapshot is kept however old it is (a failing ERP must not leave the app without costs)
+      const latestId = ctx.costs.latest().id;
+      db.prepare('UPDATE snapshots SET created=? WHERE ok=1').run(ago(200));
+      await call('PUT', 'settings', { erp_db_path: path.join(dir, 'missing3.db') }, admin);
+      assert.strictEqual((await ctx.costs.sync({ now: later })).ok, false);
+      assert.strictEqual(exists(latestId), true, 'latest ok snapshot always kept');
+      assert.strictEqual(exists(young), false, 'other unreferenced old ok snapshots pruned');
+      assert.strictEqual(exists(oldBound), true);
+      await call('PUT', 'settings', { erp_db_path: erpFile }, admin);
+      db.prepare('UPDATE snapshots SET created=? WHERE id=?').run(new Date().toISOString(), latestId);
+    }
+
+    // ---- audit list without the hourly sync rows ----------------------------------------------------------------
+    const allA = (await call('GET', 'audit', null, admin)).j, noSync = (await call('GET', 'audit?exclude=sync', null, admin)).j;
+    assert.ok(allA.some(a => a.action === 'sync') && allA.some(a => a.action === 'sync_failed'));
+    assert.ok(noSync.length > 0 && !noSync.some(a => a.action === 'sync' || a.action === 'sync_failed'), 'exclude=sync drops sync rows');
+    assert.strictEqual((await call('GET', 'audit?exclude=nope', null, admin)).s, 400);
 
     // config values are validated
     for (const bodyBad of [{ category_map: { Rent: 'overheads' } }, { trade_map: { Mason: '' } }, { trade_groups: { Mason: '' } }])
@@ -114,7 +165,9 @@ server.listen(0, async () => {
     const sq = (await call('GET', 'costs/status', null, qs)).j, sa = (await call('GET', 'costs/status', null, admin)).j;
     assert.strictEqual(sq.last_error, 'ERP sync failed'); assert.ok(/missing2\.db/.test(sa.last_error));
     await call('PUT', 'settings', { erp_db_path: erpFile }, admin);
-    assert.strictEqual((await ctx.costs.sync({ now: fixed })).ok, true);
+    const rec = await ctx.costs.sync({ now: later });   // the same clock as the latest snapshot: same data
+    assert.strictEqual(rec.ok, true); assert.strictEqual(rec.unchanged, true, 'recovery with the same data');
+    assert.strictEqual((await call('GET', 'costs/status', null, admin)).j.last_error, null, 'a no-change sync after a failure clears the error');
 
     // materials: CRUD + permissions
     assert.strictEqual((await call('POST', 'costs/materials', { name_en: 'Tile', unit: 'm2' }, null)).s, 401);

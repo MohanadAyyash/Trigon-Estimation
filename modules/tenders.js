@@ -135,7 +135,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     const blocking = [], block = (code, extra) => blocking.push({ code, ...extra });
     if (!snap) block('no_snapshot', { detail: t.snapshot_id === null ? 'no cost snapshot' : `snapshot ${t.snapshot_id} not found` });
     else {
-      if (!((now.getTime() - Date.parse(snap.created)) / DAY <= s.stale_days)) block('snapshot_stale', { detail: snap.created });
+      // age of the cost data: when a sync last read it (a later sync that found the same data confirms it again)
+      if (!((now.getTime() - Date.parse(snap.checked)) / DAY <= s.stale_days)) block('snapshot_stale', { detail: snap.checked });
       if (!(finNum(snap.data.oh_monthly) && snap.data.oh_monthly >= 0)) block('overhead_missing', { detail: 'oh_monthly' });
       if (!(finNum(snap.data.w_monthly) && snap.data.w_monthly >= 0)) block('overhead_missing', { detail: 'w_monthly' });
     }

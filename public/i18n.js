@@ -10,7 +10,7 @@ const I18N = {
     role_admin: 'Admin', role_qs: 'QS', role_viewer: 'Viewer', role: 'Role', created: 'Created', active: 'Active', sort: 'Order', id: 'ID',
     // sync
     sync_status: 'Cost data (ERP sync)', last_good_sync: 'Last good sync', last_attempt: 'Last attempt', sync_state: 'State', never: 'never',
-    sync_ok: 'Up to date', sync_failed: 'ERP sync failed.', costs_stale: 'Cost data is out of date.', sync_now: 'Sync now', sync_done: 'Sync finished.',
+    sync_ok: 'Up to date', sync_failed: 'ERP sync failed.', costs_stale: 'Cost data is out of date.', sync_now: 'Sync now', sync_done: 'Sync finished.', snapshot_built: 'Cost data built', unchanged_since: '(later syncs found no change)',
     // statuses and kinds
     st_draft: 'Draft', st_submitted: 'Waiting for approval', st_approved: 'Approved', st_sent: 'Sent', st_won: 'Won', st_lost: 'Lost',
     kind_rta: 'RTA', kind_direct: 'Direct', kind: 'Kind',
@@ -122,7 +122,7 @@ const I18N = {
     save: 'حفظ', add: 'إضافة', create: 'إنشاء', delete: 'حذف', edit: 'تعديل', cancel: 'إلغاء', reset: 'رجوع للقيم المحفوظة', all: 'الكل',
     role_admin: 'مدير', role_qs: 'مهندس كميات', role_viewer: 'مشاهد', role: 'الدور', created: 'تاريخ الإنشاء', active: 'فعّال', sort: 'الترتيب', id: 'المعرّف',
     sync_status: 'بيانات التكاليف (مزامنة الـ ERP)', last_good_sync: 'آخر مزامنة ناجحة', last_attempt: 'آخر محاولة', sync_state: 'الحالة', never: 'لم تتم',
-    sync_ok: 'محدّثة', sync_failed: 'فشلت مزامنة الـ ERP.', costs_stale: 'بيانات التكاليف قديمة.', sync_now: 'زامن الآن', sync_done: 'انتهت المزامنة.',
+    sync_ok: 'محدّثة', sync_failed: 'فشلت مزامنة الـ ERP.', costs_stale: 'بيانات التكاليف قديمة.', sync_now: 'زامن الآن', sync_done: 'انتهت المزامنة.', snapshot_built: 'تاريخ بناء بيانات التكاليف', unchanged_since: '(المزامنات اللاحقة لم تجد تغييراً)',
     st_draft: 'مسودة', st_submitted: 'بانتظار الاعتماد', st_approved: 'معتمدة', st_sent: 'أُرسلت', st_won: 'رُبحت', st_lost: 'خُسرت',
     kind_rta: 'هيئة الطرق (RTA)', kind_direct: 'مباشر', kind: 'النوع',
     hk_fixed: 'مبلغ ثابت', hk_monthly: 'شهري', hk_pct: '% من العقد', hk_locked: 'مبلغ محجوز (تأمين / ضمان)',

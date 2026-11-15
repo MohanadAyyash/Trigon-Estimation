@@ -161,6 +161,10 @@ server.listen(0, async () => {
     const so = await ok(approve(C.id, { margin_pct: 12, override_stale: true }), 'approve stale');
     assert.ok(so.frozen.P > 0); assert.strictEqual(so.frozen.override_stale, true);
     assert.ok(audited('approve_stale', C.id), 'audited as approve_stale');
+    // the same data confirmed by a later sync (no new row written) is current again
+    db.prepare('UPDATE snapshots SET last_checked=? WHERE id=?').run(new Date().toISOString(), snap2);
+    const C2 = await makeTender(false);
+    assert.deepStrictEqual((await ok(call('GET', `tenders/${C2.id}/price`, null, qs), 'price C2')).blocking, [], 'confirmed snapshot is not stale');
 
     // ---- a newer sync never silently changes an open tender (Review Focus 3) ---------------------------------------
     const snap3 = addSnap(SNAP);
