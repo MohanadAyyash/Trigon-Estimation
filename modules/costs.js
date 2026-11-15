@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
     const method = req.method, [, sub, idStr, sub2, idStr2] = parts;
 
     if (sub === 'sync' && parts.length === 2 && method === 'POST') {
-      need(me, 'admin');
+      need(me, 'admin', 'qs');   // the QS may refresh costs before pricing; a viewer only reads
       const r = await sync({ user: me });
       return r.ok ? reply(res, 200, { ok: 1, id: r.id }) : reply(res, 502, { error: r.error });
     }

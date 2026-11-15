@@ -46,8 +46,12 @@ server.listen(0, async () => {
     assert.strictEqual(cfg.s, 200); assert.strictEqual(cfg.j.trade_map.Mason, 'Mason'); assert.deepStrictEqual(cfg.j.overrides, {});
     assert.strictEqual((await call('GET', 'costs/config', null, admin)).j.category_map.Rent, 'overhead');
 
-    // sync only by admin
-    assert.strictEqual((await call('POST', 'costs/sync', null, qs)).s, 403);
+    // sync by admin and qs, never by a viewer
+    await call('POST', 'users', { username: 'view1', password: 'secret12', role: 'viewer' }, admin);
+    const viewer = (await call('POST', 'login', { username: 'view1', password: 'secret12' })).ck;
+    assert.strictEqual((await call('POST', 'costs/sync', null, viewer)).s, 403, 'viewer cannot sync');
+    const qsSync = await call('POST', 'costs/sync', null, qs);
+    assert.strictEqual(qsSync.s, 200, 'qs can sync: ' + JSON.stringify(qsSync.j));
     const ok = await call('POST', 'costs/sync', null, admin);
     assert.strictEqual(ok.s, 200, JSON.stringify(ok.j)); assert.ok(ok.j.id);
     assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots WHERE ok=1 AND id=?').get(ok.j.id).n, 1, 'HTTP sync wrote an ok row');

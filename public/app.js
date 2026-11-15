@@ -195,7 +195,7 @@
         h('dt', null, t('snapshot_built')), h('dd', null, fmtTime(st && st.snapshot_created) || '—', st && st.last_checked ? h('small', { class: 'muted' }, ' ' + t('unchanged_since')) : null),
         h('dt', null, t('sync_state')), h('dd', null, !st ? '—' : st.last_error ? t('sync_failed') : st.stale ? t('costs_stale') : t('sync_ok'))),
       st && st.last_error ? h('p', { class: 'err' }, st.last_error) : null,
-      isAdmin() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));
+      canWrite() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));
 
     const head = h('div', { class: 'row' }, h('h1', null, t('nav_tenders')), h('span', { class: 'spacer' }));
     page.append(head);
@@ -738,7 +738,7 @@
     const page = h('div', { id: 'page-costs' });
     out.append(page);
     page.append(h('div', { class: 'row' }, h('h1', null, t('nav_costs')), h('span', { class: 'spacer' }),
-      isAdmin() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));
+      canWrite() ? h('button', { onclick: ev => syncNow(ev.target) }, t('sync_now')) : null));
     const snap = st && st.last_ok_id ? await api('GET', 'costs/snapshot') : null;
     if (!snap) page.append(h('div', { class: 'banner banner-red' }, t('no_snapshot_yet')));
     else {
