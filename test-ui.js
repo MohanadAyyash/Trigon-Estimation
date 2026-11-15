@@ -350,6 +350,29 @@ server.listen(0, async () => {
     await page.waitForFunction(r => !document.querySelector(`#dw-measurements tr[data-row="${r}"]`), kerbRow);
     assert.strictEqual((await call('GET', `tenders/${dwg}/rows`, null, admin)).j.find(r => r.id === kerbRow).qty, 0, 'row qty after delete');
 
+    // a ready drawing whose parsed summary is missing on disk: a banner on that drawing; upload and measurements still work
+    {
+      const body = FIX.replace('K1\n8\nKERB', 'K8\n8\nKERB');
+      const up = await fetch(`${base}tenders/${dwg}/drawings?name=broken`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(body) });
+      assert.strictEqual(up.status, 202);
+      const bid = (await up.json()).id;
+      for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(bid).status === 'parsing';) {
+        if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
+      }
+      const sha = db.prepare('SELECT sha256 FROM drawings WHERE id=?').get(bid).sha256;
+      fs.unlinkSync(path.join(process.env.DATA_DIR, 'drawings', sha + '.summary.json.gz'));
+      const nErr = errors.length;
+      await page.goto(`${origin}/#/tender/${dwg}/drawings/${bid}`);
+      await page.waitForSelector(D + ' #dw-panel-error');
+      assert.ok((await page.textContent(D + ' #dw-panel-error')).includes('the parsed drawing is missing'), 'banner says why');
+      assert.ok(await page.$(D + ' #dw-upload'), 'the upload panel is still there');
+      assert.ok(await page.$(`${D} #dw-measurements tr[data-row="${faceRow}"]`), 'the measurement list is still there');
+      const added = errors.splice(nErr);
+      assert.ok(added.length > 0 && added.every(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')), 'only the refused reads are logged: ' + JSON.stringify(added));
+      db.prepare('DELETE FROM drawings WHERE id=?').run(bid);   // not part of the checks below
+      await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    }
+
     // a submitted tender: read-only (no upload, link, delete or units controls), numbers still shown
     await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');

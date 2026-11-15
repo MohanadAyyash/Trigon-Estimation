@@ -562,7 +562,11 @@
         h('td', null, d.units || '—'), h('td', { class: 'num' }, !fin(d.bytes) ? '—' : d.bytes < 10486 ? '< 0.01' : (d.bytes / 1048576).toFixed(2)),
         h('td', null, (fmtTime(d.created) || '') + (d.created_by ? ' · ' + d.created_by : '')))), { class: 'grid' })) : h('p', { class: 'muted' }, t('dw_none'))));
     for (const d of list.filter(x => x.status === 'parsing')) watchParse(d.id, () => rerender());
-    if (cur && cur.status === 'ready') await drawingPanel(box, cur, ms, rows, editable);
+    if (cur && cur.status === 'ready') {
+      // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
+      try { await drawingPanel(box, cur, ms, rows, editable); }
+      catch (e) { box.append(h('div', { id: 'dw-panel-error', class: 'banner banner-red' }, h('strong', null, t('dw_panel_failed')), ': ', e.message)); }
+    }
     else if (cur && cur.status === 'failed') box.append(h('div', { class: 'banner banner-red' }, h('strong', null, t('dw_parse_failed')), ': ', cur.error || ''));
     else if (cur) box.append(h('p', { class: 'muted' }, t('dw_parsing')));
     box.append(measurementList(ms, rows, editable));
