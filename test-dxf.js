@@ -533,8 +533,8 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
       ...ents([...insert('IW', 'BW', 'MH', [[41, 2], [42, 3]]), ...line('L2', 'K', 0, 0, 5, 0), ...hatch('HX', [], 0, 'K'), ...lwp('BOW', [[0, 0], [10, 10], [10, 0], [0, 10]], true, 'K')])];
     const a = parseDxf(dxf(pairs)), b = parseDxf(dxf(pairs));
     const fa = flatten(a), fb = flatten(b, { withSegs: true });
-    assert.ok(fa.every(e => !('segs' in e) && !('ins' in e)), 'default call: no segs, no ins');
-    assert.deepStrictEqual(fb.map(e => { const o = { ...e }; delete o.segs; delete o.ins; return o; }), fa);
+    assert.ok(fa.every(e => !('segs' in e) && !('ins' in e) && !('pathLens' in e)), 'default call: no segs, no ins, no pathLens');
+    assert.deepStrictEqual(fb.map(e => { const o = { ...e }; delete o.segs; delete o.ins; delete o.pathLens; return o; }), fa);
     assert.deepStrictEqual(b.warnings, a.warnings);
     assert.ok(fb.filter(e => e.kind !== 'dropped').every(e => Array.isArray(e.segs)), 'segs on every non-dropped entity');
     assert.ok(fb.filter(e => e.kind === 'dropped').every(e => !('segs' in e)));
@@ -608,6 +608,24 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     assert.deepStrictEqual(r.kind, [0, 4, 4, 0]); assert.deepStrictEqual(r.count, [2, 0, 0, 2]);
     assert.ok(Number.isNaN(r.area[1])); assert.strictEqual(r.len[1], 0);
     near(r.P(3)[0][1], 1, 1e-6);
+  }
+  // several paths in one entity (HATCH outer loop + island): one NaN,NaN break between them, none at the ends;
+  // count includes the break; no segment joins loop 1 to loop 2
+  {
+    const { f, r } = render(ents([...hatch('HI', [hpoly(sq(0, 0, 10)), hpoly(sq(4, 4, 2))], 0, 'K'), ...lwp('S1', sq(20, 0, 5), true, 'K')]));
+    assert.deepStrictEqual(f[0].pathLens, [4, 4]); assert.deepStrictEqual(f[1].pathLens, [4]);
+    assert.strictEqual(r.kind[0], 1); assert.strictEqual(r.count[0], 4 + 1 + 4, 'two rings of 4 + one break');
+    const p = r.pts.slice(r.start[0], r.start[0] + r.count[0]), brk = p.map((q, k) => Number.isNaN(q[0]) || Number.isNaN(q[1]) ? k : -1).filter(k => k >= 0);
+    assert.deepStrictEqual(brk, [4], 'exactly one break, between the loops');
+    assert.ok(Number.isNaN(p[4][0]) && Number.isNaN(p[4][1]), 'the break is a NaN,NaN pair');
+    const o = r.header.origin, abs = q => [q[0] + o[0], q[1] + o[1]];
+    assert.deepStrictEqual(p.slice(0, 4).map(abs), sq(0, 0, 10)); assert.deepStrictEqual(p.slice(5).map(abs), sq(4, 4, 2));
+    // drawn as consecutive pairs, never across the break: no segment from loop 1's last point to loop 2's first
+    const segs = []; for (let k = 0; k + 1 < p.length; k++) if (!Number.isNaN(p[k][0]) && !Number.isNaN(p[k + 1][0])) segs.push([abs(p[k]), abs(p[k + 1])]);
+    assert.ok(!segs.some(([u, v]) => u[0] === 0 && u[1] === 10 && v[0] === 4 && v[1] === 4), 'no bridge between the loops');
+    assert.strictEqual(segs.length, 6);
+    // a single-path entity has no break
+    assert.strictEqual(r.count[1], 4); assert.ok(r.pts.slice(r.start[1], r.start[1] + 4).every(q => Number.isFinite(q[0]) && Number.isFinite(q[1])));
   }
   // nothing to draw: origin (0,0), empty bbox, zero entities
   {
