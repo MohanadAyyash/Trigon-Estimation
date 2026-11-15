@@ -355,4 +355,26 @@ assert.deepStrictEqual(h0.f, []); assert.ok(warned(h0.d, 'hatch_no_boundary', 'H
 for (const r of [0, -0.5, 1.5]) assert.throws(() => fl(ents([[0, 'ELLIPSE'], [5, 'ER'], [10, 0], [20, 0], [11, 2], [21, 0], [40, r]])), /ELLIPSE ER/, String(r));
 near(fl(ents([[0, 'ELLIPSE'], [5, 'E1'], [10, 0], [20, 0], [11, 2], [21, 0], [40, 1]]))[0].area, 4 * Math.PI);
 
+// ---- Task 2 fix round 2: crossings through a vertex or a T-junction ----
+const vBow = [[0, 0], [5, 5], [10, 10], [10, 0], [5, 5], [0, 10]], tBow = [[0, 0], [10, 10], [10, 0], [5, 5], [0, 10]];
+for (const [h, pts] of [['VB', vBow], ['TB2', tBow]]) {
+  const a = flDoc(ents(lwp(h, pts, true)));
+  assert.strictEqual(a.f[0].area, null, h); assert.ok(warned(a.d, 'self_intersecting', h), h);
+  const b = flDoc(ents(hatch(h + 'H', [hpoly(pts)])));
+  assert.strictEqual(b.f[0].area, null, h + 'H'); assert.ok(warned(b.d, 'self_intersecting', h + 'H'), h + 'H');
+}
+const ovA = [[0, 0], [10, 0], [10, 5], [10, 10], [5, 10], [0, 10]], ovB = [[5, 5], [10, 5], [15, 5], [15, 15], [5, 15], [5, 10]];
+const ovv = flDoc(ents(hatch('OV', [hpoly(ovA), hpoly(ovB)])));
+assert.strictEqual(ovv.f[0].area, null); assert.ok(warned(ovv.d, 'hatch_loops_overlap', 'OV'));
+// touching is allowed: keyhole slit (repeated vertices, collinear slit edges), island touching at a vertex and along an edge
+const keyhole = [[0, 0], [10, 0], [10, 5], [7, 5], [7, 3], [3, 3], [3, 7], [7, 7], [7, 5], [10, 5], [10, 10], [0, 10]];
+const kh = flDoc(ents([...lwp('KH', keyhole, true), ...hatch('KHH', [hpoly(keyhole)]),
+  ...hatch('TI', [hpoly(sq(0, 0, 10)), hpoly([[10, 5], [5, 8], [5, 2]])]), ...lwp('TV', [[0, 0], [10, 0], [5, 5], [10, 10], [0, 10], [5, 5]], true)]));
+near(kh.f[0].area, 84); near(kh.f[1].area, 84); near(kh.f[2].area, 85); near(kh.f[3].area, 50);
+assert.deepStrictEqual(kh.d.warnings, []);
+// empty boundary loops are skipped; only empty loops -> hatch_no_boundary
+const emp = flDoc(ents([...hatch('EL', [[[92, 1], [93, 0], [97, 0]], hpoly(sq(0, 0, 10))]), ...hatch('EA', [[[92, 1], [93, 0], [97, 0]], [[92, 2], [72, 0], [73, 1], [93, 0], [97, 0]]])]));
+assert.strictEqual(emp.f.length, 1); near(emp.f[0].area, 100);
+assert.ok(warned(emp.d, 'hatch_no_boundary', 'EA')); assert.ok(!emp.d.warnings.some(w => w.detail === 'EL'));
+
 console.log('ok test-dxf');
