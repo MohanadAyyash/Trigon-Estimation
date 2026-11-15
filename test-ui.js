@@ -3,6 +3,8 @@
 const fs = require('fs'), os = require('os'), path = require('path'), assert = require('assert');
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'est-ui-'));
 process.env.ERP_SYNC_DISABLED = '1';
+// every exit removes the temp DATA_DIR
+const done = code => { fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true }); process.exit(code); };
 
 // ---- i18n key coverage (no server needed) -------------------------------------------------------------------
 const app = fs.readFileSync(path.join(__dirname, 'public', 'app.js'), 'utf8');
@@ -45,7 +47,7 @@ server.listen(0, async () => {
 
     let pw = null;
     try { pw = require('playwright'); } catch (e) { console.log('ui: playwright not installed, browser smoke skipped'); }
-    if (!pw) { console.log('ui ok'); process.exit(0); }
+    if (!pw) { console.log('ui ok'); done(0); }
 
     // ---- fixture: admin, snapshot, material, item, a complete tender and a partial one ------------------
     const admin = (await call('POST', 'setup', { username: 'admin', password: 'secret12' })).ck;
@@ -406,6 +408,6 @@ server.listen(0, async () => {
 
     assert.deepStrictEqual(errors, [], 'no console errors');
     await browser.close();
-    console.log('ui ok'); process.exit(0);
-  } catch (e) { console.error(e); if (browser) await browser.close().catch(() => {}); process.exit(1); }
+    console.log('ui ok'); done(0);
+  } catch (e) { console.error(e); if (browser) await browser.close().catch(() => {}); done(1); }
 });
