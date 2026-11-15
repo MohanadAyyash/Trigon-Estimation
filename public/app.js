@@ -352,7 +352,7 @@
     const x = infoFields('ti-', T, editable);
     const margin = inp('ti-margin', T.margin_pct, { inputmode: 'decimal', disabled: !(editable && isAdmin()) });
     if (isAdmin()) x.grid.append(field(t('margin_pct'), margin));
-    else x.grid.append(field(t('margin_pct'), h('span', null, fin(T.margin_pct) ? pctTxt(T.margin_pct) : t('margin_default'))));
+    else x.grid.append(field(t('margin'), h('span', null, fin(T.margin_pct) ? pctTxt(T.margin_pct) : t('margin_default'))));
     body.append(card(t('tab_info'), x.grid,
       editable ? h('button', { id: 'ti-save', onclick: async ev => {
         const b = x.values();
@@ -655,7 +655,7 @@
     box.append(h('div', { class: 'cols' },
       card(t('inputs_used'), h('dl', { class: 'kv' },
         h('dt', null, t('snapshot_date')), h('dd', null, fmtTime(p.snapshot_created) || '—'),
-        h('dt', null, t('margin_pct')), h('dd', null, pctTxt(p.margin_pct)),
+        h('dt', null, t('margin')), h('dd', null, pctTxt(p.margin_pct)),
         h('dt', null, t('duration_months')), h('dd', null, inpts.M ?? '—'),
         h('dt', null, t('adv_pct')), h('dd', null, pctTxt(inpts.adv_pct)),
         h('dt', null, t('ret_pct')), h('dd', null, pctTxt(inpts.ret_pct)),
@@ -725,7 +725,7 @@
 
   function drawFrozen(box, { frozen: f }) {
     box.append(h('div', { class: 'banner banner-ok' }, h('strong', null, t('frozen_price')), ' ',
-      t('approved_by') + ': ' + (f.approved_by || '—') + ' · ' + (fmtTime(f.approved_at) || '') + ' · ' + t('snapshot_date') + ': ' + (fmtTime(f.snapshot_created) || '—') + ' · ' + t('margin_pct') + ': ' + pctTxt(f.margin_pct)),
+      t('approved_by') + ': ' + (f.approved_by || '—') + ' · ' + (fmtTime(f.approved_at) || '') + ' · ' + t('snapshot_date') + ': ' + (fmtTime(f.snapshot_created) || '—') + ' · ' + t('margin') + ': ' + pctTxt(f.margin_pct)),
     );
     if (f.override_stale) box.append(h('p', { class: 'warn' }, t('approved_on_stale')));
     if ((f.snapshot_warnings || []).length) box.append(h('p', { class: 'warn', id: 'frozen-warnings' }, t('approved_with_warnings') + ': ', f.snapshot_warnings.map((c, i) => [i ? ', ' : '', h('code', null, c)])));

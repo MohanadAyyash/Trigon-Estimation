@@ -21,7 +21,7 @@ const I18N = {
     // tenders list / info
     new_tender: 'New tender', ref: 'Ref', title: 'Title', client: 'Client', rev: 'Rev.', approved_price: 'Approved price (AED)',
     duration_months: 'Duration (months)', adv_pct: 'Advance %', ret_pct: 'Retention %', collection_days: 'Collection days', retention_months: 'Retention period (months)',
-    submit_date: 'Submission date', margin_pct: 'Margin %', margin_default: 'company default', approved_by: 'Approved by',
+    submit_date: 'Submission date', margin_pct: 'Margin %', margin: 'Margin', margin_default: 'company default', approved_by: 'Approved by',
     read_only: 'Read only.', only_draft_editable: 'Only a draft can be changed.',
     tab_info: 'Details', tab_quantities: 'Quantities', tab_links: 'Links', tab_hidden: 'Hidden items', tab_summary: 'Summary',
     submit_for_approval: 'Submit for approval', return_to_draft: 'Return to draft', mark_sent: 'Mark as sent', revise: 'New revision',
@@ -131,7 +131,7 @@ const I18N = {
     ck_overhead: 'مصاريف عمومية', ck_labour_oncost: 'تكاليف عمالة إضافية', ck_equipment: 'معدات', ck_project: 'تكلفة مشروع', ck_ignore: 'تجاهل',
     new_tender: 'مناقصة جديدة', ref: 'المرجع', title: 'العنوان', client: 'العميل', rev: 'مراجعة', approved_price: 'السعر المعتمد (درهم)',
     duration_months: 'المدة (أشهر)', adv_pct: 'الدفعة المقدمة %', ret_pct: 'المحتجزات %', collection_days: 'أيام التحصيل', retention_months: 'مدة المحتجزات (أشهر)',
-    submit_date: 'تاريخ التقديم', margin_pct: 'المارجن %', margin_default: 'الافتراضي للشركة', approved_by: 'اعتمدها',
+    submit_date: 'تاريخ التقديم', margin_pct: 'المارجن %', margin: 'المارجن', margin_default: 'الافتراضي للشركة', approved_by: 'اعتمدها',
     read_only: 'للقراءة فقط.', only_draft_editable: 'لا يمكن التعديل إلا على المسودة.',
     tab_info: 'البيانات', tab_quantities: 'الكميات', tab_links: 'الربط', tab_hidden: 'البنود المخفية', tab_summary: 'الملخص',
     submit_for_approval: 'إرسال للاعتماد', return_to_draft: 'إرجاع إلى مسودة', mark_sent: 'تسجيل كمُرسلة', revise: 'مراجعة جديدة',

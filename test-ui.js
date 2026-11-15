@@ -154,6 +154,9 @@ server.listen(0, async () => {
     await page.click('#ap-approve');
     await page.waitForSelector('#summary .banner-ok');
     assert.ok((await page.textContent('#frozen-warnings')).includes('short_history'), 'frozen Summary shows the acknowledged warnings');
+    const fb = await page.textContent('#summary .banner-ok');
+    assert.ok(fb.includes('Margin: ') && !fb.includes('Margin %'), 'margin label without a second %: ' + fb);
+    assert.ok(!(await page.textContent('#summary')).includes('Margin %'), 'no "Margin %: 12 %" on the frozen Summary');
     const ap = (await call('GET', `tenders/${full}`, null, admin)).j;
     assert.strictEqual(ap.status, 'approved'); assert.strictEqual(ap.margin_pct, 20); assert.strictEqual(ap.approved_P, at20, 'approved P is the P that was shown');
 
