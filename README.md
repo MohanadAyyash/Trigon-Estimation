@@ -27,13 +27,13 @@
 netsh advfirewall firewall add rule name="Trigon Estimation 3100" dir=in action=allow protocol=TCP localport=3100 profile=private
 ```
 
-لا تفتح المنفذ على الشبكات العامة. للحذف: `netsh advfirewall firewall delete rule name="Trigon Estimation 3100"`.
+لا تفتح المنفذ على الشبكات العامة. يجب أن يكون نوع شبكة المكتب في ويندوز «خاصة» (Private) وإلا لن يصل مهندس الكميات إلى التطبيق: من الإعدادات ← الشبكة والإنترنت ← خصائص الشبكة اختر «شبكة خاصة». للحذف: `netsh advfirewall firewall delete rule name="Trigon Estimation 3100"`.
 
 ### التطبيق لا يكتب أبداً في الـ ERP
 يفتح التطبيق قاعدة بيانات الـ ERP بوضع القراءة فقط، ويأخذ منها مجاميع فقط (متوسط أجر كل مهنة وعدد العاملين) دون أسماء أو أرقام هوية أو رواتب فردية. المهن التي يقل عدد عامليها عن 3 لا تظهر أجورها لمهندس الكميات.
 
 ### النسخ الاحتياطي
-كل بيانات التطبيق في مجلد `data`: الملف `data\estimation.db` (وستُضاف لاحقاً `data\drawings`). يأخذ `Estimation-Start.bat` نسخة يومية تلقائياً إلى `data\backups\estimation-YYYYMMDD.db` ويحتفظ بآخر 14 نسخة. انسخ مجلد `data` بانتظام إلى قرص أو جهاز آخر.
+كل بيانات التطبيق في مجلد `data`: الملف `data\estimation.db` (وستُضاف لاحقاً `data\drawings`). عند كل تشغيل لـ `Estimation-Start.bat` تؤخذ نسخة إلى `data\backups\estimation-YYYYMMDD.db` إن لم تكن نسخة اليوم موجودة (أي نسخة واحدة يومياً عند التشغيل، لا نسخة كل يوم إن لم يُشغَّل التطبيق)، ويحتفظ بآخر 14 نسخة. إذا فشل النسخ تظهر رسالة تحذير في نافذة الأوامر ويُسجَّل السبب في `data\backups\backup-errors.log`؛ راجع هذا الملف من وقت لآخر. انسخ مجلد `data` بانتظام إلى قرص أو جهاز آخر.
 
 ### التحديث
 أوقف التطبيق (أغلق نافذة الأوامر)، ثم نفّذ `git pull` أو استبدل ملفات التطبيق بالنسخة الجديدة **دون حذف مجلد `data`**، ثم شغّل `Estimation-Start.bat`. تُحدَّث قاعدة البيانات تلقائياً.
@@ -67,13 +67,13 @@ Open a Command Prompt **as Administrator** and run:
 netsh advfirewall firewall add rule name="Trigon Estimation 3100" dir=in action=allow protocol=TCP localport=3100 profile=private
 ```
 
-Do not open the port on Public networks. To remove the rule: `netsh advfirewall firewall delete rule name="Trigon Estimation 3100"`.
+Do not open the port on Public networks. The office network must be set to **Private** in Windows, otherwise the QS cannot reach the app: Settings → Network & Internet → the network's properties → Private network. To remove the rule: `netsh advfirewall firewall delete rule name="Trigon Estimation 3100"`.
 
 ### The app never writes to the ERP
 The ERP database is opened read-only and only aggregates are taken from it (average rate and headcount per trade), never names, ID numbers or individual salaries. A trade with fewer than 3 people never shows its own rate to the QS.
 
 ### Backups
-All app data lives in the `data` folder: `data\estimation.db` (and `data\drawings` later). `Estimation-Start.bat` takes a daily copy to `data\backups\estimation-YYYYMMDD.db` and keeps the last 14. Copy the `data` folder regularly to another disk or PC.
+All app data lives in the `data` folder: `data\estimation.db` (and `data\drawings` later). Each time `Estimation-Start.bat` starts the app it copies the database to `data\backups\estimation-YYYYMMDD.db` unless today's copy already exists (so: at most one copy per day, taken at start — no copy on a day the app is not started), and keeps the last 14. If a backup fails, the command window shows a warning and the reason is written to `data\backups\backup-errors.log`; check that file now and then. Copy the `data` folder regularly to another disk or PC.
 
 ### Updating
 Stop the app (close the command window), run `git pull` or replace the app files with the new version **without deleting the `data` folder**, then start `Estimation-Start.bat`. The database upgrades itself.

@@ -17,8 +17,12 @@ rem reachable from the office network so the QS can open it; allow port 3100 on 
 set HOST=0.0.0.0
 set PORT=3100
 
-rem daily backup when the app starts
-node --no-warnings scripts\backup.js >nul 2>nul
+rem backup when the app starts (at most one copy per day); a failure is shown here and written to data\backups\backup-errors.log
+node --no-warnings scripts\backup.js
+if errorlevel 1 (
+  echo WARNING: today's backup FAILED. See data\backups\backup-errors.log
+  echo تحذير: فشل النسخ الاحتياطي اليوم. راجع الملف data\backups\backup-errors.log
+)
 
 start "" /min cmd /c "timeout /t 3 /nobreak >nul & start http://localhost:3100"
 echo Trigon Estimation is running at http://localhost:3100
