@@ -3,6 +3,10 @@ const fs = require('fs'), os = require('os'), path = require('path'), assert = r
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-'));
 process.env.ERP_SYNC_DISABLED = '1';
 const { server, db, ctx } = require('./server.js');
+const { layerTable } = require('./lib/dxf/summary.js');
+const http = require('http'), zlib = require('zlib');
+const TMP_DIRS = [process.env.DATA_DIR];
+const done = code => { for (const d of TMP_DIRS) fs.rmSync(d, { recursive: true, force: true }); process.exit(code); };
 const DDIR = path.join(process.env.DATA_DIR, 'drawings');
 
 // DXF fixtures are built as strings (same builders as test-dxf.js)
@@ -24,6 +28,13 @@ const BIG = (() => {
   parts.push('0\nENDSEC\n0\nEOF\n');
   return parts.join('\n');
 })();
+const bigLines = (n, tag) => { const p = ['0\nSECTION\n2\nENTITIES']; for (let i = 0; i < n; i++) p.push('0\nLINE\n5\n' + tag + i + '\n8\nL' + (i % 7) + '\n10\n' + i + '\n20\n0\n11\n' + (i + 3) + '\n21\n4'); p.push('0\nENDSEC\n0\nEOF\n'); return p.join('\n'); };
+// a lazy 300 MiB request body: tells how much the client really sent before the server stopped it
+const bigStream = () => {
+  const chunk = Buffer.from('0\n'.repeat(512 * 1024)), o = { sent: 0 };
+  o.stream = new ReadableStream({ pull(c) { if (o.sent >= 300 * 1024 * 1024) return c.close(); o.sent += chunk.length; c.enqueue(chunk); } });
+  return o;
+};
 const dirFiles = () => fs.existsSync(DDIR) ? fs.readdirSync(DDIR).sort() : [];
 
 server.listen(0, async () => {
@@ -71,6 +82,48 @@ server.listen(0, async () => {
       assert.deepStrictEqual(dirFiles(), before, 'no file left in DATA_DIR/drawings');
       assert.strictEqual(nDrawings(), 0);
     }
+    // a Content-Length over the limit → 413 at once; a refusal before the body is read closes the connection
+    {
+      const port = server.address().port;
+      const rawPost = (u, ck, headers) => new Promise((ok, no) => {
+        const q = http.request({ port, method: 'POST', path: '/api/' + u, headers: { cookie: ck, 'Content-Type': 'application/octet-stream', ...headers } }, res => {
+          let b = ''; res.on('data', c => b += c); res.on('end', () => ok({ s: res.statusCode, conn: res.headers.connection, b }));
+        });
+        q.on('error', no);
+        q.setTimeout(5000, () => { q.destroy(); no(new Error('no answer within 5 s to ' + u)); });
+        q.write('0\n');   // the rest is never sent: the answer must come anyway
+      });
+      const r = await rawPost(`tenders/${tid}/drawings?name=x`, qs, { 'Content-Length': 100 * 1024 * 1024 + 1 });
+      assert.strictEqual(r.s, 413, 'Content-Length > 100 MB → 413 immediately'); assert.strictEqual(r.conn, 'close');
+      const v = await rawPost(`tenders/${tid}/drawings?name=x`, viewer, { 'Transfer-Encoding': 'chunked' });
+      assert.strictEqual(v.s, 403); assert.strictEqual(v.conn, 'close', 'a pre-body refusal closes the connection');
+      const n = await rawPost(`tenders/${tid}/drawings?name=x`, '', { 'Transfer-Encoding': 'chunked' });
+      assert.strictEqual(n.s, 401); assert.strictEqual(n.conn, 'close', '401 before the body closes the connection');
+    }
+    // refusals before the body is read stop the client too (Connection: close)
+    {
+      const t2 = (await call('POST', 'tenders', { title: 'Approved Works', kind: 'rta' }, qs)).j.id;
+      db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(t2);
+      for (const [what, tenderId, name, ck, status] of [['no session', tid, 'x', '', 401], ['viewer', tid, 'x', viewer, 403], ['missing tender', 99999, 'x', qs, 404],
+        ['approved tender', t2, 'x', qs, 409], ['no name', tid, '', qs, 400]]) {
+        const b = bigStream();
+        const r = await upload(tenderId, name, b.stream, ck, { duplex: 'half' });
+        assert.strictEqual(r.s, status, what);
+        assert.ok(b.sent < 300 * 1024 * 1024, what + ': the client was stopped (sent ' + b.sent + ')');
+      }
+      assert.strictEqual(nDrawings(), 0);
+    }
+    // an upload the client aborts leaves no temp file
+    {
+      const before = dirFiles(), ac = new AbortController(), b = bigStream();
+      const p = upload(tid, 'aborted', b.stream, qs, { duplex: 'half', signal: ac.signal }).catch(e => e);
+      while (b.sent < 8 * 1024 * 1024) await new Promise(f => setTimeout(f, 5));
+      ac.abort(); await p;
+      const t0 = Date.now();
+      while (JSON.stringify(dirFiles()) !== JSON.stringify(before) && Date.now() - t0 < 3000) await new Promise(f => setTimeout(f, 20));
+      assert.deepStrictEqual(dirFiles(), before, 'aborted upload: temp file removed');
+      assert.strictEqual(nDrawings(), 0);
+    }
 
     // ---- bad uploads: binary DXF, empty body, no name, roles, status --------------------------------------
     {
@@ -102,11 +155,14 @@ server.listen(0, async () => {
     assert.strictEqual(d.header.insunits, 4);
     assert.strictEqual(d.ignored.XLINE, 1, 'ignored entity types are reported');
     assert.ok(Array.isArray(d.warnings));
-    assert.deepStrictEqual(dirFiles(), [d.sha256 + '.dxf', d.sha256 + '.json.gz']);
+    assert.deepStrictEqual(dirFiles(), [d.sha256 + '.dxf', d.sha256 + '.json.gz', d.sha256 + '.summary.json.gz']);
     // the cache holds flat entries without codes
     const cache = JSON.parse(require('zlib').gunzipSync(fs.readFileSync(path.join(DDIR, d.sha256 + '.json.gz'))));
     assert.deepStrictEqual(Object.keys(cache).sort(), ['flat', 'header', 'ignored', 'layers', 'warnings']);
     assert.ok(cache.flat.length >= 3 && cache.flat.every(f => !('codes' in f) && 'geomKey' in f && 'bbox' in f));
+    // the GET routes read only the small summary: they work with the full cache gone, and match layerTable(full flat)
+    const expectLayers = unit => { const lt = layerTable(cache.flat, cache.layers, unit); return { units: unit, units_confirmed: unit !== null, layers: lt.layers, warnings: [...cache.warnings, ...lt.warnings] }; };
+    fs.unlinkSync(path.join(DDIR, d.sha256 + '.json.gz'));
     const au = (await call('GET', 'audit', null, admin)).j.find(a => a.action === 'upload' && a.entity === 'drawings');
     assert.deepStrictEqual(JSON.parse(au.detail), { name: 'Site plan', bytes: d.bytes, sha256: d.sha256 });
 
@@ -117,6 +173,8 @@ server.listen(0, async () => {
     // layers before units: no numbers, not confirmed
     let ly = await call('GET', `drawings/${id}/layers`, null, viewer);
     assert.strictEqual(ly.s, 200);
+    assert.deepStrictEqual(ly.j, expectLayers(null), 'layers (no units) = layerTable(full flat, null)');
+    assert.deepStrictEqual((await call('GET', `drawings/${id}`, null, viewer)).j.header, cache.header);
     assert.strictEqual(ly.j.units_confirmed, false); assert.strictEqual(ly.j.units, null);
     const kerb0 = ly.j.layers.find(l => l.layer === 'KERB');
     assert.strictEqual(kerb0.open_length, null); assert.strictEqual(kerb0.area, null);
@@ -132,6 +190,7 @@ server.listen(0, async () => {
     assert.strictEqual(pu.s, 200, JSON.stringify(pu.j)); assert.strictEqual(pu.j.units, 'mm');
     ly = await call('GET', `drawings/${id}/layers`, null, qs);
     assert.strictEqual(ly.j.units_confirmed, true); assert.strictEqual(ly.j.units, 'mm');
+    assert.deepStrictEqual(ly.j, expectLayers('mm'), 'layers in mm = layerTable(full flat, mm)');
     const kerb = ly.j.layers.find(l => l.layer === 'KERB');
     assert.ok(Math.abs(kerb.open_length - 5) < 1e-9, 'KERB open_length 5 m: ' + kerb.open_length);
     assert.ok(Math.abs(kerb.closed_perimeter - 4) < 1e-9); assert.ok(Math.abs(kerb.area - 1) < 1e-9);
@@ -139,6 +198,8 @@ server.listen(0, async () => {
     const ua = (await call('GET', 'audit', null, admin)).j.find(a => a.action === 'units');
     assert.deepStrictEqual(JSON.parse(ua.detail), { from: null, to: 'mm' });
     assert.strictEqual((await call('PUT', `drawings/${id}/units`, { units: 'm' }, admin)).j.units, 'm', 'admin may change units before measuring');
+    assert.deepStrictEqual((await call('GET', `drawings/${id}/layers`, null, qs)).j, expectLayers('m'), 'layers in m = layerTable(full flat, m)');
+    assert.ok(!fs.existsSync(path.join(DDIR, d.sha256 + '.json.gz')), 'the full cache was not needed');
     assert.strictEqual((await call('PUT', `drawings/${id}/units`, { units: 'mm' }, qs)).s, 200);
 
     // missing drawing → 404
@@ -172,6 +233,7 @@ server.listen(0, async () => {
       const f = await waitDone(r.j.id, qs);
       assert.strictEqual(f.status, 'failed'); assert.match(f.error, /truncated/);
       assert.strictEqual((await call('GET', `drawings/${r.j.id}/layers`, null, qs)).s, 409, 'no layers for a failed drawing');
+      assert.strictEqual((await call('PUT', `drawings/${r.j.id}/units`, { units: 'm' }, qs)).s, 409, 'units need a ready drawing');
       const pf = (await call('GET', 'audit', null, admin)).j.find(a => a.action === 'parse_failed');
       assert.ok(pf && /truncated/.test(JSON.parse(pf.detail).error));
     }
@@ -190,12 +252,24 @@ server.listen(0, async () => {
         observed++;
         if (Date.now() - t0 > 30000) throw new Error('100k parse still running after 30 s');
       }
-      if (!observed) console.log('note: the 100k parse finished before the first /api/status call (no overlap observed)');
-      else console.log('responsiveness: ' + observed + ' /api/status call(s) answered < 500 ms during the parse');
+      assert.ok(observed > 0, 'no /api/status call overlapped the 100k parse');
+      console.log('responsiveness: ' + observed + ' /api/status call(s) answered < 500 ms during the parse');
       await call('PUT', `drawings/${r.j.id}/units`, { units: 'm' }, qs);
       const bl = (await call('GET', `drawings/${r.j.id}/layers`, null, qs)).j;
       assert.strictEqual(bl.layers.reduce((s, l) => s + l.entities, 0), 100000);
       assert.strictEqual(bl.layers.reduce((s, l) => s + l.open_length, 0), 500000);
+    }
+
+    // ---- one parse at a time: three uploads at once never run two workers, and all end ready ----------------
+    {
+      const w = ctx.drawings._workers; w.peak = w.alive;
+      const started = w.started;
+      const ups = await Promise.all(['QA', 'QB', 'QC'].map(tag => upload(tid, tag, Buffer.from(bigLines(20000, tag)), qs)));
+      assert.deepStrictEqual(ups.map(u => u.s), [202, 202, 202]);
+      for (const u of ups) assert.strictEqual((await waitDone(u.j.id, qs)).status, 'ready');
+      assert.strictEqual(w.started - started, 3, 'three parses');
+      assert.strictEqual(w.peak, 1, 'never more than one worker alive');
+      assert.strictEqual(w.alive, 0);
     }
 
     // ---- ctx.drawings hooks; units cannot change after measuring ------------------------------------------
@@ -241,19 +315,44 @@ server.listen(0, async () => {
         fs.copyFileSync(${JSON.stringify(src)}, path.join(process.env.DATA_DIR, 'drawings', ${JSON.stringify(sha + '.dxf')}));
         db.prepare("INSERT INTO tenders(title,kind,status,created) VALUES('T','rta','draft','x')").run();
         db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(1,'p',?,1,'parsing','x')").run(${JSON.stringify(sha)});
+        db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(1,'gone',?,1,'parsing','x')").run('0'.repeat(64));
         process.exit(0);`], { env, encoding: 'utf8' });
       assert.strictEqual(a.status, 0, a.stderr);
       // second run: the module re-queues the parse
       const b = spawnSync(process.execPath, ['--no-warnings', '-e', `
         const { db } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
         const t0 = Date.now();
-        const tick = () => { const r = db.prepare('SELECT status, suggested_units FROM drawings WHERE id=1').get();
-          if (r.status !== 'parsing' || Date.now() - t0 > 10000) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
+        const tick = () => { const r = db.prepare('SELECT status, suggested_units, error FROM drawings ORDER BY id').all();
+          if (r.every(x => x.status !== 'parsing') || Date.now() - t0 > 10000) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
         tick();`], { env, encoding: 'utf8' });
       assert.strictEqual(b.status, 0, b.stderr);
-      assert.deepStrictEqual(JSON.parse(b.stdout.trim()), { status: 'ready', suggested_units: 'mm' });
+      const rows = JSON.parse(b.stdout.trim());
+      assert.deepStrictEqual(rows[0], { status: 'ready', suggested_units: 'mm', error: null });
+      assert.strictEqual(rows[1].status, 'failed'); assert.strictEqual(rows[1].error, 'the stored drawing file is missing', 'no server path in the error');
+      TMP_DIRS.push(dir2);
+    }
+    // a parse that runs out of memory fails with a clear message (small heap for the test)
+    {
+      const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-oom-')); TMP_DIRS.push(dir3);
+      const src = path.join(dir3, 'big.dxf'); fs.writeFileSync(src, BIG);
+      const c = spawnSync(process.execPath, ['--no-warnings', '-e', `
+        const fs = require('fs'), path = require('path');
+        const { db } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
+        fs.copyFileSync(${JSON.stringify(src)}, path.join(process.env.DATA_DIR, 'drawings', '${'a'.repeat(64)}.dxf'));
+        db.prepare("INSERT INTO tenders(title,kind,status,created) VALUES('T','rta','draft','x')").run();
+        db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(1,'p',?,1,'parsing','x')").run('${'a'.repeat(64)}');
+        process.exit(0);`], { env: { ...process.env, DATA_DIR: dir3 }, encoding: 'utf8' });
+      assert.strictEqual(c.status, 0, c.stderr);
+      const e = spawnSync(process.execPath, ['--no-warnings', '-e', `
+        const { db } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
+        const t0 = Date.now();
+        const tick = () => { const r = db.prepare('SELECT status, error FROM drawings WHERE id=1').get();
+          if (r.status !== 'parsing' || Date.now() - t0 > 20000) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
+        tick();`], { env: { ...process.env, DATA_DIR: dir3, DRAWINGS_PARSE_HEAP_MB: '16' }, encoding: 'utf8' });
+      assert.strictEqual(e.status, 0, e.stderr);
+      assert.deepStrictEqual(JSON.parse(e.stdout.trim()), { status: 'failed', error: 'drawing too large to parse — PURGE unused objects or split the drawing in AutoCAD, then save as DXF again' });
     }
 
-    console.log('drawings ok'); process.exit(0);
-  } catch (e) { console.error(e); process.exit(1); }
+    console.log('drawings ok'); done(0);
+  } catch (e) { console.error(e); done(1); }
 });

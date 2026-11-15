@@ -33,6 +33,9 @@ const readBody = (req, max = 20e6) => req._body !== undefined ? Promise.resolve(
   req.on('end', () => { if (over) return; try { const j = b ? JSON.parse(b) : {}; if (!j || typeof j !== 'object' || Array.isArray(j)) throw 0; ok(req._body = j); } catch (e) { no(Object.assign(new Error('invalid request body'), { status: 400 })); } });
   req.on('error', no);
 });
+// a reply sent before the request body has fully arrived (a refusal): close the connection once it is sent, so a
+// large upload stops instead of being read and thrown away
+const closeEarly = (req, res) => { if (req.complete) return {}; res.once('finish', () => setImmediate(() => req.destroy())); return { Connection: 'close' }; };
 const tx = fn => { db.exec('BEGIN'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 const audit = (user, action, entity, id, detail) => db.prepare('INSERT INTO audit_log(at,user,action,entity,entity_id,detail) VALUES(?,?,?,?,?,?)')
   .run(new Date().toISOString(), user && user.username || (typeof user === 'string' ? user : null), action, entity || null, id == null ? null : String(id), detail == null ? null : (typeof detail === 'string' ? detail : JSON.stringify(detail)));
@@ -130,7 +133,7 @@ async function api(req, res, url) {
   }
 
   const me = sessionUser(req);
-  if (!me) return send(res, 401, { error: 'unauthorized' });
+  if (!me) return send(res, 401, { error: 'unauthorized' }, closeEarly(req, res));
   if (a === 'users') {
     need(me, 'admin');
     if (parts.length === 1 && method === 'GET') return send(res, 200, db.prepare('SELECT id,username,role,disabled,created FROM users ORDER BY id').all());
@@ -199,7 +202,8 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     const status = e.status || 500;
     if (status === 500) console.error(e);
-    if (!res.headersSent) send(res, status, { error: status === 500 ? 'internal error' : e.message });
+    if (!res.headersSent) send(res, status, { error: status === 500 ? 'internal error' : e.message }, closeEarly(req, res));
+    else if (!req.complete) req.destroy();
   }
 });
 
