@@ -96,6 +96,15 @@ server.listen(0, async () => {
     await login('qs2', 'newpass99');
     assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM sessions WHERE token=?').get('ab'.repeat(24)).n, 0, 'expired session purged');
 
+    // the audit row is written in the same transaction as the change: if it cannot be written, nothing changes
+    const auditDown = async (entities, fn) => {
+      db.exec(`CREATE TRIGGER audit_down BEFORE INSERT ON audit_log WHEN NEW.entity IN (${entities.map(e => `'${e}'`).join(',')}) BEGIN SELECT RAISE(ABORT, 'test: audit log down'); END;`);
+      const ce = console.error; console.error = () => {};   // the expected 500s would log a stack
+      try { await fn(); } finally { console.error = ce; db.exec('DROP TRIGGER audit_down'); }
+    };
+    await auditDown(['settings'], async () => { assert.strictEqual((await call('PUT', 'settings', { work_days: 22 }, admin)).s, 500); });
+    assert.strictEqual((await call('GET', 'settings', null, admin)).j.work_days, 24, 'settings unchanged without the audit row');
+
     // lockout: 5 failures per username -> 429, even with the right password
     for (let i = 0; i < 5; i++) assert.strictEqual((await call('POST', 'login', { username: 'qs1', password: 'nope' })).s, 401);
     assert.strictEqual((await call('POST', 'login', { username: 'qs1', password: 'secret12' })).s, 429);

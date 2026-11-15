@@ -118,22 +118,29 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
       };
       if (idStr === undefined && method === 'POST') {
         const n = await clean(null);
-        const id = Number(db.prepare('INSERT INTO sections(name_ar,name_en,parent_id,default_rework_pct,sort) VALUES(?,?,?,?,?)').run(n.name_ar, n.name_en, n.parent_id, n.default_rework_pct, n.sort).lastInsertRowid);
-        audit(me, 'create', 'sections', id, n);
+        const id = tx(() => {
+          const sid = Number(db.prepare('INSERT INTO sections(name_ar,name_en,parent_id,default_rework_pct,sort) VALUES(?,?,?,?,?)').run(n.name_ar, n.name_en, n.parent_id, n.default_rework_pct, n.sort).lastInsertRowid);
+          audit(me, 'create', 'sections', sid, n);
+          return sid;
+        });
         return reply(res, 200, { id });
       }
       const sec = sectionRow(idOf(idStr));
       if (idStr !== undefined && !sec) bad('section not found', 404);
       if (sec && method === 'PUT') {
         const n = await clean(sec);
-        db.prepare('UPDATE sections SET name_ar=?, name_en=?, parent_id=?, default_rework_pct=?, sort=? WHERE id=?').run(n.name_ar, n.name_en, n.parent_id, n.default_rework_pct, n.sort, sec.id);
-        audit(me, 'update', 'sections', sec.id, { before: sec, after: n });
+        tx(() => {
+          db.prepare('UPDATE sections SET name_ar=?, name_en=?, parent_id=?, default_rework_pct=?, sort=? WHERE id=?').run(n.name_ar, n.name_en, n.parent_id, n.default_rework_pct, n.sort, sec.id);
+          audit(me, 'update', 'sections', sec.id, { before: sec, after: n });
+        });
         return reply(res, 200, sectionRow(sec.id));
       }
       if (sec && method === 'DELETE') {
         if (db.prepare('SELECT 1 FROM items WHERE section_id=?').get(sec.id) || db.prepare('SELECT 1 FROM sections WHERE parent_id=?').get(sec.id)) bad('section is not empty');
-        db.prepare('DELETE FROM sections WHERE id=?').run(sec.id);
-        audit(me, 'delete', 'sections', sec.id, sec);
+        tx(() => {
+          db.prepare('DELETE FROM sections WHERE id=?').run(sec.id);
+          audit(me, 'delete', 'sections', sec.id, sec);
+        });
         return reply(res, 200, { ok: 1 });
       }
       return false;
@@ -147,9 +154,9 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
       const id = tx(() => {
         const iid = Number(db.prepare('INSERT INTO items(code,section_id,unit,name_ar,name_en,current_version) VALUES(?,?,?,?,?,1)').run(head.code, head.section_id, head.unit, head.name_ar, head.name_en).lastInsertRowid);
         db.prepare('INSERT INTO item_versions(item_id,version,created,created_by,data) VALUES(?,1,?,?,?)').run(iid, new Date().toISOString(), me.username, JSON.stringify(data));
+        audit(me, 'create', 'items', iid, { ...head, version: 1 });
         return iid;
       });
-      audit(me, 'create', 'items', id, { ...head, version: 1 });
       return reply(res, 200, { id, version: 1 });
     }
     const item = itemRow(idOf(idStr));
@@ -162,8 +169,8 @@ CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, i
       tx(() => {
         db.prepare('UPDATE items SET code=?, section_id=?, unit=?, name_ar=?, name_en=?, current_version=? WHERE id=?').run(head.code, head.section_id, head.unit, head.name_ar, head.name_en, version, item.id);
         db.prepare('INSERT INTO item_versions(item_id,version,created,created_by,data) VALUES(?,?,?,?,?)').run(item.id, version, new Date().toISOString(), me.username, JSON.stringify(data));
+        audit(me, 'update', 'items', item.id, { before: { code: item.code, section_id: item.section_id, unit: item.unit, version: item.current_version }, after: { ...head, version } });
       });
-      audit(me, 'update', 'items', item.id, { before: { code: item.code, section_id: item.section_id, unit: item.unit, version: item.current_version }, after: { ...head, version } });
       return reply(res, 200, { id: item.id, version });
     }
     if (item && sub2 === 'versions' && parts.length === 4 && method === 'GET')

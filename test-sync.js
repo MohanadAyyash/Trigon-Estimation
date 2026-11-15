@@ -218,6 +218,36 @@ server.listen(0, async () => {
     assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM material_quotes WHERE material_id=?').get(mid).n, 0);
     const acts = (await call('GET', 'audit', null, admin)).j.filter(a => a.entity === 'materials' || a.entity === 'material_quotes' || a.entity === 'material_po_links').map(a => a.action + ':' + a.entity);
     for (const x of ['create:materials', 'update:materials', 'delete:materials', 'create:material_quotes', 'delete:material_quotes', 'create:material_po_links', 'delete:material_po_links']) assert.ok(acts.includes(x), 'audit ' + x);
+    // the audit row is written in the same transaction as the change: if it cannot be written, nothing changes
+    const auditDown = async (entities, fn) => {
+      db.exec(`CREATE TRIGGER audit_down BEFORE INSERT ON audit_log WHEN NEW.entity IN (${entities.map(e => `'${e}'`).join(',')}) BEGIN SELECT RAISE(ABORT, 'test: audit log down'); END;`);
+      const ce = console.error; console.error = () => {};   // the expected 500s would log a stack
+      try { await fn(); } finally { console.error = ce; db.exec('DROP TRIGGER audit_down'); }
+    };
+    const am = (await call('POST', 'costs/materials', { name_en: 'Test Audit Tile', unit: 'm2' }, qs)).j.id;
+    const al = (await call('POST', `costs/materials/${am}/links`, { description: 'Test tile', unit: 'm2' }, qs)).j.id;
+    const aq = (await call('POST', `costs/materials/${am}/quotes`, { date: '2026-10-01', supplier: 'Fake Supplier LLC', rate: 10 }, qs)).j.id;
+    const mcounts = () => ['materials', 'material_po_links', 'material_quotes'].map(tb => db.prepare(`SELECT COUNT(*) n FROM ${tb}`).get().n);
+    const mc0 = mcounts(), am0 = db.prepare('SELECT * FROM materials WHERE id=?').get(am);
+    await auditDown(['materials', 'material_po_links', 'material_quotes'], async () => {
+      assert.strictEqual((await call('POST', 'costs/materials', { name_en: 'Test Audit 2', unit: 'm' }, qs)).s, 500);
+      assert.strictEqual((await call('PUT', `costs/materials/${am}`, { name_en: 'Test renamed' }, qs)).s, 500);
+      assert.strictEqual((await call('POST', `costs/materials/${am}/links`, { description: 'Test tile 2', unit: 'm2' }, qs)).s, 500);
+      assert.strictEqual((await call('DELETE', `costs/materials/${am}/links/${al}`, null, qs)).s, 500);
+      assert.strictEqual((await call('POST', `costs/materials/${am}/quotes`, { date: '2026-10-02', supplier: 'Fake Supplier LLC', rate: 11 }, qs)).s, 500);
+      assert.strictEqual((await call('DELETE', `costs/materials/${am}/quotes/${aq}`, null, qs)).s, 500);
+      assert.strictEqual((await call('DELETE', `costs/materials/${am}`, null, qs)).s, 500);
+    });
+    assert.deepStrictEqual(mcounts(), mc0, 'no material/link/quote change without its audit row');
+    assert.deepStrictEqual(db.prepare('SELECT * FROM materials WHERE id=?').get(am), am0, 'material unchanged');
+    // a failed sync and its audit row are written together
+    {
+      const f0 = db.prepare('SELECT COUNT(*) n FROM snapshots WHERE ok=0').get().n;
+      await call('PUT', 'settings', { erp_db_path: path.join(dir, 'missing4.db') }, admin);
+      await auditDown(['snapshots'], async () => { await assert.rejects(ctx.costs.sync({ now: fixed }), /audit log down/); });
+      assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM snapshots WHERE ok=0').get().n, f0, 'no failed row without its audit row');
+      await call('PUT', 'settings', { erp_db_path: erpFile }, admin);
+    }
     console.log('sync ok'); process.exit(0);
   } catch (e) { console.error(e); process.exit(1); }
 });

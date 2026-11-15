@@ -180,8 +180,10 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
           }
           changed[key] = v;
         }
-        for (const key in changed) db.prepare('INSERT INTO cost_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(changed[key]));
-        audit(me, 'config', 'cost_config', null, changed);
+        tx(() => {
+          for (const key in changed) db.prepare('INSERT INTO cost_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(changed[key]));
+          audit(me, 'config', 'cost_config', null, changed);
+        });
         return reply(res, 200, getConfig());
       }
       return false;
@@ -195,8 +197,11 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
         const b = await readBody(req), name_en = text(b.name_en), name_ar = text(b.name_ar), unit = text(b.unit);
         if (!name_en && !name_ar) bad('a name is required');
         if (!unit) bad('unit is required');
-        const id = Number(db.prepare('INSERT INTO materials(code,name_ar,name_en,unit) VALUES(?,?,?,?)').run(text(b.code), name_ar, name_en, unit).lastInsertRowid);
-        audit(me, 'create', 'materials', id, { code: text(b.code), name_en, name_ar, unit });
+        const id = tx(() => {
+          const mid = Number(db.prepare('INSERT INTO materials(code,name_ar,name_en,unit) VALUES(?,?,?,?)').run(text(b.code), name_ar, name_en, unit).lastInsertRowid);
+          audit(me, 'create', 'materials', mid, { code: text(b.code), name_en, name_ar, unit });
+          return mid;
+        });
         return reply(res, 200, { id });
       }
       return false;
@@ -211,19 +216,19 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
         for (const f of ['code', 'name_ar', 'name_en', 'unit']) if (f in b) n[f] = text(b[f]);
         if (!n.name_en && !n.name_ar) bad('a name is required');
         if (!n.unit) bad('unit is required');
-        db.prepare('UPDATE materials SET code=?, name_ar=?, name_en=?, unit=? WHERE id=?').run(n.code, n.name_ar, n.name_en, n.unit, id);
-        audit(me, 'update', 'materials', id, { before: mat, after: n });
+        tx(() => {
+          db.prepare('UPDATE materials SET code=?, name_ar=?, name_en=?, unit=? WHERE id=?').run(n.code, n.name_ar, n.name_en, n.unit, id);
+          audit(me, 'update', 'materials', id, { before: mat, after: n });
+        });
         return reply(res, 200, matRow(id));
       }
       if (method === 'DELETE') {
-        db.exec('BEGIN');
-        try {
+        tx(() => {
           db.prepare('DELETE FROM material_po_links WHERE material_id=?').run(id);
           db.prepare('DELETE FROM material_quotes WHERE material_id=?').run(id);
           db.prepare('DELETE FROM materials WHERE id=?').run(id);
-          db.exec('COMMIT');
-        } catch (e) { db.exec('ROLLBACK'); throw e; }
-        audit(me, 'delete', 'materials', id, mat);
+          audit(me, 'delete', 'materials', id, mat);
+        });
         return reply(res, 200, { ok: 1 });
       }
       return false;
@@ -236,15 +241,20 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
         if (!d) bad('description is required');
         if (!u) bad('unit is required');
         if (db.prepare('SELECT 1 FROM material_po_links WHERE material_id=? AND description_norm=? AND unit=?').get(id, d, u)) bad('this link already exists');
-        const lid = Number(db.prepare('INSERT INTO material_po_links(material_id,description_norm,unit) VALUES(?,?,?)').run(id, d, u).lastInsertRowid);
-        audit(me, 'create', 'material_po_links', lid, { material_id: id, description_norm: d, unit: u });
+        const lid = tx(() => {
+          const r = Number(db.prepare('INSERT INTO material_po_links(material_id,description_norm,unit) VALUES(?,?,?)').run(id, d, u).lastInsertRowid);
+          audit(me, 'create', 'material_po_links', r, { material_id: id, description_norm: d, unit: u });
+          return r;
+        });
         return reply(res, 200, { id: lid });
       }
       if (idStr2 !== undefined && method === 'DELETE') {
         const row = /^\d+$/.test(idStr2) ? db.prepare('SELECT rowid AS id, * FROM material_po_links WHERE material_id=? AND rowid=?').get(id, Number(idStr2)) : null;
         if (!row) bad('link not found', 404);
-        db.prepare('DELETE FROM material_po_links WHERE rowid=?').run(row.id);
-        audit(me, 'delete', 'material_po_links', row.id, { material_id: id, description_norm: row.description_norm, unit: row.unit });
+        tx(() => {
+          db.prepare('DELETE FROM material_po_links WHERE rowid=?').run(row.id);
+          audit(me, 'delete', 'material_po_links', row.id, { material_id: id, description_norm: row.description_norm, unit: row.unit });
+        });
         return reply(res, 200, { ok: 1 });
       }
       return false;
@@ -256,15 +266,20 @@ CREATE TABLE IF NOT EXISTS cost_config(key TEXT PRIMARY KEY, value TEXT NOT NULL
         const b = await readBody(req), rate = num(b.rate), date = typeof b.date === 'string' ? b.date.trim() : '';
         if (dayMs(date) === null) bad('date must be a real date, YYYY-MM-DD');
         if (rate === null || !(rate > 0)) bad('rate must be a positive number');
-        const qid = Number(db.prepare('INSERT INTO material_quotes(material_id,date,supplier,rate,created_by) VALUES(?,?,?,?,?)').run(id, date, text(b.supplier), rate, me.username).lastInsertRowid);
-        audit(me, 'create', 'material_quotes', qid, { material_id: id, date, supplier: text(b.supplier), rate });
+        const qid = tx(() => {
+          const r = Number(db.prepare('INSERT INTO material_quotes(material_id,date,supplier,rate,created_by) VALUES(?,?,?,?,?)').run(id, date, text(b.supplier), rate, me.username).lastInsertRowid);
+          audit(me, 'create', 'material_quotes', r, { material_id: id, date, supplier: text(b.supplier), rate });
+          return r;
+        });
         return reply(res, 200, { id: qid });
       }
       if (idStr2 !== undefined && method === 'DELETE') {
         const row = /^\d+$/.test(idStr2) ? db.prepare('SELECT * FROM material_quotes WHERE material_id=? AND id=?').get(id, Number(idStr2)) : null;
         if (!row) bad('quote not found', 404);
-        db.prepare('DELETE FROM material_quotes WHERE id=?').run(row.id);
-        audit(me, 'delete', 'material_quotes', row.id, row);
+        tx(() => {
+          db.prepare('DELETE FROM material_quotes WHERE id=?').run(row.id);
+          audit(me, 'delete', 'material_quotes', row.id, row);
+        });
         return reply(res, 200, { ok: 1 });
       }
       return false;

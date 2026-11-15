@@ -157,8 +157,10 @@ async function api(req, res, url) {
         else v = String(v);
         changed[k] = v;
       }
-      for (const k in changed) setSetting(k, changed[k]);
-      audit(me, 'update', 'settings', null, changed);
+      tx(() => {
+        for (const k in changed) setSetting(k, changed[k]);
+        audit(me, 'update', 'settings', null, changed);
+      });
       return send(res, 200, getSettings());
     }
   }

@@ -153,6 +153,25 @@ server.listen(0, async () => {
     const m = await call('POST', 'library/items', { ...priv, code: 'T-005', parts: [{ kind: 'labour', crew: [{ trade: 'Nobody', count: 1 }], output_per_day: 8 }] }, qs);
     const mrow = (await call('GET', 'library/items', null, qs)).j.find(i => i.id === m.j.id);
     assert.strictEqual(mrow.unit, null); assert.deepStrictEqual(mrow.missing, ['trade:Nobody']);
+    // the audit row is written in the same transaction as the change: if it cannot be written, nothing changes
+    const auditDown = async (entities, fn) => {
+      db.exec(`CREATE TRIGGER audit_down BEFORE INSERT ON audit_log WHEN NEW.entity IN (${entities.map(e => `'${e}'`).join(',')}) BEGIN SELECT RAISE(ABORT, 'test: audit log down'); END;`);
+      const ce = console.error; console.error = () => {};   // the expected 500s would log a stack
+      try { await fn(); } finally { console.error = ce; db.exec('DROP TRIGGER audit_down'); }
+    };
+    const emptySec = (await call('POST', 'library/sections', { name_en: 'Test Empty Section', name_ar: 'قسم فارغ' }, qs)).j.id;
+    const counts = () => ['sections', 'items', 'item_versions'].map(tb => db.prepare(`SELECT COUNT(*) n FROM ${tb}`).get().n);
+    const c0 = counts(), asph0 = db.prepare('SELECT * FROM sections WHERE id=?').get(asphalt), itm0 = db.prepare('SELECT * FROM items WHERE id=?').get(p.j.id);
+    await auditDown(['sections', 'items'], async () => {
+      assert.strictEqual((await call('POST', 'library/sections', { name_en: 'Test Audit Section', name_ar: 'س' }, qs)).s, 500);
+      assert.strictEqual((await call('PUT', `library/sections/${asphalt}`, { default_rework_pct: 77 }, qs)).s, 500);
+      assert.strictEqual((await call('DELETE', `library/sections/${emptySec}`, null, qs)).s, 500);
+      assert.strictEqual((await call('POST', 'library/items', { ...priv, code: 'T-AUD' }, qs)).s, 500);
+      assert.strictEqual((await call('PUT', `library/items/${p.j.id}`, { name_en: 'Test changed' }, qs)).s, 500);
+    });
+    assert.deepStrictEqual(counts(), c0, 'no section/item/version written without its audit row');
+    assert.deepStrictEqual(db.prepare('SELECT * FROM sections WHERE id=?').get(asphalt), asph0, 'section unchanged');
+    assert.deepStrictEqual(db.prepare('SELECT * FROM items WHERE id=?').get(p.j.id), itm0, 'item unchanged');
     console.log('library ok'); process.exit(0);
   } catch (e) { console.error(e); process.exit(1); }
 });
