@@ -41,6 +41,8 @@ server.listen(0, async () => {
     assert.strictEqual((await call('PUT', 'settings', { work_days: 20 }, qs)).s, 403);
     const g = await call('GET', 'settings', null, qs);
     assert.strictEqual(g.s, 200); assert.strictEqual(g.j.work_days, 26);
+    assert.ok(!('erp_db_path' in g.j), 'the ERP server path is for the admin only');
+    assert.ok('erp_db_path' in (await call('GET', 'settings', null, admin)).j);
     assert.strictEqual((await call('GET', 'users', null, qs)).s, 403);
     assert.strictEqual((await call('GET', 'audit', null, qs)).s, 403);
     assert.strictEqual((await call('PUT', 'settings', { work_days: 24 }, admin)).s, 200);

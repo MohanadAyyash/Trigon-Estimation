@@ -146,7 +146,11 @@ async function api(req, res, url) {
     if (parts.length === 2 && method === 'PUT') return send(res, 200, await updateUser(req, parts[1], me));
   }
   if (a === 'settings') {
-    if (method === 'GET') return send(res, 200, getSettings());
+    if (method === 'GET') {
+      const s = getSettings();
+      if (me.role !== 'admin') delete s.erp_db_path;   // a server file path is for the admin only
+      return send(res, 200, s);
+    }
     if (method === 'PUT') {
       need(me, 'admin');
       const b = await readBody(req), changed = {};
