@@ -99,15 +99,18 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
 
   // ---- measured quantities (drawings.js) ---------------------------------------------------------------
   // A take-off row's qty = its take-off lines + its measurements. A measurement counts when its unit is the row's
-  // normalised unit or the mismatch was confirmed (uom_confirmed); any other one stops the write, never silently left out.
+  // normalised unit, or the row's unit is not recognised and it was confirmed (uom_confirmed) — all in one unit.
+  // Any other one stops the write: never silently left out, never m added into m2.
   const rowMeasurements = rowId => ctx.drawings ? ctx.drawings.rowMeasurements(rowId) : [];
   function recomputeTakeoffQty(rowId) {
     const row = db.prepare('SELECT * FROM tender_rows WHERE id=?').get(rowId);
     if (!row || row.source !== 'takeoff' || row.is_heading) return null;   // an imported row's qty is the client's: never changed
     const u = normUom(row.unit);
     let qty = takeoffQty(db.prepare('SELECT * FROM takeoff_lines WHERE row_id=?').all(row.id));
-    for (const m of rowMeasurements(row.id)) {
-      if (m.qty_unit !== u && !m.uom_confirmed) conflict(`measurement ${m.id} is in ${m.qty_unit} but the row is in ${row.unit}: relink or remove it`);
+    const ms = rowMeasurements(row.id);
+    if (new Set(ms.map(m => m.qty_unit)).size > 1) conflict(`the row's measurements are in different units: relink or remove them`);
+    for (const m of ms) {
+      if (!(m.qty_unit === u || (u === null && m.uom_confirmed))) conflict(`measurement ${m.id} is in ${m.qty_unit} but the row is in ${row.unit}: relink or remove it`);
       qty += m.qty;
     }
     if (!Number.isFinite(qty) || qty < 0) bad(`take-off total would be ${qty}: deductions exceed the measured quantity`);
@@ -623,21 +626,28 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     mustDraft(tenderRow(t.id));
 
     if (sub2 === undefined && method === 'PUT') {
-      const nr = { no: row.no, description: row.description, unit: row.unit, qty: row.qty, is_heading: row.is_heading, manual_unit: row.manual_unit };
-      for (const f of ['no', 'description', 'unit']) if (f in body) nr[f] = text(body[f]);
-      if ('qty' in body) {
-        if (row.source !== 'import') bad("a take-off row's qty comes from its lines");
-        const q = body.qty;
-        if (blankCell(q)) { nr.qty = null; nr.is_heading = 1; }
-        else { nr.qty = num(q); if (nr.qty === null || nr.qty < 0 || nr.qty > MAX) bad('qty must be a number ≥ 0'); nr.is_heading = 0; }
-      }
-      if ('manual_unit' in body) nr.manual_unit = nonNegField(body.manual_unit, 'manual_unit');
-      if (nr.is_heading && (nr.manual_unit !== null || db.prepare('SELECT 1 FROM row_links WHERE row_id=?').get(row.id))) bad('a heading row has no price: remove its links and manual unit first');
+      // built from the row as it is now (inside the tx): a line or measurement write may have committed while the
+      // body was being read, and its recomputed qty must never be overwritten with a stale one
       tx(() => {
-        // measurements were checked against the row's unit: it cannot change under them, nor the row become a heading
-        if ((nr.is_heading || normUom(nr.unit) !== normUom(row.unit)) && ctx.drawings && ctx.drawings.hasMeasurements(row.id)) conflict('the row has measurements: remove them before changing its unit or making it a heading');
-        db.prepare('UPDATE tender_rows SET no=?, description=?, unit=?, qty=?, is_heading=?, manual_unit=? WHERE id=?').run(nr.no, nr.description, nr.unit, nr.qty, nr.is_heading, nr.manual_unit, row.id);
-        audit(me, 'update', 'tender_rows', row.id, { tender_id: t.id, before: row, after: nr });
+        const cur = db.prepare('SELECT * FROM tender_rows WHERE id=?').get(row.id);
+        if (!cur) bad('row not found', 404);
+        const nr = { no: cur.no, description: cur.description, unit: cur.unit, qty: cur.qty, is_heading: cur.is_heading, manual_unit: cur.manual_unit };
+        for (const f of ['no', 'description', 'unit']) if (f in body) nr[f] = text(body[f]);
+        if ('qty' in body) {
+          if (cur.source !== 'import') bad("a take-off row's qty comes from its lines");
+          const q = body.qty;
+          if (blankCell(q)) { nr.qty = null; nr.is_heading = 1; }
+          else { nr.qty = num(q); if (nr.qty === null || nr.qty < 0 || nr.qty > MAX) bad('qty must be a number ≥ 0'); nr.is_heading = 0; }
+        }
+        if ('manual_unit' in body) nr.manual_unit = nonNegField(body.manual_unit, 'manual_unit');
+        if (nr.is_heading && (nr.manual_unit !== null || db.prepare('SELECT 1 FROM row_links WHERE row_id=?').get(cur.id))) bad('a heading row has no price: remove its links and manual unit first');
+        // measurements were checked against the row's unit: it cannot change under them (an unrecognised unit text
+        // not even in spelling, as the confirmation was for it), nor the row become a heading
+        const unitChanged = normUom(nr.unit) !== normUom(cur.unit) || (normUom(cur.unit) === null && nr.unit !== cur.unit);
+        if ((nr.is_heading || unitChanged) && ctx.drawings && ctx.drawings.hasMeasurements(cur.id)) conflict('the row has measurements: remove them before changing its unit or making it a heading');
+        db.prepare('UPDATE tender_rows SET no=?, description=?, unit=?, qty=?, is_heading=?, manual_unit=? WHERE id=?').run(nr.no, nr.description, nr.unit, nr.qty, nr.is_heading, nr.manual_unit, cur.id);
+        if (cur.source === 'takeoff' && !nr.is_heading) nr.qty = recomputeTakeoffQty(cur.id);   // lines + measurements, never the request's
+        audit(me, 'update', 'tender_rows', cur.id, { tender_id: t.id, before: cur, after: nr });
       });
       return reply(res, 200, db.prepare('SELECT * FROM tender_rows WHERE id=?').get(row.id));
     }

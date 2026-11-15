@@ -362,21 +362,33 @@ server.listen(0, async () => {
       near(del.row_qty, 2, 'delete returns the row qty'); near(await qtyOf(rM), 2, 'measurement removed');
       assert.ok(audits('measure_delete').length === 1);
       assert.strictEqual((await call('DELETE', `measurements/${m1.id}`, null, qs)).s, 404);
+      // role check before the lookup: a viewer gets 403 whether or not the id exists; GET is not served (405)
+      assert.strictEqual((await call('DELETE', `measurements/${m1.id}`, null, viewer)).s, 403);
+      assert.strictEqual((await call('DELETE', 'measurements/999999', null, viewer)).s, 403);
+      assert.strictEqual((await call('PUT', 'measurements/999999', { row_id: rM }, viewer)).s, 403);
+      assert.strictEqual((await call('GET', `measurements/${m1.id}`, null, qs)).s, 405);
 
-      // take-off row in m2: × width 0.5 → 2.5 m2; a length without width → 409 unit mismatch; confirm_uom saves it (audited)
+      // take-off row in m2: × width 0.5 → 2.5 m2; a length (m) on it → 400, and confirm_uom cannot override a known unit
       const m2 = await ok(measure({ row_id: rM2, ...kerb, width: 0.5 }), 'width');
       near(m2.qty, 2.5, 'KERB × 0.5'); assert.strictEqual(m2.qty_unit, 'm2'); near(await qtyOf(rM2), 2.5, 'row m2');
-      r = await measure({ row_id: rM2, tool: 'dxf_layer', layer: 'KERB', metric: 'closed_perimeter' });
-      assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'unit mismatch', row_unit: 'm2', qty_unit: 'm' });
+      for (const extra of [{}, { confirm_uom: true }]) {
+        r = await measure({ row_id: rM2, tool: 'dxf_layer', layer: 'KERB', metric: 'closed_perimeter', ...extra });
+        assert.strictEqual(r.s, 400, 'known unit mismatch ' + JSON.stringify(extra)); assert.deepStrictEqual(r.j, { error: 'unit mismatch — add width/depth', row_unit: 'm2', qty_unit: 'm' });
+      }
       near(await qtyOf(rM2), 2.5, 'refused: row qty unchanged');
-      const m3 = await ok(measure({ row_id: rM2, tool: 'dxf_layer', layer: 'KERB', metric: 'closed_perimeter', confirm_uom: true }), 'confirm_uom');
-      near(m3.qty, 4, 'perimeter'); assert.strictEqual(m3.qty_unit, 'm'); near(await qtyOf(rM2), 6.5, 'confirmed unit counts in the row qty');
+      assert.strictEqual(audits('measure_uom_confirmed').length, 0);
+      // a row unit normUom does not recognise: 409 unit mismatch unless confirm_uom (audited), then one unit only
+      const rU = await newRow('Kerb (odd unit)', 'lin.ft');
+      r = await measure({ row_id: rU, ...kerb });
+      assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'unit mismatch', row_unit: 'lin.ft', qty_unit: 'm' });
+      const m3 = await ok(measure({ row_id: rU, ...kerb, confirm_uom: true }), 'confirm_uom');
+      near(m3.qty, 5, 'KERB'); assert.strictEqual(m3.qty_unit, 'm'); near(await qtyOf(rU), 5, 'confirmed measurement counts');
       assert.strictEqual(audits('measure_uom_confirmed').length, 1);
       assert.strictEqual(db.prepare('SELECT uom_confirmed FROM measurements WHERE id=?').get(m3.id).uom_confirmed, 1);
-      // mixed units on one row are never added together in the measured view
-      const vM2 = (await rowsOf(T)).find(x => x.id === rM2);
-      assert.strictEqual(vM2.measured_qty, null); assert.strictEqual(vM2.measured_unit, null);
-      assert.deepStrictEqual(vM2.measured_units.map(u => u.unit), ['m', 'm2']);
+      r = await measure({ row_id: rU, tool: 'dxf_layer', layer: 'KERB', metric: 'closed_perimeter', width: 0.5, confirm_uom: true });
+      assert.strictEqual(r.s, 400, 'a second unit on the row'); assert.match(r.j.error, /one unit per row/);
+      near(await qtyOf(rU), 5, 'never m + m2');
+      assert.strictEqual((await call('PUT', `tenders/${T}/rows/${rU}`, { unit: 'lin. ft' }, qs)).s, 409, 'an unrecognised unit text cannot change under a confirmation');
 
       // imported row ASPHALT m2 (client qty 95): measuring never changes qty; measured 100 → diff 5.263 %
       const p0 = await ok(call('GET', `tenders/${T}/price`, null, qs), 'price before');
@@ -462,7 +474,7 @@ server.listen(0, async () => {
         { metric: 'count' }, { layer: 'NOPE' }, { tool: 'dxf_selection' }, { metric: 'volume' }, { extra: 1 }, { confirm_uom: 'yes' }])
         assert.strictEqual((await measure({ row_id: rM, ...kerb, ...bad })).s, 400, 'bad ' + JSON.stringify(bad));
       assert.strictEqual((await measure({ row_id: rNr, ...mh, block: 'NOPE' })).s, 400, 'unknown block');
-      assert.strictEqual((await measure({ row_id: rM2, ...kerb, width: 0.5, depth: 0.2, confirm_overlap: true })).s, 409, 'm3 on an m2 row → unit mismatch');
+      assert.strictEqual((await measure({ row_id: rM2, ...kerb, width: 0.5, depth: 0.2, confirm_overlap: true, confirm_uom: true })).s, 400, 'm3 on an m2 row → unit mismatch');
       assert.strictEqual(await qtyOf(rM), 2, 'refusals saved nothing');
 
       // a row with measurements: delete → 409; its unit cannot change; it cannot become a heading
@@ -483,17 +495,74 @@ server.listen(0, async () => {
       // relink: the same validation as create; both rows recomputed
       rows = await rowsOf(T);
       const asph2 = byDesc(rows, 'ASPHALT surfacing');
-      assert.strictEqual((await call('PUT', `measurements/${ma1.id}`, { row_id: rM }, qs)).s, 409, 'relink: unit mismatch');
+      for (const extra of [{}, { confirm_uom: true }]) {
+        r = await call('PUT', `measurements/${ma1.id}`, { row_id: rM, ...extra }, qs);
+        assert.strictEqual(r.s, 400, 'relink: known unit mismatch'); assert.strictEqual(r.j.error, 'unit mismatch — add width/depth');
+      }
+      assert.strictEqual(db.prepare('SELECT row_id FROM measurements WHERE id=?').get(ma1.id).row_id, null);
       assert.strictEqual((await call('PUT', `measurements/${ma1.id}`, { row_id: byDesc(rows, 'Mobilisation').id }, qs)).s, 400, 'relink: LS');
       assert.strictEqual((await call('PUT', `measurements/${ma1.id}`, { row_id: asph2.id }, viewer)).s, 403);
       await ok(call('PUT', `measurements/${ma1.id}`, { row_id: asph2.id }, qs), 'relink');
       assert.strictEqual((await rowsOf(T)).find(x => x.id === asph2.id).measure_diff, true);
       assert.strictEqual(audits('measure_relink').at(-1).row_id, asph2.id);
       // moving a take-off measurement recomputes both rows
-      await ok(call('PUT', `measurements/${m2.id}`, { row_id: rM, confirm_uom: true }, qs), 'move m2 → m row');
-      near(await qtyOf(rM2), 4, 'old row recomputed'); near(await qtyOf(rM), 4.5, 'new row recomputed');
+      const rM2b = await newRow('Kerb face 2', 'm2');
+      await ok(call('PUT', `measurements/${m2.id}`, { row_id: rM2b }, qs), 'move m2 → other m2 row');
+      near(await qtyOf(rM2), 0, 'old row recomputed'); near(await qtyOf(rM2b), 2.5, 'new row recomputed');
+      // overlap on relink: the same link already on the target row → 409; confirm_overlap moves it, audited
+      const dup = await ok(measure({ row_id: rM2, ...kerb, width: 0.5 }), 'same link on rM2');
+      const overBefore = audits('measure_overlap_confirmed').length;
+      r = await call('PUT', `measurements/${dup.id}`, { row_id: rM2b }, qs);
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'already measured on this row');
+      near(await qtyOf(rM2b), 2.5, 'refused relink: qty unchanged');
+      await ok(call('PUT', `measurements/${dup.id}`, { row_id: rM2b, confirm_overlap: true }, qs), 'relink confirm_overlap');
+      assert.strictEqual(audits('measure_overlap_confirmed').length, overBefore + 1);
+      assert.strictEqual(audits('measure_overlap_confirmed').at(-1).row_id, rM2b);
+      near(await qtyOf(rM2b), 5, 'confirmed overlap'); near(await qtyOf(rM2), 0, 'source row');
       await ok(call('PUT', `measurements/${m2.id}`, { row_id: rM2 }, qs), 'move back');
-      near(await qtyOf(rM2), 6.5, 'back'); near(await qtyOf(rM), 2, 'back');
+      near(await qtyOf(rM2), 2.5, 'back'); near(await qtyOf(rM2b), 2.5, 'back');
+      // a negative total through a measurement path → 400, rolled back (qty and link unchanged)
+      {
+        const rN = await newRow('Kerb net', 'm');
+        const mn = await ok(measure({ row_id: rN, ...kerb }), 'measure net');
+        const dl = await ok(call('POST', `tenders/${T}/rows/${rN}/lines`, { description: 'gap', l: 3, deduct: true }, qs), 'deduct line');
+        near(dl.row_qty, 2, '5 − 3');
+        r = await call('DELETE', `measurements/${mn.id}`, null, qs);
+        assert.strictEqual(r.s, 400); assert.match(r.j.error, /deductions exceed/);
+        r = await call('PUT', `measurements/${mn.id}`, { row_id: rM }, qs);
+        assert.strictEqual(r.s, 400, 'relink leaving −3'); assert.match(r.j.error, /deductions exceed/);
+        near(await qtyOf(rN), 2, 'rolled back'); near(await qtyOf(rM), 2, 'target unchanged');
+        assert.strictEqual(db.prepare('SELECT row_id FROM measurements WHERE id=?').get(mn.id).row_id, rN, 'measurement still present and linked');
+        // a take-off line DELETE goes through the same recompute: lines + measurements
+        near((await ok(call('DELETE', `tenders/${T}/rows/${rN}/lines/${dl.id}`, null, qs), 'line delete')).row_qty, 5, 'line delete keeps the measurement');
+        near(await qtyOf(rN), 5, 'line delete');
+        await ok(call('DELETE', `measurements/${mn.id}`, null, qs), 'tidy');
+        await ok(call('DELETE', `tenders/${T}/rows/${rN}`, null, qs), 'tidy row');
+      }
+      // a row PUT never writes back a stale qty: a measurement committed while its body was being read is kept
+      {
+        const port = server.address().port;
+        const slowPut = (u, body, ck, between) => new Promise((res2, rej) => {
+          const data = Buffer.from(JSON.stringify(body));
+          const q = http.request({ port, method: 'PUT', path: '/api/' + u, headers: { cookie: ck, 'Content-Type': 'application/json', 'Content-Length': data.length } }, rs => {
+            let b = ''; rs.on('data', c => b += c); rs.on('end', () => res2({ s: rs.statusCode, j: JSON.parse(b) }));
+          });
+          q.on('error', rej);
+          q.write(data.subarray(0, 5));   // the server has read the row and waits for the rest of the body
+          setTimeout(() => { try { between(); q.end(data.subarray(5)); } catch (e) { rej(e); } }, 200);
+        });
+        near(await qtyOf(rM), 2, 'line only');
+        let injected;
+        const pr = await slowPut(`tenders/${T}/rows/${rM}`, { description: 'Kerb renamed' }, qs, () => {
+          // what a measurement write does, committed in between
+          injected = Number(db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,metric,qty,qty_unit,created,created_by) VALUES(?,?,?,'dxf_layer','KERB','open_length',5,'m','x','qs1')").run(D, T, rM).lastInsertRowid);
+          db.prepare('UPDATE tender_rows SET qty=7 WHERE id=?').run(rM);
+        });
+        assert.strictEqual(pr.s, 200, JSON.stringify(pr.j));
+        assert.strictEqual(pr.j.description, 'Kerb renamed'); near(pr.j.qty, 7, 'qty not overwritten with the stale 2');
+        near(await qtyOf(rM), 7, 'lines + measurement');
+        near((await ok(call('DELETE', `measurements/${injected}`, null, qs), 'tidy')).row_qty, 2, 'tidy');
+      }
       // a second re-import leaves it unlinked for the revision below
       assert.strictEqual((await ok(call('POST', `tenders/${T}/import`, BOQ, qs), 're-import 2')).measurements_unlinked, 1);
 
@@ -550,8 +619,8 @@ server.listen(0, async () => {
       for (const o of oRows) assert.strictEqual(nRows.find(x => x.seq === o.seq).qty, o.qty, 'Rev row qty = original');
       // the Rev is a draft: its measurements work and recompute its own rows only
       const nM = nBySeq.get(seqOf.get(rM));
-      const del2 = await ok(call('DELETE', `measurements/${nm.find(x => x.row_id === nBySeq.get(seqOf.get(rM2)) && x.qty_unit === 'm').id}`, null, qs), 'rev delete');
-      near(del2.row_qty, 2.5, 'rev row recomputed'); near(await qtyOf(rM2), 6.5, 'original row untouched');
+      const del2 = await ok(call('DELETE', `measurements/${nm.find(x => x.row_id === nBySeq.get(seqOf.get(rU))).id}`, null, qs), 'rev delete');
+      near(del2.row_qty, 0, 'rev row recomputed'); near(await qtyOf(rU), 5, 'original row untouched');
       assert.ok(nM);
       assert.ok(audits('revise').at(-1).measurements_copied === before.length);
       // a drawing copied while it is still parsing gets its own parse in the Rev

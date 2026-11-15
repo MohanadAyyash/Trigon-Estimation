@@ -307,7 +307,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   };
   const rowIdOf = v => { if (!Number.isInteger(v) || v <= 0) bad('row_id must be a row id'); return v; };
   // a 409 whose body carries more than an error message
-  const conflictBody = body => { throw Object.assign(new Error(body.error), { status: 409, body }); };
+  const failBody = (status, body) => { throw Object.assign(new Error(body.error), { status, body }); };
+  const conflictBody = body => failBody(409, body);
   function cleanMeasure(b) {
     for (const k of Object.keys(b)) if (!MFIELDS.includes(k)) bad('unknown field: ' + k);
     const m = { row_id: rowIdOf(b.row_id), tool: b.tool, metric: b.metric };
@@ -335,7 +336,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     return m;
   }
   const summaryOf = m => ({ drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, layer: m.layer, ...(m.tool === 'dxf_blocks' ? { block: m.block, nested: !!m.nested } : {}), metric: m.metric, qty: m.qty, qty_unit: m.qty_unit });
-  // the row checks shared by create and relink; returns 1 when a unit mismatch was confirmed. Runs inside the tx.
+  // the row checks shared by create and relink. Runs inside the tx.
+  // Units: a known row unit must equal qty_unit (no override: m is never added into m2). Only a row whose unit text
+  // normUom does not recognise may take a measurement with confirm_uom (uom_confirmed = 1), and then in one unit only.
   function checkRow(me, m, sha, tenderId, selfId, confirmUom, confirmOverlap) {
     const row = db.prepare('SELECT * FROM tender_rows WHERE id=?').get(m.row_id);
     if (!row || row.tender_id !== tenderId) bad('row not found in this tender');
@@ -343,10 +346,12 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const ru = normUom(row.unit);
     if (ru === 'ls') bad('a lump-sum (LS) row cannot take measurements');
     let uomConfirmed = 0;
-    if (ru === null || ru !== m.qty_unit) {
+    if (ru === null) {
       if (!confirmUom) conflictBody({ error: 'unit mismatch', row_unit: row.unit, qty_unit: m.qty_unit });
+      const other = db.prepare('SELECT DISTINCT qty_unit u FROM measurements WHERE row_id=? AND id<>?').all(m.row_id, selfId).map(x => x.u).filter(u => u !== m.qty_unit);
+      if (other.length) failBody(400, { error: `the row already has measurements in ${other.join(', ')}: one unit per row`, row_unit: row.unit, qty_unit: m.qty_unit });
       uomConfirmed = 1;
-    }
+    } else if (ru !== m.qty_unit) failBody(400, { error: 'unit mismatch — add width/depth', row_unit: row.unit, qty_unit: m.qty_unit });
     // the same geometry already on this row: same file (sha256), tool, layer, block (top and nested both count the
     // top inserts, so nested is not part of the key) and metric
     const over = db.prepare(`SELECT m.id FROM measurements m JOIN drawings d ON d.id=m.drawing_id
@@ -403,11 +408,13 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
 
   async function measurementApi(req, res, parts, me) {
     const method = req.method;
+    if (method !== 'PUT' && method !== 'DELETE') bad('method not allowed', 405);
+    need(me, 'admin', 'qs');   // before the lookup: a viewer learns nothing about which ids exist
     const m = idOf(parts[1]) === null ? null : db.prepare('SELECT * FROM measurements WHERE id=?').get(idOf(parts[1]));
     if (!m) bad('measurement not found', 404);
     const t = tenderRow(m.tender_id);
     if (!t) bad('measurement not found', 404);
-    need(me, 'admin', 'qs'); mustDraft(t);
+    mustDraft(t);
     if (method === 'DELETE') {
       const out = tx(() => {
         mustDraft(tenderRow(t.id));
