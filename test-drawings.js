@@ -56,7 +56,7 @@ server.listen(0, async () => {
       const r = await call('GET', `drawings/${id}`, null, ck);
       assert.strictEqual(r.s, 200, JSON.stringify(r.j));
       if (r.j.status !== 'parsing') return r.j;
-      if (Date.now() - t0 > 10000) throw new Error('drawing ' + id + ' still parsing after 10 s');
+      if (Date.now() - t0 > WAIT_MS) throw new Error('drawing ' + id + ' still parsing after ' + WAIT_MS + ' ms');
       await new Promise(f => setTimeout(f, 50));
     }
   };
@@ -286,12 +286,12 @@ server.listen(0, async () => {
         const s = await call('GET', `drawings/${r.j.id}`, null, qs);
         if (s.j.status !== 'parsing') { assert.strictEqual(s.j.status, 'ready', s.j.error); break; }
         const a = performance.now(); const st = await call('GET', 'status', null, qs); const ms = performance.now() - a;
-        assert.strictEqual(st.s, 200); assert.ok(ms < 500, '/api/status took ' + Math.round(ms) + ' ms during a parse');
+        assert.strictEqual(st.s, 200); assert.ok(ms < LATENCY_MS, '/api/status took ' + Math.round(ms) + ' ms during a parse (cap ' + LATENCY_MS + ' ms)');
         observed++;
-        if (Date.now() - t0 > 30000) throw new Error('100k parse still running after 30 s');
+        if (Date.now() - t0 > 3 * WAIT_MS) throw new Error('100k parse still running after ' + 3 * WAIT_MS + ' ms');
       }
       assert.ok(observed > 0, 'no /api/status call overlapped the 100k parse');
-      console.log('responsiveness: ' + observed + ' /api/status call(s) answered < 500 ms during the parse');
+      console.log('responsiveness: ' + observed + ' /api/status call(s) answered < ' + LATENCY_MS + ' ms during the parse');
       await call('PUT', `drawings/${r.j.id}/units`, { units: 'm' }, qs);
       const bl = (await call('GET', `drawings/${r.j.id}/layers`, null, qs)).j;
       assert.strictEqual(bl.layers.reduce((s, l) => s + l.entities, 0), 100000);
@@ -722,7 +722,7 @@ server.listen(0, async () => {
         const { db } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
         const t0 = Date.now();
         const tick = () => { const r = db.prepare('SELECT status, suggested_units, error FROM drawings ORDER BY id').all();
-          if (r.every(x => x.status !== 'parsing') || Date.now() - t0 > 10000) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
+          if (r.every(x => x.status !== 'parsing') || Date.now() - t0 > ${WAIT_MS}) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
         tick();`], { env, encoding: 'utf8' });
       assert.strictEqual(b.status, 0, b.stderr);
       const rows = JSON.parse(b.stdout.trim());
@@ -746,7 +746,7 @@ server.listen(0, async () => {
         const { db } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
         const t0 = Date.now();
         const tick = () => { const r = db.prepare('SELECT status, error FROM drawings WHERE id=1').get();
-          if (r.status !== 'parsing' || Date.now() - t0 > 20000) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
+          if (r.status !== 'parsing' || Date.now() - t0 > ${2 * WAIT_MS}) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
         tick();`], { env: { ...process.env, DATA_DIR: dir3, DRAWINGS_PARSE_HEAP_MB: '16' }, encoding: 'utf8' });
       assert.strictEqual(e.status, 0, e.stderr);
       assert.deepStrictEqual(JSON.parse(e.stdout.trim()), { status: 'failed', error: 'drawing too large to parse — PURGE unused objects or split the drawing in AutoCAD, then save as DXF again' });
