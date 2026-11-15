@@ -392,4 +392,52 @@ near(abl.f[0].length, 40 + 28);
 // a spike back along the previous edge (adjacent edges) is not this check's business; non-collinear shapes still measure
 near(fl(ents(lwp('NC', [[0, 0], [10, 0], [10, 10], [5, 6], [0, 10]], true)))[0].area, 80);
 
+// ---- Task 3: layer summary ----
+const { layerTable } = require('./lib/dxf/summary.js');
+const { performance } = require('perf_hooks');
+const sumOf = (pairs, unit) => { const d = parseDxf(dxf(pairs)); return layerTable(flatten(d), d.layers, unit); };
+const byL = (t, n) => t.layers.find(l => l.layer === n);
+const sumEnts = [...lwp('K1', sq(0, 0, 1000), true, 'KERB'), ...line('K2', 'KERB', 0, 0, 3000, 4000), ...hatch('A1', [hpoly(sq(0, 0, 10000))], 0, 'ASPHALT'),
+  ...insert('M1', 'MH1', 'MH'), ...insert('M2', 'MH1', 'MH'), ...lwp('E1', sq(0, 0, 1), true, 'EMPTY')];
+const sumDoc = [...sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]), ...tables([layerRec('KERB'), layerRec('ASPHALT'), layerRec('MH'), layerRec('UNUSED', -7, 1), layerRec('أسفلت')]), ...ents(sumEnts)];
+const stT = sumOf(sumDoc, 'mm');
+near(byL(stT, 'KERB').open_length, 5); near(byL(stT, 'KERB').closed_perimeter, 4); near(byL(stT, 'KERB').area, 1);
+near(byL(stT, 'ASPHALT').area, 100); assert.strictEqual(byL(stT, 'ASPHALT').closed_perimeter, 0); // R3
+assert.deepStrictEqual(byL(stT, 'MH').blocks, [{ name: 'MH1', top: 2, nested: 0 }]);
+assert.deepStrictEqual(stT.warnings, []);
+const unT = byL(stT, 'UNUSED'); assert.deepStrictEqual([unT.off, unT.frozen, unT.open_length, unT.area, unT.entities, unT.blocks], [true, true, 0, 0, 0, []]);
+assert.ok(byL(stT, 'أسفلت')); assert.strictEqual(byL(stT, 'EMPTY').area, 1e-6);
+assert.deepStrictEqual(stT.layers.map(l => l.layer), [...stT.layers.map(l => l.layer)].sort((a, b) => (a < b ? -1 : 1)));
+const nuT = sumOf(sumDoc, null);
+assert.strictEqual(byL(nuT, 'KERB').open_length, null); assert.strictEqual(byL(nuT, 'KERB').area, null); assert.strictEqual(byL(nuT, 'MH').blocks, null); assert.deepStrictEqual(nuT.warnings, []);
+// duplicates: counted, warned, never merged
+const dupT = sumOf([...ents([...line('D1', 'KERB', 0, 0, 3, 4), ...line('D2', 'KERB', 3, 4, 0, 0), ...line('D3', 'KERB', 1, 1, 2, 2), ...line('D4', 'OTHER', 0, 0, 3, 4)])], 'm');
+near(byL(dupT, 'KERB').open_length, 10 + Math.SQRT2); assert.deepStrictEqual(dupT.warnings, [{ code: 'possible_duplicate', detail: { layer: 'KERB', count: 1 } }]);
+const hdT = sumOf(ents([...lwp('P1', sq(0, 0, 10), true, 'X'), ...hatch('P2', [hpoly(sq(0, 0, 10))], 0, 'X')]), 'm');
+near(byL(hdT, 'X').area, 200); near(byL(hdT, 'X').closed_perimeter, 40); assert.strictEqual(hdT.warnings[0].detail.count, 1);
+// null areas are skipped and counted, not zero
+const bowT = sumOf(ents([...lwp('B1', [[0, 0], [10, 10], [10, 0], [0, 10]], true, 'X'), ...lwp('B2', sq(0, 0, 2), true, 'X')]), 'm');
+near(byL(bowT, 'X').area, 4); assert.strictEqual(byL(bowT, 'X').area_excluded, 1);
+// nested blocks stay separate from top-level; unit factors: ft squared
+const nestT = sumOf([...sec('BLOCKS', [[0, 'BLOCK'], [2, 'IN'], [70, 0], [10, 0], [20, 0], [0, 'LINE'], [5, 'L1'], [8, '0'], [10, 0], [20, 0], [11, 10], [21, 0], [0, 'ENDBLK'],
+  [0, 'BLOCK'], [2, 'OUT'], [70, 0], [10, 0], [20, 0], [0, 'INSERT'], [5, 'N1'], [8, '0'], [2, 'IN'], [10, 0], [20, 0], [0, 'ENDBLK']]), ...ents([...insert('O1', 'OUT', 'B'), ...insert('O2', 'IN', 'B'), ...lwp('F', sq(0, 0, 10), true, 'B')])], 'ft');
+assert.deepStrictEqual(byL(nestT, 'B').blocks, [{ name: 'IN', top: 1, nested: 1 }, { name: 'OUT', top: 1, nested: 0 }]);
+near(byL(nestT, 'B').area, 100 * 0.3048 * 0.3048); near(byL(nestT, 'B').open_length, 20 * 0.3048);
+// performance: 100,000 LINEs over 20 layers
+{
+  const parts = ['0\nSECTION\n2\nENTITIES'];
+  for (let i = 0; i < 100000; i++) parts.push('0\nLINE\n5\nH' + i + '\n8\nL' + (i % 20) + '\n10\n' + i + '\n20\n0\n30\n0\n11\n' + (i + 3) + '\n21\n4\n31\n0');
+  parts.push('0\nENDSEC\n0\nEOF\n');
+  const text = parts.join('\n');
+  const t0 = performance.now();
+  const d = parseDxf(text); const t = layerTable(flatten(d), d.layers, 'm');
+  const ms = performance.now() - t0;
+  console.log('perf 100k LINEs parse+flatten+layerTable ms:', Math.round(ms));
+  assert.ok(ms < 15000, 'perf ' + ms);
+  assert.strictEqual(t.layers.length, 21); assert.strictEqual(t.layers.find(l => l.layer === '0').entities, 0); // parseDxf always lists layer 0 assert.deepStrictEqual(t.warnings, []);
+  assert.strictEqual(t.layers.reduce((a, l) => a + l.entities, 0), 100000);
+  assert.strictEqual(t.layers.reduce((a, l) => a + l.open_length, 0), 500000);
+  for (const l of t.layers.filter(l => l.layer !== '0')) assert.strictEqual(l.open_length, 25000);
+}
+
 console.log('ok test-dxf');
