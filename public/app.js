@@ -372,7 +372,7 @@
   const colName = i => { let s = ''; for (let n = i + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s; return s; };
   // measured vs client qty of a row (spec: a measurement never changes an imported row's qty). Mixed units are
   // never added together: shown as "mixed units" with each unit in the tooltip.
-  const diffTxt = v => iso((v > 0 ? '+' : '') + v.toFixed(1) + ' %');
+  const diffTxt = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');
   function measuredCell(r) {
     if (r.is_heading) return null;
     const units = r.measured_units || [], out = [];
@@ -385,7 +385,7 @@
     return out;
   }
 
-  async function tabQuantities(body, { T, id, editable }) {
+  async function tabQuantities(body, { T, id, editable, focusId }) {
     const rows = await api('GET', `tenders/${id}/rows`);
     if (editable) body.append(importPanel(id, rows.some(r => r.source === 'import')));
 
@@ -399,7 +399,7 @@
             try { await api('PUT', `tenders/${id}/rows/${r.id}`, { qty: q.value }); rerender(); } catch (e) { fail(e); }
           } }, t('save')));
         })() : h('span', { class: 'num' }, fmtQ(r.qty));
-      tb.push(h('tr', { id: 'row-' + r.id, class: r.is_heading ? 'heading' : null },
+      tb.push(h('tr', { id: 'row-' + r.id, class: [r.is_heading ? 'heading' : '', r.id === focusId ? 'focus' : ''].join(' ').trim() || null },
         h('td', null, r.no || ''), h('td', { class: 'desc' }, r.description || ''), h('td', null, r.unit || ''), h('td', { class: 'num qty' }, qtyCell),
         h('td', { class: 'num measured' }, measuredCell(r)), h('td', null, isTake ? t('src_takeoff') : t('src_import')),
         h('td', null, editable ? h('button', { class: 'small danger', onclick: async () => {
@@ -499,19 +499,26 @@
   const rowText = r => [r.no, r.description].filter(Boolean).join(' — ') || '#' + r.id;
   const rowOpts = rows => [['', t('lk_choose_row')], ...rows.filter(r => !r.is_heading).map(r => [String(r.id), rowText(r) + ' (' + (r.unit || '—') + ') · ' + (r.source === 'takeoff' ? t('src_takeoff') : t('src_import'))])];
 
-  // a drawing being parsed: ask again with backoff (0.3 s doubling, at most 3 s) while the same page is shown
+  // a drawing being parsed: ask again with backoff (0.3 s doubling, at most 3 s; after a failed request at most 10 s)
+  // while the same page is shown. Stops only when the page changes.
   function watchParse(did, onDone) {
     const tok = routeTok;
     let delay = 300;
     const tick = async () => {
       if (tok !== routeTok) return;
       let d;
-      try { d = await api('GET', 'drawings/' + did); } catch (e) { if (tok === routeTok) fail(e); return; }
+      try { d = await api('GET', 'drawings/' + did); } catch (e) { delay = Math.min(delay * 2, 10000); setTimeout(tick, delay); return; }
       if (tok !== routeTok) return;
       if (d.status === 'parsing') { delay = Math.min(delay * 2, 3000); setTimeout(tick, delay); return; }
-      onDone(d);
+      whenFormsFree(tok, () => onDone(d));
     };
     setTimeout(tick, delay);
+  }
+  // a finished parse never wipes what the user is typing: wait while a link form is open or a relink row is chosen
+  const formsBusy = () => !!document.getElementById('lk-form') || [...document.querySelectorAll('select.rl-row')].some(x => x.value);
+  function whenFormsFree(tok, fn) {
+    if (tok !== routeTok) return;
+    if (formsBusy()) setTimeout(() => whenFormsFree(tok, fn), 1000); else fn();
   }
 
   function uploadPanel(id) {
@@ -629,6 +636,12 @@
     else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
     if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
   }
+  // width / depth / factor: plain digits with a dot only. "1,5" is refused, never read as 15 (or 1.5).
+  const strictNum = (s, label) => {
+    const x = String(s).trim();
+    if (/^[-+]?(\d+\.?\d*|\.\d+)$/.test(x)) return Number(x);
+    throw new Error(t('lk_bad_number', { field: label, v: x }));
+  };
   // confirm checkboxes that stay once shown (a second refusal can follow the first)
   function confirmBoxes(prefix) {
     const boxes = {}, el = h('div');
@@ -637,7 +650,9 @@
       return true;
     };
     const flags = () => Object.fromEntries(Object.entries(boxes).filter(([, cb]) => cb.checked).map(([k]) => [k, true]));
-    return { el, add, flags };
+    // a confirmation belongs to the row and numbers it was given for: any change drops it
+    const reset = () => { for (const k of Object.keys(boxes)) delete boxes[k]; el.replaceChildren(); };
+    return { el, add, flags, reset };
   }
 
   function linkForm(target, rows, close) {
@@ -647,14 +662,19 @@
     const fac = inp('lk-factor', '', { class: 'w-num', inputmode: 'decimal', placeholder: '1' }), label = inp('lk-label', '', { maxlength: 200 });
     const nested = count && target.has_nested ? h('input', { type: 'checkbox', id: 'lk-nested' }) : null;
     const msg = h('div', { id: 'lk-msg' }), cb = confirmBoxes('lk-');
+    const clear = () => { cb.reset(); msg.replaceChildren(); };
+    rowSel.addEventListener('change', clear);
+    for (const x of [w, dp, fac]) if (x) x.addEventListener('input', clear);
     const what = target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
       : [h('span', { dir: 'auto' }, target.layer), ' — ' + metricLabel(target.metric)];
     const save = h('button', { id: 'lk-save', onclick: async () => {
       const b = { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, layer: target.layer, metric: target.metric, ...cb.flags() };
       if (target.tool === 'dxf_blocks') { b.block = target.block; if (nested) b.nested = nested.checked; }
-      if (w && !blank(w.value)) b.width = pnum(w.value);
-      if (dp && !blank(dp.value)) b.depth = pnum(dp.value);
-      if (!blank(fac.value)) b.factor = pnum(fac.value);
+      try {
+        if (w && !blank(w.value)) b.width = strictNum(w.value, t('width'));
+        if (dp && !blank(dp.value)) b.depth = strictNum(dp.value, t('depth'));
+        if (!blank(fac.value)) b.factor = strictNum(fac.value, t('lk_factor'));
+      } catch (e) { msg.replaceChildren(h('p', { class: 'err' }, e.message)); return; }
       if (!blank(label.value)) b.label = label.value.trim();
       save.disabled = true;
       try { await api('POST', `drawings/${target.drawing_id}/measurements`, b); flash(t('saved'), 'ok'); rerender(); }
@@ -679,7 +699,8 @@
     } }, t('delete')) : null;
     const relink = m => {
       if (!editable) return null;
-      const rs = sel('', '', rowOpts(rows), { class: 'w-item' }), msg = h('div'), cb = confirmBoxes('rl-' + m.id + '-');
+      const rs = sel('', '', rowOpts(rows), { class: 'w-item rl-row' }), msg = h('div'), cb = confirmBoxes('rl-' + m.id + '-');
+      rs.addEventListener('change', () => { cb.reset(); msg.replaceChildren(); });
       const go = h('button', { class: 'small', onclick: async () => {
         go.disabled = true;
         try { await api('PUT', 'measurements/' + m.id, { row_id: rs.value ? Number(rs.value) : null, ...cb.flags() }); rerender(); }

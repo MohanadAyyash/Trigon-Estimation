@@ -190,24 +190,31 @@ server.listen(0, async () => {
 
     // ---- Drawings tab: upload a DXF, confirm units, link layers to rows, measured vs client qty ----------------
     // fixture (mm): KERB = one 3000×4000 line (5 m open length in plan; its Z differs → z_ignored); أسفلت = a 10 m square (100 m2);
-    // MH = three MH1 inserts, two at the same point (a possible duplicate)
+    // MH = three MH1 inserts, two at the same point (a possible duplicate); CURVE = a SPLINE (approximated);
+    // BOW = a 2 m square (4 m2) and a self-intersecting bowtie (excluded from the area)
     const dxf = pairs => [...pairs, [0, 'EOF']].map(([c, v]) => c + '\n' + v).join('\n') + '\n';
     const dsec = (name, pairs) => [[0, 'SECTION'], [2, name], ...pairs, [0, 'ENDSEC']];
     const layerRec = name => [[0, 'LAYER'], [2, name], [70, 0], [62, 7], [6, 'CONTINUOUS']];
     const lwp = (hd, pts, layer) => [[0, 'LWPOLYLINE'], [5, hd], [8, layer], [90, pts.length], [70, 1], ...pts.flatMap(([x, y]) => [[10, x], [20, y]])];
     const ins = (hd, x) => [[0, 'INSERT'], [5, hd], [8, 'MH'], [2, 'MH1'], [10, x], [20, 0]];
     const FIX = dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
-      ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 3], ...layerRec('KERB'), ...layerRec('MH'), ...layerRec('أسفلت'), [0, 'ENDTAB']]),
+      ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 5], ...layerRec('KERB'), ...layerRec('MH'), ...layerRec('أسفلت'), ...layerRec('CURVE'), ...layerRec('BOW'), [0, 'ENDTAB']]),
       ...dsec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
       ...dsec('ENTITIES', [[0, 'LINE'], [5, 'K1'], [8, 'KERB'], [10, 0], [20, 0], [30, 0], [11, 3000], [21, 4000], [31, 500],
         ...lwp('A1', [[0, 0], [10000, 0], [10000, 10000], [0, 10000]], 'أسفلت'), ...ins('M1', 0), ...ins('M2', 5000), ...ins('M3', 0),
+        ...lwp('B1', [[20000, 0], [22000, 0], [22000, 2000], [20000, 2000]], 'BOW'), ...lwp('B2', [[0, 20000], [1000, 21000], [1000, 20000], [0, 21000]], 'BOW'),
+        [0, 'SPLINE'], [5, 'S1'], [8, 'CURVE'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3000], [20, 4000],
         [0, 'XLINE'], [5, 'X1'], [8, 'KERB']])]);
     const { writeXlsx } = require('./lib/xlsx.js');
     const dwg = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Drawings' }, admin), 'drawings tender')).id;
-    await ok(call('POST', `tenders/${dwg}/import`, { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Test asphalt', 'm2', 95]] }]).toString('base64'),
+    await ok(call('POST', `tenders/${dwg}/import`, { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Test asphalt', 'm2', 95], ['3', 'Test legacy row', 'm2', 10]] }]).toString('base64'),
       sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } }, admin), 'import');
     const kerbRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '2', description: 'Test kerb', unit: 'm' }, admin), 'kerb row')).id;
-    const asphRow = (await call('GET', `tenders/${dwg}/rows`, null, admin)).j.find(r => r.description === 'Test asphalt').id;
+    const kerbRowB = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '4', description: 'Test kerb B', unit: 'm' }, admin), 'kerb row B')).id;
+    const bowRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '5', description: 'Test bow', unit: 'm2' }, admin), 'bow row')).id;
+    const imported = (await call('GET', `tenders/${dwg}/rows`, null, admin)).j;
+    const asphRow = imported.find(r => r.description === 'Test asphalt').id, legacyRow = imported.find(r => r.description === 'Test legacy row').id;
+    const mCount = async () => { const j = (await call('GET', `tenders/${dwg}/measurements`, null, admin)).j; return j.measurements.length + j.unlinked.length; };
     const D = `#drawings[data-tender="${dwg}"]`;
     await page.goto(`${origin}/#/tender/${dwg}/drawings`);
     await page.waitForSelector(D + ' #dw-upload');
@@ -227,7 +234,9 @@ server.listen(0, async () => {
     assert.ok((await page.textContent(D + ' tr[data-layer="KERB"] td.m-open_length')).includes('5.00'), 'KERB open length 5.00 m');
     assert.strictEqual((await page.textContent(D + ' tr[data-layer="أسفلت"] td.layer-name')).trim(), 'أسفلت', 'Arabic layer name unchanged');
     assert.ok((await page.textContent(D + ' tr[data-layer="MH"] td.m-blocks')).includes('MH1: 3 / 0'), 'block counts top / nested');
-    assert.ok((await page.textContent(D + ' tr[data-layer="MH"] td.notes')).includes('MH1: 1 possible duplicate copies'), 'duplicate warning next to its layer');
+    assert.ok((await page.textContent(D + ' tr[data-layer="MH"] td.notes')).includes('MH1: possible duplicates: 1 (counted in the total)'), 'duplicate warning next to its layer');
+    assert.ok((await page.textContent(D + ' tr[data-layer="CURVE"] td.notes')).includes('approximated curves: 1'), 'approx tag next to its layer');
+    assert.ok((await page.textContent(D + ' tr[data-layer="BOW"] td.notes')).includes('shapes excluded from area: 1'), 'area_excluded tag next to its layer');
     assert.ok((await page.textContent(D + ' #dw-warnings li[data-code="z_ignored"]')).includes('Height (Z) differences ignored'), 'drawing warning in plain words');
 
     // link KERB open length to the take-off row (m)
@@ -244,35 +253,68 @@ server.listen(0, async () => {
     await page.waitForSelector(D + ' #lk-confirm-overlap');
     assert.ok((await page.textContent(D + ' #lk-msg')).includes('already measured on this row'), 'overlap message shown');
     assert.strictEqual(await page.$(D + ' #lk-confirm-uom'), null, 'no unit checkbox for an overlap');
+    // a tick belongs to the row it was given for: switching the row clears it, and row B (also measured) gets its own 409
+    const dId = (await call('GET', `tenders/${dwg}/drawings`, null, admin)).j[0].id;
+    await ok(call('POST', `drawings/${dId}/measurements`, { row_id: kerbRowB, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length' }, admin), 'KERB on row B');
+    await page.check('#lk-confirm-overlap');
+    await page.selectOption('#lk-row', String(kerbRowB));
+    assert.strictEqual(await page.$(D + ' #lk-confirm-overlap'), null, 'row change clears the confirmation');
+    assert.strictEqual((await page.textContent(D + ' #lk-msg')).trim(), '', 'row change clears the server message');
+    await page.click('#lk-save');
+    await page.waitForSelector(D + ' #lk-confirm-overlap');
+    assert.strictEqual(await page.isChecked('#lk-confirm-overlap'), false, 'fresh, unticked confirmation for row B');
+    assert.strictEqual(await mCount(), 2, 'nothing saved without a confirmation for row B');
     // a known unit mismatch (m into m2): message and the width/depth hint, no checkbox
     await page.selectOption('#lk-row', String(asphRow));
     await page.click('#lk-save');
     await page.waitForFunction(() => (document.querySelector('#lk-msg') || {}).textContent.includes('unit mismatch'));
     assert.ok(await page.$(D + ' #lk-hint-width'), 'width/depth hint for a unit mismatch');
     assert.strictEqual(await page.$(D + ' #lk-confirm-uom'), null, 'no override for known units');
+    // a comma in a width is refused here, never read as 15
+    await page.fill('#lk-width', '1,5');
+    await page.click('#lk-save');
+    await page.waitForFunction(() => (document.querySelector('#lk-msg') || {}).textContent.includes('is not a number'));
+    assert.ok((await page.textContent(D + ' #lk-msg')).includes('1,5'), 'the typed value is quoted');
+    assert.strictEqual(await mCount(), 2, 'nothing sent for "1,5"');
     await page.click('#lk-cancel');
-    // the browser logs the two refusals asked for above (409 overlap, 400 unit mismatch); nothing else may be logged
-    for (const code of ['409 (Conflict)', '400 (Bad Request)']) {
+    // an incomplete layer total (the bowtie has no area): 409 with its confirm box; ticked → saved and flagged
+    await linkTo('BOW', 'area', bowRow);
+    await page.waitForSelector(D + ' #lk-confirm-incomplete');
+    assert.ok((await page.textContent(D + ' #lk-msg')).includes('layer quantity is incomplete'), 'incomplete message shown');
+    await page.check('#lk-confirm-incomplete');
+    await page.click('#lk-save');
+    await page.waitForSelector(`${D} #dw-measurements tr[data-row="${bowRow}"]`);
+    assert.ok((await page.textContent(`${D} #dw-measurements tr[data-row="${bowRow}"]`)).includes('incomplete'), 'incomplete flag in the measurement list');
+    // the browser logs the refusals asked for above (3 × 409, 400 unit mismatch); nothing else may be logged
+    for (const code of ['409 (Conflict)', '409 (Conflict)', '409 (Conflict)', '400 (Bad Request)']) {
       const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes(code));
       assert.ok(i >= 0, 'expected refusal logged: ' + code); errors.splice(i, 1);
     }
     // the Arabic asphalt layer's area → the imported m2 row (100 vs client 95: +5.26 %)
     await linkTo('أسفلت', 'area', asphRow);
     await page.waitForSelector(`${D} #dw-measurements tr[data-row="${asphRow}"]`);
-    assert.strictEqual((await call('GET', `tenders/${dwg}/measurements`, null, admin)).j.measurements.length, 2, 'two measurements saved');
+    assert.strictEqual((await call('GET', `tenders/${dwg}/measurements`, null, admin)).j.measurements.length, 4, 'four measurements saved');
     if (process.env.DRAWINGS_SCREENSHOT) await page.screenshot({ path: process.env.DRAWINGS_SCREENSHOT, fullPage: true });
+    // legacy data (before the one-unit rule): a row measured in two units is shown as mixed, never summed
+    const legacy = db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,metric,qty,qty_unit,created) VALUES(?,?,?,'dxf_layer','KERB',?,?,?,?)");
+    legacy.run(dId, dwg, legacyRow, 'area', 3, 'm2', new Date().toISOString()); legacy.run(dId, dwg, legacyRow, 'open_length', 2, 'm', new Date().toISOString());
 
     // Quantities: the take-off row qty is the measurement; the imported row keeps 95 and shows measured 100 with a warning badge
     await page.click('#tab-quantities'); await page.waitForSelector('#tab-body-quantities');
     assert.strictEqual(Number((await page.textContent(`#row-${kerbRow} td.qty`)).trim()), 5, 'take-off row qty 5 from the drawing');
     const mtxt = await page.textContent(`#row-${asphRow} td.measured`);
-    assert.ok(mtxt.includes('100') && mtxt.includes('+5.3 %'), 'measured qty and diff on the imported row: ' + mtxt);
+    assert.ok(mtxt.includes('100') && mtxt.includes('+5.26 %'), 'measured qty and diff on the imported row: ' + mtxt);
     assert.ok(await page.$(`#row-${asphRow} td.measured .tag.bad`), 'diff above 5 % in the warning colour');
+    assert.ok((await page.textContent(`#row-${bowRow} td.measured`)).includes('incomplete'), 'measured_incomplete badge');
+    const lg = await page.textContent(`#row-${legacyRow} td.measured`);
+    assert.ok(lg.includes('mixed units') && !/\b5\b/.test(lg), 'mixed units, not a sum: ' + lg);
     assert.ok((await page.textContent(`#row-${asphRow} td.qty`)).includes('95') || await page.inputValue(`#row-${asphRow} td.qty input`) === '95', 'client qty unchanged');
     // Summary lists the measure warning (not blocking)
     await page.click('#tab-summary'); await page.waitForSelector(`#summary[data-tender="${dwg}"]`);
     const mw = await page.textContent('#measure-warnings');
-    assert.ok(mw.includes('Test asphalt') && mw.includes('+5.3 %'), 'measure warning listed: ' + mw);
+    assert.ok(mw.includes('Test asphalt') && mw.includes('+5.26 %'), 'measure warning listed: ' + mw);
+    await page.click('#measure-warnings a');
+    await page.waitForSelector(`#tab-body-quantities #row-${asphRow}.focus`);
 
     // delete a measurement from the list → the row qty goes back to 0
     await page.click('#tab-drawings'); await page.waitForSelector(`${D} #dw-measurements tr[data-row="${kerbRow}"]`);
