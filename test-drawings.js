@@ -908,6 +908,208 @@ server.listen(0, async () => {
         assert.strictEqual(fin.status, 'ready', fin.error); assert.strictEqual(fin.suggested_units, 'mm'); assert.strictEqual(fin.sha256, sha);
         assert.strictEqual(db.prepare('SELECT status FROM drawings WHERE id=?').get(px).status, 'parsing', 'the original row is not touched by the copy');
       }
+
+      // ---- batch 2 Task 3: a selection of DXF entities (by handle) measured and linked to a row ----------------
+      {
+        const TS = (await ok(call('POST', 'tenders', info, qs), 'selection tender')).id;
+        const rowS = async (description, unit) => (await ok(call('POST', `tenders/${TS}/rows`, { description, unit }, qs), 'row ' + description)).id;
+        const qtyS = async id => (await ok(call('GET', `tenders/${TS}/rows`, null, viewer), 'rows')).find(x => x.id === id).qty;
+        const nMeas = () => db.prepare('SELECT COUNT(*) n FROM measurements WHERE tender_id=?').get(TS).n;
+        const handlesOf = id => db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=? ORDER BY rowid').all(id).map(x => x.handle);
+        const us = await upload(TS, 'Selection plan', Buffer.from(FIX5), qs);
+        assert.strictEqual(us.s, 202);
+        const DS = us.j.id;
+        assert.strictEqual((await waitDone(DS, qs)).status, 'ready');
+        const sel = (b, ck = qs, did = DS) => call('POST', `drawings/${did}/measurements`, { tool: 'dxf_selection', ...b }, ck);
+        const lay = b => call('POST', `drawings/${DS}/measurements`, b, qs);
+        const rK = await rowS('Kerb (selection)', 'm');
+        let r = await sel({ row_id: rK, handles: ['K2'], metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'confirm the drawing units first');
+        await ok(call('PUT', `drawings/${DS}/units`, { units: 'mm' }, qs), 'units');
+        assert.strictEqual((await sel({ row_id: rK, handles: ['K2'], metric: 'open_length' }, viewer)).s, 403, 'viewer cannot measure');
+        // a drawing that is not ready → 409
+        db.prepare("UPDATE drawings SET status='failed' WHERE id=?").run(DS);
+        r = await sel({ row_id: rK, handles: ['K2'], metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'drawing is failed: nothing to measure yet');
+        db.prepare("UPDATE drawings SET status='ready' WHERE id=?").run(DS);
+
+        // validation: 400 and nothing saved
+        for (const [b, msg] of [[{ handles: ['K2', 'K2'] }, /^duplicate handle in selection$/], [{ handles: ['K2', 'NOPE'] }, /^selection contains entities not in this drawing$/],
+          [{ handles: ['K2'], metric: 'count' }, /^nothing in the selection can be measured as count$/], [{ handles: [] }, /handles/], [{ handles: 'K2' }, /handles/], [{ handles: [7] }, /handles/],
+          [{ handles: [''] }, /handles/], [{ handles: ['K2'], layer: 'KERB' }, /layer/], [{ handles: ['K2'], metric: 'volume' }, /metric/], [{ handles: ['M1'], metric: 'count', width: 1 }, /width/],
+          [{ handles: ['K2'], block: 'MH1' }, /block/], [{ handles: new Array(200001).fill(0).map((_, i) => 'Z' + i) }, /handles/]]) {
+          r = await sel({ row_id: rK, metric: 'open_length', ...b });
+          assert.strictEqual(r.s, 400, JSON.stringify(b).slice(0, 80)); assert.match(r.j.error, msg);
+        }
+        assert.strictEqual(nMeas(), 0, 'refusals saved nothing');
+
+        // one KERB line (5 m) onto a take-off row in m → 5
+        const s1 = await ok(sel({ row_id: rK, handles: ['K2'], metric: 'open_length' }), 'select K2');
+        near(s1.qty, 5, 'K2'); assert.strictEqual(s1.qty_unit, 'm'); near(s1.row_qty, 5, 'row qty'); near(await qtyS(rK), 5, 'row');
+        const m1 = db.prepare('SELECT * FROM measurements WHERE id=?').get(s1.id);
+        assert.deepStrictEqual([m1.tool, m1.layer, m1.block, m1.metric, m1.handles_count, m1.incomplete, m1.duplicate, m1.uom_confirmed], ['dxf_selection', null, null, 'open_length', 1, 0, 0, 0]);
+        near(m1.base, 5, 'base stored in metres');
+        assert.deepStrictEqual(JSON.parse(m1.selection_summary), { metric: 'open_length', by_layer: { KERB: 1 } });
+        assert.deepStrictEqual(handlesOf(s1.id), ['K2']);
+        assert.deepStrictEqual(audits('measure').at(-1), { drawing_id: DS, row_id: rK, tool: 'dxf_selection', metric: 'open_length', used: 1, qty: s1.qty, qty_unit: 'm' }, 'audit: counts, never handles');
+        // listed with handles_count and the summary, never the handle list; GET handles for the viewer
+        const li = (await ok(call('GET', `tenders/${TS}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === s1.id);
+        assert.strictEqual(li.handles_count, 1); assert.deepStrictEqual(li.selection_summary, { metric: 'open_length', by_layer: { KERB: 1 } }); assert.ok(!('handles' in li));
+        assert.deepStrictEqual(await ok(call('GET', `measurements/${s1.id}/handles`, null, viewer), 'handles'), { id: s1.id, count: 1, handles: ['K2'] });
+        assert.strictEqual((await call('GET', 'measurements/999999/handles', null, viewer)).s, 404);
+        assert.strictEqual((await call('GET', `measurements/${s1.id}/handles`, null, '')).s, 401);
+
+        // the same handle again on the row → 409 already measured; confirmed → saved and audited
+        r = await sel({ row_id: rK, handles: ['K2'], metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'already measured on this row', dropped: 0, area_null: 0, approx: 0, duplicates: 0, overlapping: 1 });
+        // the length family: closed_perimeter of the same handles is still a length on the same row (K2 is open: nothing to measure)
+        assert.strictEqual(nMeas(), 1);
+        const ov0 = audits('measure_overlap_confirmed').length;
+        const s2 = await ok(sel({ row_id: rK, handles: ['K2'], metric: 'open_length', confirm_overlap: true }), 'confirm overlap');
+        near(await qtyS(rK), 10, 'counted twice once confirmed');
+        assert.deepStrictEqual(audits('measure_overlap_confirmed').slice(ov0), [{ drawing_id: DS, row_id: rK, tool: 'dxf_selection', metric: 'open_length', used: 1, qty: s2.qty, qty_unit: 'm', overlaps: 1 }]);
+        // delete → its handles are gone too
+        await ok(call('DELETE', `measurements/${s2.id}`, null, qs), 'delete s2');
+        assert.deepStrictEqual(handlesOf(s2.id), []); near(await qtyS(rK), 5, 'row after delete');
+        assert.deepStrictEqual(audits('measure_delete').at(-1), { drawing_id: DS, row_id: rK, tool: 'dxf_selection', metric: 'open_length', used: 1, qty: s2.qty, qty_unit: 'm' });
+
+        // part of a layer already linked to the row by a dxf_layer measurement (same metric family, same file) → 409
+        const rL = await rowS('Kerb (layer)', 'm');
+        const ml = await ok(lay({ row_id: rL, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length' }), 'layer KERB');
+        r = await sel({ row_id: rL, handles: ['K2'], metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'already measured on this row', dropped: 0, area_null: 0, approx: 0, duplicates: 0, overlapping: 1 });
+        r = await sel({ row_id: rL, handles: ['K1'], metric: 'closed_perimeter' });
+        assert.strictEqual(r.s, 409, 'closed_perimeter is in the length family'); assert.strictEqual(r.j.error, 'already measured on this row');
+        // another layer on that row is no overlap
+        const sa = await ok(sel({ row_id: rL, handles: ['A1'], metric: 'closed_perimeter' }), 'ASPHALT perimeter');
+        near(sa.qty, 40, 'A1 perimeter');
+        const ovL = audits('measure_overlap_confirmed').length;
+        const s3 = await ok(sel({ row_id: rL, handles: ['K2'], metric: 'open_length', confirm_overlap: true }), 'confirmed overlap with layer');
+        assert.strictEqual(audits('measure_overlap_confirmed').length, ovL + 1); assert.strictEqual(audits('measure_overlap_confirmed').at(-1).row_id, rL);
+        // the other way round: a layer measurement onto a row whose selection already covers that layer → 409
+        r = await lay({ row_id: rK, tool: 'dxf_layer', layer: 'KERB', metric: 'closed_perimeter' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'already measured on this row' });
+        assert.strictEqual((await lay({ row_id: rK, tool: 'dxf_layer', layer: 'KERB', metric: 'area', width: undefined })).s, 400, 'area on an m row: unit first');
+        for (const id of [s3.id, sa.id, ml.id]) await ok(call('DELETE', `measurements/${id}`, null, qs), 'tidy');
+
+        // blocks: a dxf_blocks count of MH1 on MH overlaps a selected MH1 insert on MH; the count is Σ count of inserts
+        const rN = await rowS('Manholes (blocks)', 'nr'), rN2 = await rowS('Manholes (selection)', 'nr');
+        const mb = await ok(lay({ row_id: rN, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' }), 'blocks');
+        r = await sel({ row_id: rN, handles: ['M1'], metric: 'count' });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'already measured on this row');
+        const sc = await ok(sel({ row_id: rN2, handles: ['M1', 'M2', 'K2'], metric: 'count' }), 'count');
+        assert.strictEqual(sc.qty, 2); assert.strictEqual(sc.qty_unit, 'nr');
+        assert.deepStrictEqual(JSON.parse(db.prepare('SELECT selection_summary s FROM measurements WHERE id=?').get(sc.id).s),
+          { metric: 'count', by_layer: { MH: 2 }, blocks: [{ layer: 'MH', block: 'MH1', count: 2 }] });
+        assert.deepStrictEqual(handlesOf(sc.id), ['M1', 'M2'], 'only the entities that contributed are stored');
+        r = await lay({ row_id: rN2, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' });
+        assert.strictEqual(r.s, 409, 'blocks onto a row whose selection has that block'); assert.strictEqual(r.j.error, 'already measured on this row');
+        await ok(call('DELETE', `measurements/${mb.id}`, null, qs), 'tidy');
+
+        // incomplete: a bowtie (no area), a spline (approx), a dropped shape → 409 with counts, then saved with confirm, flag stored
+        const rA = await rowS('Paving (selection)', 'm2'), rC = await rowS('Edge (selection)', 'm');
+        r = await sel({ row_id: rA, handles: ['B1', 'B2'], metric: 'area' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 1, approx: 0, dropped: 0, area_null: 1, duplicates: 0, overlapping: 0 });
+        r = await sel({ row_id: rC, handles: ['S1'], metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 0, approx: 1, dropped: 0, area_null: 0, duplicates: 0, overlapping: 0 });
+        r = await sel({ row_id: rA, handles: ['Q1', 'QH'], metric: 'area' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 0, approx: 0, dropped: 1, area_null: 0, duplicates: 0, overlapping: 0 });
+        assert.strictEqual((await sel({ row_id: rA, handles: ['QH'], metric: 'area' })).s, 400, 'only a dropped shape: nothing to measure');
+        assert.strictEqual(nMeas(), 2, 'refused: nothing saved');
+        const inc0 = audits('measure_incomplete_confirmed').length;
+        const si = await ok(sel({ row_id: rA, handles: ['B1', 'B2'], metric: 'area', confirm_incomplete: true }), 'confirm incomplete');
+        near(si.qty, 4, 'the square only'); assert.strictEqual(si.incomplete, true);
+        assert.strictEqual(db.prepare('SELECT incomplete FROM measurements WHERE id=?').get(si.id).incomplete, 1);
+        assert.deepStrictEqual(audits('measure_incomplete_confirmed').slice(inc0), [{ drawing_id: DS, row_id: rA, tool: 'dxf_selection', metric: 'area', dropped: 0, area_null: 1, approx: 0 }]);
+        assert.strictEqual((await ok(call('GET', `tenders/${TS}/rows`, null, viewer), 'rows')).find(x => x.id === rA).measured_incomplete, true);
+        // duplicates: the same line twice → 409, then saved with confirm (both counted), flag stored
+        const rD = await rowS('Dup (selection)', 'm');
+        r = await sel({ row_id: rD, handles: ['U1', 'U2'], metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'possible duplicates on this layer', dropped: 0, area_null: 0, approx: 0, duplicates: 1, overlapping: 0 });
+        const dup0 = audits('measure_duplicate_confirmed').length;
+        const sd = await ok(sel({ row_id: rD, handles: ['U1', 'U2'], metric: 'open_length', confirm_duplicate: true }), 'confirm duplicate');
+        near(sd.qty, 6, 'both counted'); assert.strictEqual(sd.duplicate, true);
+        assert.strictEqual(db.prepare('SELECT duplicate FROM measurements WHERE id=?').get(sd.id).duplicate, 1);
+        assert.deepStrictEqual(audits('measure_duplicate_confirmed').slice(dup0), [{ drawing_id: DS, row_id: rD, tool: 'dxf_selection', metric: 'open_length', duplicates: 1 }]);
+
+        // relink revalidates the overlap from the stored handles
+        const rK2 = await rowS('Kerb 2 (selection)', 'm');
+        const s4 = await ok(sel({ row_id: rK2, handles: ['K2'], metric: 'open_length' }), 'K2 on rK2');
+        r = await call('PUT', `measurements/${s4.id}`, { row_id: rK }, qs);
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'already measured on this row', overlapping: 1 });
+        const mlD = await ok(lay({ row_id: rD, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', confirm_overlap: true }), 'KERB layer on rD');
+        r = await call('PUT', `measurements/${s4.id}`, { row_id: rD }, qs);
+        assert.strictEqual(r.s, 409, 'relink onto a row with that layer linked'); assert.strictEqual(r.j.error, 'already measured on this row');
+        await ok(call('DELETE', `measurements/${mlD.id}`, null, qs), 'tidy');
+        await ok(call('PUT', `measurements/${s4.id}`, { row_id: rD }, qs), 'relink to rD');
+        near(await qtyS(rD), 11, 'rD: 6 + 5'); near(await qtyS(rK2), 0, 'rK2 emptied');
+        assert.deepStrictEqual(handlesOf(s4.id), ['K2'], 'handles kept on relink');
+
+        // the full parse cache missing: parsed again from the stored .dxf, then totalled
+        const shaS = db.prepare('SELECT sha256 FROM drawings WHERE id=?').get(DS).sha256;
+        fs.unlinkSync(path.join(DDIR, shaS + '.json.gz'));
+        const s5 = await ok(sel({ row_id: rK2, handles: ['K2'], metric: 'open_length' }), 'cache rebuilt');
+        near(s5.qty, 5, 'after rebuild'); assert.ok(fs.existsSync(path.join(DDIR, shaS + '.json.gz')));
+
+        // 100k handles: every entity of the 100k-LINE drawing, totalled in a worker through the parse queue;
+        // /api/status answers within the cap meanwhile, and the qty is exact
+        {
+          const ub = await upload(TS, 'big (selection)', Buffer.from(BIG), qs);
+          const DB = ub.j.id;
+          assert.strictEqual((await waitDone(DB, qs)).status, 'ready');
+          await ok(call('PUT', `drawings/${DB}/units`, { units: 'm' }, qs), 'units big');
+          const rB = await rowS('Kerb (100k)', 'm');
+          const handles = Array.from({ length: 100000 }, (_, i) => 'H' + i);
+          const w = ctx.drawings._workers; w.peak = w.alive;
+          const started = w.started;
+          let settled = false;
+          const pr = sel({ row_id: rB, handles, metric: 'open_length' }, qs, DB).finally(() => { settled = true; });
+          // a parse queued at the same time waits its turn: never two workers
+          const up = upload(TS, 'QS', Buffer.from(bigLines(20000, 'QS')), qs);
+          let observed = 0, worst = 0;
+          while (!settled) {
+            const a = performance.now(); const st = await call('GET', 'status', null, qs); const ms = performance.now() - a;
+            assert.strictEqual(st.s, 200); worst = Math.max(worst, ms);
+            assert.ok(ms < LATENCY_MS, '/api/status took ' + Math.round(ms) + ' ms during a 100k selection (cap ' + LATENCY_MS + ' ms)');
+            if (!settled) observed++;
+          }
+          const big = await pr;
+          assert.strictEqual(big.s, 200, JSON.stringify(big.j));
+          assert.ok(observed > 0, 'no /api/status call overlapped the 100k selection');
+          console.log('selection: ' + observed + ' /api/status call(s) answered during a 100k selection (worst ' + Math.round(worst) + ' ms, cap ' + LATENCY_MS + ' ms)');
+          assert.strictEqual(big.j.qty, 500000, 'exact'); assert.strictEqual(big.j.qty_unit, 'm');
+          assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM measurement_handles WHERE measurement_id=?').get(big.j.id).n, 100000);
+          assert.strictEqual(db.prepare('SELECT handles_count FROM measurements WHERE id=?').get(big.j.id).handles_count, 100000);
+          const hb = await ok(call('GET', `measurements/${big.j.id}/handles`, null, viewer), 'handles 100k');
+          assert.strictEqual(hb.count, 100000); assert.strictEqual(hb.handles.length, 100000); assert.strictEqual(hb.handles[99999], 'H99999');
+          assert.ok(!JSON.stringify(audits('measure').at(-1)).includes('H1'), 'the audit carries no handles');
+          const u = await up; assert.strictEqual(u.s, 202); assert.strictEqual((await waitDone(u.j.id, qs)).status, 'ready');
+          assert.ok(w.started - started >= 2, 'the selection ran in a worker'); assert.strictEqual(w.peak, 1, 'never more than one worker alive');
+        }
+
+        // approved tender → 409; revise → the Rev has the selections with the same handles
+        const before = db.prepare("SELECT * FROM measurements WHERE tender_id=? AND tool='dxf_selection' ORDER BY id").all(TS);
+        db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(TS);
+        assert.strictEqual((await sel({ row_id: rK, handles: ['K1'], metric: 'closed_perimeter' })).s, 409, 'approved → 409');
+        assert.strictEqual((await call('DELETE', `measurements/${s1.id}`, null, qs)).s, 409, 'approved → DELETE 409');
+        const rv = await ok(call('POST', `tenders/${TS}/revise`, null, qs), 'revise');
+        const after = db.prepare("SELECT * FROM measurements WHERE tender_id=? AND tool='dxf_selection' ORDER BY id").all(rv.id);
+        assert.strictEqual(after.length, before.length);
+        after.forEach((x, i) => {
+          assert.notStrictEqual(x.id, before[i].id);
+          for (const k of ['metric', 'handles_count', 'base', 'qty', 'qty_unit', 'incomplete', 'duplicate', 'selection_summary']) assert.strictEqual(x[k], before[i][k], k);
+          assert.deepStrictEqual(handlesOf(x.id), handlesOf(before[i].id), 'same handles');
+        });
+        // the Rev is a draft: delete one of its selections → its handles go, the original's stay
+        const ri = after.findIndex(x => x.handles_count === 1);
+        await ok(call('DELETE', `measurements/${after[ri].id}`, null, qs), 'rev delete');
+        assert.deepStrictEqual(handlesOf(after[ri].id), []); assert.strictEqual(handlesOf(before[ri].id).length, 1);
+        // deleting the draft Rev removes its handles
+        const revIds = after.map(x => x.id);
+        await ok(call('DELETE', `tenders/${rv.id}`, null, qs), 'delete rev');
+        assert.strictEqual(db.prepare(`SELECT COUNT(*) n FROM measurement_handles WHERE measurement_id IN (${revIds.join(',')})`).get().n, 0);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM measurement_handles WHERE measurement_id NOT IN (SELECT id FROM measurements)').get().n, 0, 'no orphan handles');
+      }
     }
 
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------

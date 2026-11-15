@@ -17,6 +17,8 @@ const HEAP_MB = Number(process.env.DRAWINGS_PARSE_HEAP_MB) || 4096;   // worker 
 const TOO_LARGE = 'drawing too large to parse — PURGE unused objects or split the drawing in AutoCAD, then save as DXF again';
 const SUMMARY_LRU = 8;
 const WORKER = path.join(__dirname, '..', 'lib', 'dxf', 'worker.js');
+const SELECT_WORKER = path.join(__dirname, '..', 'lib', 'dxf', 'select-worker.js');
+const MAX_HANDLES = 200000;                    // entities in one selection
 
 module.exports = ctx => {
   const { db, send, bad, need, audit, DATA_DIR } = ctx;
@@ -40,6 +42,11 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // the layer metric or block count the qty was computed from (before width/depth/factor), for the formula shown with it;
   // NULL on measurements saved before this column (the UI then derives it from qty and the factors)
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'base')) db.exec('ALTER TABLE measurements ADD COLUMN base REAL');
+  // dxf_selection: JSON { metric, by_layer: { layer: entities used }, blocks?: [{ layer, block, count }] } for display and the
+  // overlap check of later layer/block measurements; NULL for the other tools
+  if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'selection_summary')) db.exec('ALTER TABLE measurements ADD COLUMN selection_summary TEXT');
+  // dxf_selection: the handles of the entities that made its qty (written, copied and deleted with the measurement)
+  db.exec('CREATE TABLE IF NOT EXISTS measurement_handles(measurement_id INTEGER NOT NULL, handle TEXT NOT NULL, PRIMARY KEY(measurement_id, handle))');
   const DIR = path.join(DATA_DIR, 'drawings');
   fs.mkdirSync(DIR, { recursive: true });
   // temp uploads left by a stopped server are never valid: remove them
@@ -93,15 +100,17 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
-    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,base,created,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,base,selection_summary,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle) SELECT ?, handle FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
     let n = 0;
     for (const m of db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(oldTid)) {
       // never drop or detach a measurement silently: a broken link stops the revision
       if (!dmap.has(m.drawing_id)) bad(`measurement ${m.id}: its drawing is not in this tender`, 409);
       if (m.row_id !== null && !rowIdMap.has(m.row_id)) bad(`measurement ${m.id}: its row is not in this tender`, 409);
-      insM.run(dmap.get(m.drawing_id), newTid, m.row_id === null ? null : rowIdMap.get(m.row_id), m.tool, m.layer, m.block, m.metric, m.nested, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.base, m.created, m.created_by);
+      const nid = Number(insM.run(dmap.get(m.drawing_id), newTid, m.row_id === null ? null : rowIdMap.get(m.row_id), m.tool, m.layer, m.block, m.metric, m.nested, m.width, m.depth, m.factor, m.label, m.color,
+        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.base, m.selection_summary, m.created, m.created_by).lastInsertRowid);
+      if (m.tool === 'dxf_selection') insH.run(nid, m.id);
       n++;
     }
     // a copy taken while its file was still parsing gets its own result once the caller's transaction is over
@@ -110,6 +119,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   };
   // delete a draft tender: its drawings and measurements rows go too (files stay: they are shared by sha256)
   const deleteForTender = tid => ({
+    handles: Number(db.prepare('DELETE FROM measurement_handles WHERE measurement_id IN (SELECT id FROM measurements WHERE tender_id=?)').run(tid).changes),
     measurements: Number(db.prepare('DELETE FROM measurements WHERE tender_id=?').run(tid).changes),
     drawings: Number(db.prepare('DELETE FROM drawings WHERE tender_id=?').run(tid).changes),
   });
@@ -179,22 +189,30 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (busy || !queue.length) return;
     busy = true;
     const job = queue.shift();
-    runWorker(job.sha).then(job.resolve, e => job.resolve({ ok: false, transient: true, error: String(e && e.message || e) })).finally(() => { busy = false; pump(); });
+    job.run().then(job.resolve, e => job.resolve({ ok: false, transient: true, error: String(e && e.message || e) })).finally(() => { busy = false; pump(); });
   };
-  const enqueue = sha => new Promise(resolve => { queue.push({ sha, resolve }); pump(); });
-  // settles only after the worker has exited, so the next one never overlaps it
-  function runWorker(sha) {
+  // every worker (parse or selection total) goes through this one queue
+  const enqueueJob = run => new Promise(resolve => { queue.push({ run, resolve }); pump(); });
+  const enqueue = sha => enqueueJob(() => runWorker(sha));
+  // settles only after the worker has exited, so the next one never overlaps it. `msg` names what failed in plain words.
+  function spawnWorker(file, workerData, accept, msg) {
     return new Promise(resolve => {
       let result = null;
       const set = r => { if (!result) result = r; };
-      const w = new Worker(WORKER, { workerData: { file: dxfFile(sha) }, resourceLimits: { maxOldGenerationSizeMb: HEAP_MB } });
+      const w = new Worker(file, { workerData, resourceLimits: { maxOldGenerationSizeMb: HEAP_MB } });
       workers.alive++; workers.started++; workers.peak = Math.max(workers.peak, workers.alive);
-      const timer = setTimeout(() => { set({ ok: false, transient: true, error: 'parse timed out' }); w.terminate(); }, PARSE_TIMEOUT_MS);
-      w.on('message', m => { set(m && typeof m === 'object' ? (m.ok === false && /^(the stored drawing file is missing|could not read the stored)/.test(String(m.error)) ? { ...m, transient: true } : m) : { ok: false, transient: true, error: 'bad parser reply' }); w.terminate(); });
-      w.on('error', e => set({ ok: false, transient: true, error: e && e.code === 'ERR_WORKER_OUT_OF_MEMORY' ? TOO_LARGE : 'the parser stopped unexpectedly: ' + (e && e.message || e) }));
-      w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, transient: true, error: 'the parser stopped unexpectedly (exit code ' + code + ')' }); });
+      const timer = setTimeout(() => { set({ ok: false, transient: true, error: msg.timeout }); w.terminate(); }, PARSE_TIMEOUT_MS);
+      w.on('message', m => { set(m && typeof m === 'object' ? accept(m) : { ok: false, transient: true, error: msg.bad }); w.terminate(); });
+      w.on('error', e => set({ ok: false, transient: true, error: e && e.code === 'ERR_WORKER_OUT_OF_MEMORY' ? msg.oom : msg.stopped + ': ' + (e && e.message || e) }));
+      w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, transient: true, error: msg.stopped + ' (exit code ' + code + ')' }); });
     });
   }
+  const runWorker = sha => spawnWorker(WORKER, { file: dxfFile(sha) },
+    m => m.ok === false && /^(the stored drawing file is missing|could not read the stored)/.test(String(m.error)) ? { ...m, transient: true } : m,
+    { timeout: 'parse timed out', bad: 'bad parser reply', oom: TOO_LARGE, stopped: 'the parser stopped unexpectedly' });
+  // a selection total: never changes a drawing's status (any failure is reported to the caller only)
+  const runSelect = (sha, handles, metric) => spawnWorker(SELECT_WORKER, { file: cacheFile(sha), handles, metric }, m => m,
+    { timeout: 'the selection total timed out', bad: 'bad reply from the selection total', oom: 'the selection is too large to total', stopped: 'the selection total stopped unexpectedly' });
   async function writeGz(bytes, dest) {
     const tmp = tmpName('.json.gz');
     try { await fsp.writeFile(tmp, Buffer.from(bytes)); } catch (e) { await fsp.unlink(tmp).catch(() => {}); throw e; }
@@ -378,7 +396,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // ---- measurements: a layer metric or a block count linked to a tender row -----------------------------------
   // qty = base × (width ?? 1) × (depth ?? 1) × factor, base from the same scaled layer table as GET layers.
   const LAYER_METRICS = ['open_length', 'closed_perimeter', 'area'];
-  const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap', 'confirm_incomplete', 'confirm_duplicate'];
+  const SELECTION_METRICS = ['open_length', 'closed_perimeter', 'area', 'count'];
+  // metrics that can count the same geometry twice on one row: lengths with each other, areas, counts
+  const FAMILY = { open_length: ['open_length', 'closed_perimeter'], closed_perimeter: ['open_length', 'closed_perimeter'], area: ['area'], count: ['count'] };
+  const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'handles', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap', 'confirm_incomplete', 'confirm_duplicate'];
   const finNum = v => typeof v === 'number' && Number.isFinite(v);
   const optBool = (b, k) => { if (b[k] !== undefined && typeof b[k] !== 'boolean') bad(k + ' must be true or false'); return b[k] === true; };
   const optText = (b, k, max) => {
@@ -398,14 +419,25 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   function cleanMeasure(b) {
     for (const k of Object.keys(b)) if (!MFIELDS.includes(k)) bad('unknown field: ' + k);
     const m = { row_id: rowIdOf(b.row_id), tool: b.tool, metric: b.metric };
-    if (!['dxf_layer', 'dxf_blocks'].includes(m.tool)) bad('tool must be dxf_layer or dxf_blocks');
-    if (typeof b.layer !== 'string' || !b.layer || b.layer.length > 255) bad('layer is required');
-    m.layer = b.layer;
+    if (!['dxf_layer', 'dxf_blocks', 'dxf_selection'].includes(m.tool)) bad('tool must be dxf_layer, dxf_blocks or dxf_selection');
+    if (m.tool === 'dxf_selection') {
+      if (b.layer !== undefined || b.block !== undefined || b.nested !== undefined) bad('layer, block and nested do not apply to a selection');
+      if (!SELECTION_METRICS.includes(m.metric)) bad('metric must be one of ' + SELECTION_METRICS.join(', '));
+      const h = b.handles;
+      if (!Array.isArray(h) || h.length < 1 || h.length > MAX_HANDLES) bad(`handles must be a list of 1 to ${MAX_HANDLES} entity handles`);
+      for (const x of h) if (typeof x !== 'string' || !x || x.length > 1000) bad('handles must be entity handles (text)');
+      if (new Set(h).size !== h.length) bad('duplicate handle in selection');
+      m.handles = h; m.layer = null; m.block = null; m.nested = false;
+    } else {
+      if (b.handles !== undefined) bad('handles belong to dxf_selection');
+      if (typeof b.layer !== 'string' || !b.layer || b.layer.length > 255) bad('layer is required');
+      m.layer = b.layer;
+    }
     if (m.tool === 'dxf_layer') {
       if (!LAYER_METRICS.includes(m.metric)) bad('metric must be one of ' + LAYER_METRICS.join(', '));
       if (b.block !== undefined || b.nested !== undefined) bad('block and nested belong to dxf_blocks');
       m.block = null; m.nested = false;
-    } else {
+    } else if (m.tool === 'dxf_blocks') {
       if (m.metric !== 'count') bad('metric must be count for dxf_blocks');
       if (typeof b.block !== 'string' || !b.block) bad('block is required');
       m.block = b.block; m.nested = optBool(b, 'nested');
@@ -422,11 +454,48 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     m.confirm_duplicate = optBool(b, 'confirm_duplicate');
     return m;
   }
-  const summaryOf = m => ({ drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, layer: m.layer, ...(m.tool === 'dxf_blocks' ? { block: m.block, nested: !!m.nested } : {}), metric: m.metric, qty: m.qty, qty_unit: m.qty_unit });
+  // a selection's audit summary: counts only, never its handles
+  const summaryOf = m => m.tool === 'dxf_selection'
+    ? { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, metric: m.metric, used: m.handles_count, qty: m.qty, qty_unit: m.qty_unit }
+    : { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, layer: m.layer, ...(m.tool === 'dxf_blocks' ? { block: m.block, nested: !!m.nested } : {}), metric: m.metric, qty: m.qty, qty_unit: m.qty_unit };
+  const parseSummary = s => { try { return s ? JSON.parse(s) : null; } catch (e) { return null; } };
+  // how many measurements already on the row count some of the same geometry (same file). Runs inside the tx.
+  // A selection (m.sel = { handles: Set, layers: Set, pairs: Set of layer\0block }) overlaps: another selection of the
+  // same metric family holding one of its handles; a dxf_layer measurement of that family on a layer it uses; a
+  // dxf_blocks count of a block it counts on that layer. A layer or block measurement overlaps: the same link (batch 1
+  // rule), or a selection of that family using its layer (or counting its block on its layer).
+  function overlapCount(m, sha, tenderId, selfId) {
+    const fam = FAMILY[m.metric] || [m.metric];
+    const others = db.prepare(`SELECT m.id, m.tool, m.layer, m.block, m.metric, m.selection_summary FROM measurements m JOIN drawings d ON d.id=m.drawing_id
+      WHERE m.row_id=? AND m.tender_id=? AND m.id<>? AND d.sha256=? AND m.metric IN (${fam.map(() => '?').join(',')}) ORDER BY m.id`).all(m.row_id, tenderId, selfId, sha, ...fam);
+    let n = 0;
+    for (const o of others) {
+      if (m.tool === 'dxf_selection') {
+        if (o.tool === 'dxf_layer') { if (m.sel.layers.has(o.layer)) n++; }
+        else if (o.tool === 'dxf_blocks') { if (m.sel.pairs.has(o.layer + '\0' + o.block)) n++; }
+        else if (o.tool === 'dxf_selection') {
+          for (const h of db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=?').iterate(o.id)) if (m.sel.handles.has(h.handle)) { n++; break; }
+        }
+      } else if (o.tool === 'dxf_selection') {
+        const s = parseSummary(o.selection_summary);
+        if (!s) { n++; continue; }   // unreadable summary: never assume no overlap
+        if (m.tool === 'dxf_layer' && Object.hasOwn(s.by_layer || {}, m.layer)) n++;
+        if (m.tool === 'dxf_blocks' && (s.blocks || []).some(x => x.layer === m.layer && x.block === m.block)) n++;
+      } else if (o.tool === m.tool && o.metric === m.metric && o.layer === m.layer && o.block === m.block) n++;
+    }
+    return n;
+  }
+  // a stored selection's handles, layers and block pairs, for the overlap check of a relink
+  const storedSel = cur => {
+    const s = parseSummary(cur.selection_summary) || {};
+    return { handles: new Set(db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=?').all(cur.id).map(x => x.handle)),
+      layers: new Set(Object.keys(s.by_layer || {})), pairs: new Set((s.blocks || []).map(x => x.layer + '\0' + x.block)) };
+  };
   // the row checks shared by create and relink. Runs inside the tx.
   // Units: a known row unit must equal qty_unit (no override: m is never added into m2). Only a row whose unit text
   // normUom does not recognise may take a measurement with confirm_uom (uom_confirmed = 1), and then in one unit only.
-  function checkRow(me, m, sha, tenderId, selfId, confirmUom, confirmOverlap) {
+  // extra: counts added to a selection's 409 bodies; overlaps: the overlap count when the caller already has it
+  function checkRow(me, m, sha, tenderId, selfId, confirmUom, confirmOverlap, extra = {}, overlaps = null) {
     const row = db.prepare('SELECT * FROM tender_rows WHERE id=?').get(m.row_id);
     if (!row || row.tender_id !== tenderId) bad('row not found in this tender');
     if (row.is_heading) bad('a heading row cannot take measurements');
@@ -434,17 +503,16 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (ru === 'ls') bad('a lump-sum (LS) row cannot take measurements');
     let uomConfirmed = 0;
     if (ru === null) {
-      if (!confirmUom) conflictBody({ error: 'unit mismatch', row_unit: row.unit, qty_unit: m.qty_unit });
+      if (!confirmUom) conflictBody({ error: 'unit mismatch', row_unit: row.unit, qty_unit: m.qty_unit, ...extra });
       const other = db.prepare('SELECT DISTINCT qty_unit u FROM measurements WHERE row_id=? AND id<>?').all(m.row_id, selfId).map(x => x.u).filter(u => u !== m.qty_unit);
       if (other.length) failBody(400, { error: `the row already has measurements in ${other.join(', ')}: one unit per row`, row_unit: row.unit, qty_unit: m.qty_unit });
       uomConfirmed = 1;
     } else if (ru !== m.qty_unit) failBody(400, { error: 'unit mismatch — add width/depth', row_unit: row.unit, qty_unit: m.qty_unit });
     // the same geometry already on this row: same file (sha256), tool, layer, block (top and nested both count the
-    // top inserts, so nested is not part of the key) and metric
-    const over = db.prepare(`SELECT m.id FROM measurements m JOIN drawings d ON d.id=m.drawing_id
-      WHERE m.row_id=? AND m.id<>? AND d.sha256=? AND m.tool=? AND m.layer=? AND m.block IS ? AND m.metric=?`).all(m.row_id, selfId, sha, m.tool, m.layer, m.block, m.metric);
-    if (over.length && !confirmOverlap) conflictBody({ error: 'already measured on this row' });
-    return { row, uomConfirmed, overlaps: over.length };
+    // top inserts, so nested is not part of the key) and metric; and selections of the same geometry (overlapCount)
+    const over = overlaps === null ? overlapCount(m, sha, tenderId, selfId) : overlaps;
+    if (over && !confirmOverlap) conflictBody({ error: 'already measured on this row', ...extra });
+    return { row, uomConfirmed, overlaps: over };
   }
   const recompute = rowId => rowId === null ? null : ctx.tenders.recomputeTakeoffQty(rowId);
 
@@ -453,6 +521,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const m = cleanMeasure(await ctx.readBody(req));
     if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to measure yet`, 409);
     if (d.units === null) bad('confirm the drawing units first', 409);
+    if (m.tool === 'dxf_selection') return createSelection(res, d, t, me, m);
     const c = await readSummary(d.sha256), lt = scaledTable(c.raw, d.units);
     const layer = lt.layers.find(l => l.layer === m.layer);
     if (!layer) bad('layer not found in this drawing: ' + m.layer);
@@ -500,6 +569,71 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     return reply(res, 200, out);
   }
 
+  // ---- selections: totals from the full parse cache, in a worker through the parse queue (never on this thread) ----
+  async function totalSelection(sha, handles, metric) {
+    for (let attempt = 0; ; attempt++) {
+      const r = await enqueueJob(() => runSelect(sha, handles, metric));
+      if (r.ok) return r;
+      // the cache is missing, unreadable or of another parser version: parse the stored .dxf again, once
+      if (r.stale && attempt === 0) {
+        if (!fs.existsSync(dxfFile(sha))) bad('the parsed drawing is missing: upload the drawing again', 409);
+        await reparse(sha);
+        continue;
+      }
+      bad('could not total the selection: ' + plain(r.error).slice(0, 300), 409);
+    }
+  }
+  // qty = base × (width ?? 1) × (depth ?? 1) × factor with base = Σ in drawing units × f (lengths), × f² (areas), counts as they are
+  async function createSelection(res, d, t, me, m) {
+    const sel = await totalSelection(d.sha256, m.handles, m.metric);
+    if (sel.unknown) bad('selection contains entities not in this drawing');
+    if (!sel.used) bad('nothing in the selection can be measured as ' + m.metric);
+    const f = UNIT_TO_M[d.units];
+    const base = m.metric === 'count' ? sel.base : m.metric === 'area' ? sel.base * f * f : sel.base * f;
+    m.handles_count = sel.used; m.drawing_id = d.id;
+    m.sel = { handles: new Set(sel.used_handles), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(sel.blocks.map(x => x.layer + '\0' + x.block)) };
+    const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, ...(m.metric === 'count' ? { blocks: sel.blocks } : {}) });
+    const out = tx(() => {
+      mustDraft(tenderRow(t.id));
+      // the totals must still describe this drawing (units could change before the first measurement)
+      const cur = drawingRow(d.id);
+      if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
+      const overlapping = overlapCount(m, d.sha256, t.id, -1);
+      const counts = { dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx, duplicates: sel.duplicates, overlapping };
+      // the batch 1 gates and bodies (the link form keys on them), with the selection's counts added
+      const incomplete = sel.dropped > 0 || sel.area_null > 0 || sel.approx > 0;
+      if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', area_excluded: sel.area_null, approx: sel.approx, dropped: sel.dropped, ...counts });
+      if (sel.duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', ...counts });
+      if (!finNum(base) || !(base > 0)) bad('nothing in the selection can be measured as ' + m.metric);
+      m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
+      if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
+      const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap, counts, overlapping);
+      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,base,selection_summary,created,created_by)
+        VALUES(?,?,?,?,NULL,NULL,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.metric, m.width, m.depth, m.factor, m.label, m.color,
+        m.qty, m.qty_unit, sel.used, ch.uomConfirmed, incomplete ? 1 : 0, sel.duplicates ? 1 : 0, base, summary, new Date().toISOString(), me.username).lastInsertRowid);
+      const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle) VALUES(?,?)');
+      for (const h of sel.used_handles) insH.run(id, h);
+      const sum = summaryOf(m), short = { drawing_id: d.id, row_id: m.row_id, tool: m.tool, metric: m.metric };
+      audit(me, 'measure', 'measurements', id, sum);
+      if (ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', id, { ...sum, row_unit: ch.row.unit });
+      if (ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', id, { ...sum, overlaps: ch.overlaps });
+      if (sel.duplicates) audit(me, 'measure_duplicate_confirmed', 'measurements', id, { ...short, duplicates: sel.duplicates });
+      if (incomplete) audit(me, 'measure_incomplete_confirmed', 'measurements', id, { ...short, dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx });
+      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete, duplicate: !!sel.duplicates, handles_count: sel.used };
+    });
+    return reply(res, 200, out);
+  }
+
+  // GET /api/measurements/:id/handles: a selection's handles, for the viewer to highlight
+  function measurementHandles(res, parts, me) {
+    need(me, 'admin', 'qs', 'viewer');
+    const m = idOf(parts[1]) === null ? null : db.prepare('SELECT id, tool, tender_id FROM measurements WHERE id=?').get(idOf(parts[1]));
+    if (!m || !tenderRow(m.tender_id)) bad('measurement not found', 404);
+    if (m.tool !== 'dxf_selection') bad('only a selection measurement has handles');
+    const handles = db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=? ORDER BY rowid LIMIT ?').all(m.id, MAX_HANDLES).map(x => x.handle);
+    return reply(res, 200, { id: m.id, count: handles.length, handles });
+  }
+
   async function measurementApi(req, res, parts, me) {
     const method = req.method;
     if (method !== 'PUT' && method !== 'DELETE') bad('method not allowed', 405);
@@ -514,6 +648,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
         mustDraft(tenderRow(t.id));
         const cur = db.prepare('SELECT * FROM measurements WHERE id=?').get(m.id);
         if (!cur) bad('measurement not found', 404);
+        db.prepare('DELETE FROM measurement_handles WHERE measurement_id=?').run(m.id);
         db.prepare('DELETE FROM measurements WHERE id=?').run(m.id);
         audit(me, 'measure_delete', 'measurements', m.id, summaryOf(cur));
         return { ok: 1, row_qty: recompute(cur.row_id) };
@@ -531,7 +666,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
         if (cur.row_id === rowId) bad('the measurement is already linked to this row');
         const d = drawingRow(cur.drawing_id);
         if (!d) bad('the drawing of this measurement is missing', 409);
-        const ch = checkRow(me, { ...cur, row_id: rowId }, d.sha256, t.id, cur.id, confirmUom, confirmOverlap);
+        const isSel = cur.tool === 'dxf_selection';
+        const mv = { ...cur, row_id: rowId, ...(isSel ? { sel: storedSel(cur) } : {}) };
+        const overlaps = overlapCount(mv, d.sha256, t.id, cur.id);
+        const ch = checkRow(me, mv, d.sha256, t.id, cur.id, confirmUom, confirmOverlap, isSel ? { overlapping: overlaps } : {}, overlaps);
         db.prepare('UPDATE measurements SET row_id=?, uom_confirmed=? WHERE id=?').run(rowId, ch.uomConfirmed, cur.id);
         const sum = { ...summaryOf({ ...cur, row_id: rowId }), from_row_id: cur.row_id };
         audit(me, 'measure_relink', 'measurements', cur.id, sum);
@@ -547,6 +685,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   function tenderMeasurements(t) {
     const all = db.prepare(`SELECT m.*, d.name AS drawing_name, r.no AS row_no, r.description AS row_description, r.unit AS row_unit
       FROM measurements m JOIN drawings d ON d.id=m.drawing_id LEFT JOIN tender_rows r ON r.id=m.row_id WHERE m.tender_id=? ORDER BY m.id`).all(t.id);
+    for (const x of all) x.selection_summary = parseSummary(x.selection_summary);   // handles_count and this; never the handle list
     return { measurements: all.filter(x => x.row_id !== null), unlinked: all.filter(x => x.row_id === null) };
   }
 
@@ -563,6 +702,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       return reply(res, 200, tenderMeasurements(t));
     }
     if (parts[0] === 'measurements' && parts.length === 2) return measurementApi(req, res, parts, me);
+    if (parts[0] === 'measurements' && parts.length === 3 && parts[2] === 'handles' && method === 'GET') return measurementHandles(res, parts, me);
     if (parts[0] === 'tenders' && parts[2] === 'drawings' && parts.length === 3) {
       const t = tenderRow(idOf(parts[1]));
       if (!t) bad('tender not found', 404);

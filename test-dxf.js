@@ -702,4 +702,58 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   }
 }
 
+// ---- batch 2 Task 3: selection totals (pure) ----
+{
+  const { selectionTotals } = require('./lib/dxf/select.js');
+  const spline = [[0, 'SPLINE'], [5, 'S1'], [8, 'CURVE'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3], [20, 4]];
+  const splineHatch = hatch('QH', [[[92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0]]], 0, 'DROP');
+  const sd = parseDxf(dxf([...sec('BLOCKS', block('MH1', [])), ...ents([...line('K1', 'KERB', 0, 0, 3, 4), ...line('K2', 'KERB', 10, 0, 13, 4),
+    ...lwp('B1', [[0, 20], [1, 21], [1, 20], [0, 21]], true, 'BOW'), ...lwp('B2', sq(20, 0, 2), true, 'BOW'), ...hatch('BH', [hpoly(sq(40, 0, 3))], 0, 'BOW'), ...spline,
+    ...line('U1', 'DUPL', 0, 60, 3, 60), ...line('U2', 'DUPL', 3, 60, 0, 60), ...insert('M1', 'MH1', 'MH'),
+    ...insert('M2', 'MH1', 'MH', [[10, 50], [20, 50], [70, 2], [71, 3], [44, 5], [45, 5]]), ...insert('M3', 'MH1', 'MH2', [[10, 90], [20, 90]]),
+    [0, 'TEXT'], [5, 'T1'], [8, 'KERB'], [10, 0], [20, 0], [40, 1], [1, 'NOTE'], ...splineHatch])]));
+  const sf = flatten(sd);
+  const st = (h, metric) => selectionTotals(sf, h, metric);
+  // open_length over the two KERB lines → 10; the text on the layer is not a length (skipped)
+  const k = st(['K1', 'K2', 'T1'], 'open_length');
+  assert.deepStrictEqual(k, { base: 10, used: 2, dropped: 0, area_null: 0, approx: 0, duplicates: 0, unknown: 0, skipped: 1, by_layer: { KERB: 2 }, blocks: [], used_handles: ['K1', 'K2'] });
+  // area including the bowtie: the bowtie has no area → area_null 1, the square counts; the hatch counts as an area
+  const a = st(['B1', 'B2', 'BH'], 'area');
+  near(a.base, 4 + 9); assert.strictEqual(a.area_null, 1); assert.strictEqual(a.used, 2); assert.deepStrictEqual(a.used_handles, ['B2', 'BH']);
+  // closed_perimeter: a HATCH is an area only (skipped); the bowtie still has a perimeter
+  const pr = st(['B1', 'B2', 'BH'], 'closed_perimeter');
+  assert.strictEqual(pr.used, 2); assert.strictEqual(pr.skipped, 1); assert.strictEqual(pr.area_null, 0);
+  // the duplicate pair → duplicates 1, both counted (never merged)
+  const u = st(['U1', 'U2'], 'open_length');
+  assert.strictEqual(u.duplicates, 1); near(u.base, 6); assert.strictEqual(u.used, 2);
+  // the spline → approx 1
+  const s = st(['S1'], 'open_length');
+  assert.strictEqual(s.approx, 1); assert.strictEqual(s.used, 1); near(s.base, 5, 1e-6);
+  // count over the INSERT handle → 1; an MINSERT counts rows × cols; lines are skipped; blocks per layer for the summary
+  const c1 = st(['M1'], 'count');
+  assert.strictEqual(c1.base, 1); assert.strictEqual(c1.used, 1); assert.deepStrictEqual(c1.blocks, [{ layer: 'MH', block: 'MH1', count: 1 }]);
+  const c2 = st(['M1', 'M2', 'M3', 'K1'], 'count');
+  assert.strictEqual(c2.base, 1 + 6 + 1); assert.strictEqual(c2.skipped, 1); assert.deepStrictEqual(c2.by_layer, { MH: 2, MH2: 1 });
+  assert.deepStrictEqual(c2.blocks, [{ layer: 'MH', block: 'MH1', count: 7 }, { layer: 'MH2', block: 'MH1', count: 1 }]);
+  // an insert is not a length
+  assert.strictEqual(st(['M1'], 'open_length').used, 0);
+  // an unknown handle → unknown 1
+  const un = st(['K1', 'NOPE'], 'open_length');
+  assert.strictEqual(un.unknown, 1); assert.strictEqual(un.base, 5);
+  // a dropped shape (spline-edge hatch) → dropped, whatever the metric; nothing used
+  for (const m of ['open_length', 'closed_perimeter', 'area', 'count']) { const d = st(['QH'], m); assert.strictEqual(d.dropped, 1, m); assert.strictEqual(d.used, 0, m); }
+  assert.throws(() => st(['K1'], 'volume'), /unknown metric/);
+  // a layer named __proto__ is an own property of by_layer
+  const pf = flatten(parseDxf(dxf(ents(line('P1', '__proto__', 0, 0, 3, 4)))));
+  assert.ok(Object.hasOwn(selectionTotals(pf, ['P1'], 'open_length').by_layer, '__proto__'));
+  // a whole layer adds up bit for bit as the layer table does (flat order, not request order)
+  {
+    const L = [];
+    for (let i = 0; i < 500; i++) L.push(...line('W' + i, 'W', i * 0.1, 0, i * 0.1 + 0.7 + i / 3, 0.3 * i));
+    const wd = parseDxf(dxf(ents(L))), wf = flatten(wd);
+    const hs = wf.map(f => f.handle).reverse();
+    assert.strictEqual(selectionTotals(wf, hs, 'open_length').base, layerTable(wf, wd.layers, 'm').layers.find(l => l.layer === 'W').open_length);
+  }
+}
+
 console.log('ok test-dxf');
