@@ -186,10 +186,10 @@ assert.ok(rot.bbox[2] - rot.bbox[0] < 1e-9, 'rotated line is vertical'); near(ro
 const nest = fl([...sec('BLOCKS', [...B1, ...block('B2', insert('I0', 'B1', '0'))]), ...ents(insert('I2', 'B2', 'KERB'))]);
 assert.strictEqual(nest.find(f => f.type === 'LINE').depth, 2); assert.strictEqual(nest.find(f => f.type === 'LINE').layer, 'KERB');
 assert.deepStrictEqual(nest.filter(f => f.kind === 'insert').map(f => [f.block, f.depth, f.layer]), [['B2', 0, 'KERB'], ['B1', 1, 'KERB']]);
-// base point, layer kept when not 0, BYBLOCK colour inherits, instance handles are unique
+// base point, layer kept when not 0 (also with BYBLOCK colour), instance handles are unique
 const lay = fl([...sec('BLOCKS', block('B3', [...line('K1', 'OWN', 5, 5, 6, 5), ...line('K2', 'OWN', 5, 5, 5, 6, [[62, 0]])], [5, 5])), ...ents([...insert('J1', 'B3', 'TOP'), ...insert('J2', 'B3', 'TOP', [[10, 100]])])]);
 const ll = lay.filter(f => f.type === 'LINE');
-assert.deepStrictEqual(ll.map(f => f.layer), ['OWN', 'TOP', 'OWN', 'TOP']);
+assert.deepStrictEqual(ll.map(f => f.layer), ['OWN', 'OWN', 'OWN', 'OWN']); // BYBLOCK colour does not change layer (ruling)
 assert.deepStrictEqual(ll[0].bbox, [0, 0, 1, 0]); assert.deepStrictEqual(ll[2].bbox, [100, 0, 101, 0]);
 assert.strictEqual(new Set(lay.map(f => f.handle)).size, lay.length);
 // MINSERT: 70 columns, 71 rows, 44/45 spacing
@@ -304,5 +304,55 @@ near(me.length, 9.688448220547676 / 4, 1e-8); near(me.bbox[0], 0); near(me.bbox[
 const hsDoc = parseDxf(dxf(ents(hatch('HS', [[[92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0]]]))));
 assert.deepStrictEqual(flatten(hsDoc), []);
 assert.ok(hsDoc.warnings.some(w => w.code === 'unsupported_hatch_edge' && w.detail === 'HS'));
+
+// ---- Task 2 fix round 1 ----
+const warned = (doc, code, detail) => doc.warnings.some(w => w.code === code && w.detail === detail);
+const flDoc = pairs => { const d = parseDxf(dxf(pairs)); return { d, f: flatten(d) }; };
+// 1. hatch loop area does not depend on absolute position; tolerated gaps are closed explicitly
+const gapSq = (x0, y0, g) => [[92, 1], [93, 4], [72, 1], [10, x0], [20, y0], [11, x0 + 10], [21, y0], [72, 1], [10, x0 + 10], [20, y0], [11, x0 + 10], [21, y0 + 10],
+  [72, 1], [10, x0 + 10], [20, y0 + 10], [11, x0], [21, y0 + 10], [72, 1], [10, x0], [20, y0 + 10], [11, x0], [21, y0 + g], [97, 0]];
+const atOrigin = fl(ents(hatch('G0', [gapSq(0, 0, 1e-7)])))[0];
+const geo = fl(ents(hatch('G1', [gapSq(500000, 2700000, 1e-7)])))[0];
+near(atOrigin.area, 100, 1e-6); near(geo.area, atOrigin.area, 1e-6);
+const geoMm = fl(ents(hatch('G2', [gapSq(500000000, 2700000000, 1e-7)])))[0];
+near(geoMm.area, 100, 1e-3);
+for (const [h, x, y] of [['G3', 0, 0], ['G4', 500000, 2700000], ['G5', 500000000, 2700000000]]) {
+  const { d, f } = flDoc(ents(hatch(h, [gapSq(x, y, 0.001)])));
+  assert.deepStrictEqual(f, [], h); assert.ok(warned(d, 'hatch_open_loop', h), h);
+}
+near(fl(ents(lwp('GP', sq(500000, 2700000, 10), true)))[0].area, 100, 1e-6);
+near(fl(ents(lwp('GQ', [[500000, 2700000, 1], [500002, 2700000, 1]], true)))[0].area, Math.PI, 1e-6);
+// 3. self-intersecting closed paths and overlapping hatch loops: area excluded, length kept, warned
+const bow = flDoc(ents(lwp('BOW', [[0, 0], [10, 10], [10, 0], [0, 10]], true)));
+assert.strictEqual(bow.f[0].area, null); near(bow.f[0].length, 20 + 20 * Math.SQRT2); assert.ok(warned(bow.d, 'self_intersecting', 'BOW'));
+const hbow = flDoc(ents(hatch('HB', [hpoly([[0, 0], [10, 10], [10, 0], [0, 10]])])));
+assert.strictEqual(hbow.f[0].area, null); assert.ok(warned(hbow.d, 'self_intersecting', 'HB'));
+const hov = flDoc(ents(hatch('HO', [hpoly(sq(0, 0, 10)), hpoly(sq(5, 5, 10))])));
+assert.strictEqual(hov.f[0].area, null); near(hov.f[0].length, 80); assert.ok(warned(hov.d, 'hatch_loops_overlap', 'HO'));
+const hdup = flDoc(ents(hatch('HD', [hpoly(sq(0, 0, 10)), hlines(sq(0, 0, 10))])));
+assert.strictEqual(hdup.f[0].area, null); assert.ok(warned(hdup.d, 'hatch_loops_overlap', 'HD'));
+const okShape = flDoc(ents([...lwp('OK1', [[0, 0], [10, 0], [10, 10], [5, 5], [0, 10]], true), ...hatch('OK2', [hpoly(sq(0, 0, 10)), hpoly(sq(0, 0, 5))])]));
+near(okShape.f[0].area, 75); near(okShape.f[1].area, 75); assert.strictEqual(okShape.d.warnings.length, 0); // touching island is still contained
+// 4. clockwise hatch edges: computed, but flagged approx and warned
+const cw = flDoc(ents(hatch('H6', [quarter])));
+near(cw.f[0].area, Math.PI / 4); assert.strictEqual(cw.f[0].approx, true); assert.ok(warned(cw.d, 'hatch_cw_edge_unverified', 'H6'));
+assert.strictEqual(fl(ents(hatch('H5', [[[92, 1], [93, 1], ...arcEdge(0, 0, 1, 0, 360, 1), [97, 0]]])))[0].approx, false);
+// 5. expansion cap
+assert.throws(() => fl([...sec('BLOCKS', B1), ...ents(insert('BIG', 'B1', 'K', [[70, 32767], [71, 32767], [44, 1], [45, 1]]))]), /^Error: drawing expands to too many entities \(> 5,000,000\)$/);
+const fan = []; for (let i = 0; i < 6; i++) fan.push(...block('F' + i, i < 5 ? insert('f' + i, 'F' + (i + 1), '0', [[70, 20], [71, 1]]) : line('end', '0', 0, 0, 1, 0)));
+assert.throws(() => fl([...sec('BLOCKS', fan), ...ents(insert('top', 'F0', '0', [[70, 20], [71, 1]]))]), /too many entities/);
+// 6. minors
+const tb = fl(ents(lwp('TB', [[0, 0, 1e-13], [2, 0]], false)))[0];
+near(tb.length, 2); assert.strictEqual(tb.approx, false);
+near(fl(ents(lwp('TC', [[0, 0, 1e-13], [10, 0, -1e-13], [10, 10], [0, 10]], true)))[0].area, 100);
+const zl = flDoc(ents([[0, 'LINE'], [5, 'Z1'], [8, '0'], [10, 0], [20, 0], [30, 0], [11, 3], [21, 4], [31, 12]]));
+assert.strictEqual(zl.f[0].length, 5); assert.ok(warned(zl.d, 'z_ignored', 'Z1'));
+assert.ok(!warned(flDoc(ents(line('Z2', '0', 0, 0, 3, 4))).d, 'z_ignored', 'Z2'));
+const zs = flDoc(ents([[0, 'SPLINE'], [5, 'Z3'], [8, '0'], [71, 1], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [30, 0], [10, 3], [20, 4], [30, 2]]));
+near(zs.f[0].length, 5); assert.ok(warned(zs.d, 'z_ignored', 'Z3'));
+const h0 = flDoc(ents(hatch('H0', [])));
+assert.deepStrictEqual(h0.f, []); assert.ok(warned(h0.d, 'hatch_no_boundary', 'H0'));
+for (const r of [0, -0.5, 1.5]) assert.throws(() => fl(ents([[0, 'ELLIPSE'], [5, 'ER'], [10, 0], [20, 0], [11, 2], [21, 0], [40, r]])), /ELLIPSE ER/, String(r));
+near(fl(ents([[0, 'ELLIPSE'], [5, 'E1'], [10, 0], [20, 0], [11, 2], [21, 0], [40, 1]]))[0].area, 4 * Math.PI);
 
 console.log('ok test-dxf');
