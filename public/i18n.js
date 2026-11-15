@@ -110,7 +110,7 @@ const I18N = {
     category_map_note: 'How each ERP bill category is counted. Changes apply from the next sync.',
     trade_map: 'Designations → trades', erp_designation: 'ERP designation', trade_map_note: 'Map each ERP designation to a trade. Applies from the next sync.',
     trade_groups: 'Trade groups', trade_groups_note: 'A trade with fewer than 3 people shows only its group rate to QS and viewers.',
-    users: 'Users', add_user: 'Add user', hidden_templates: 'Hidden-item checklist', add_template: 'Add checklist item',
+    users: 'Users', add_user: 'Add user', users_note: 'Changing a role, disabling a user or resetting a password signs that user out. The last active admin cannot be demoted or disabled.', new_password: 'New password (6+ characters)', reset_password: 'Reset password', password_reset_done: 'Password reset. The user must sign in again.', user_change_confirm: 'Apply this change? The user will be signed out.', hidden_templates: 'Hidden-item checklist', add_template: 'Add checklist item',
     hidden_templates_note: 'New tenders copy the active items. Existing tenders keep their own copy. No amounts here.',
   },
   ar: {
@@ -213,7 +213,7 @@ const I18N = {
     category_map_note: 'كيف تُحسب كل فئة فواتير في الـ ERP. التغيير يسري من المزامنة القادمة.',
     trade_map: 'المسميات ← المهن', erp_designation: 'المسمى في الـ ERP', trade_map_note: 'اربط كل مسمى وظيفي في الـ ERP بمهنة. يسري من المزامنة القادمة.',
     trade_groups: 'مجموعات المهن', trade_groups_note: 'المهنة التي فيها أقل من 3 أشخاص يرى الـ QS والمشاهد سعر مجموعتها فقط.',
-    users: 'المستخدمون', add_user: 'إضافة مستخدم', hidden_templates: 'قائمة البنود المخفية', add_template: 'إضافة بند للقائمة',
+    users: 'المستخدمون', add_user: 'إضافة مستخدم', users_note: 'تغيير الدور أو تعطيل المستخدم أو إعادة تعيين كلمة المرور يُخرج المستخدم من التطبيق. لا يمكن خفض دور آخر مدير فعّال أو تعطيله.', new_password: 'كلمة مرور جديدة (6 أحرف أو أكثر)', reset_password: 'إعادة تعيين كلمة المرور', password_reset_done: 'تمت إعادة تعيين كلمة المرور. على المستخدم تسجيل الدخول من جديد.', user_change_confirm: 'تطبيق هذا التغيير؟ سيتم إخراج المستخدم من التطبيق.', hidden_templates: 'قائمة البنود المخفية', add_template: 'إضافة بند للقائمة',
     hidden_templates_note: 'المناقصات الجديدة تنسخ البنود الفعّالة. المناقصات الحالية تحتفظ بنسختها. لا مبالغ هنا.',
   },
 };

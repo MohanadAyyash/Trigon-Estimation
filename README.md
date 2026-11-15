@@ -12,7 +12,7 @@
 5. تعرض النافذة عناوين IPv4 للجهاز. يفتح مهندس الكميات (QS) من جهازه `http://<العنوان>:3100`.
 
 ### إعداد المدير الأول
-عند أول فتح للتطبيق تظهر شاشة إنشاء حساب المدير: اختر اسم مستخدم وكلمة مرور قوية. بعدها ينشئ المدير من شاشة الإعدادات حسابات المستخدمين: `qs` (يسعّر ويقدّم المناقصات)، `viewer` (عرض فقط). الاعتماد النهائي للمناقصة للمدير فقط.
+عند أول فتح للتطبيق تظهر شاشة إنشاء حساب المدير: اختر اسم مستخدم وكلمة مرور قوية. بعدها ينشئ المدير من شاشة الإعدادات حسابات المستخدمين: `qs` (يسعّر ويقدّم المناقصات)، `viewer` (عرض فقط). الاعتماد النهائي للمناقصة للمدير فقط. من نفس الشاشة يغيّر المدير دور المستخدم أو يعطّله أو يعيد تعيين كلمة مروره؛ أي تغيير يُخرج ذلك المستخدم من التطبيق، ولا يمكن خفض دور آخر مدير فعّال أو تعطيله.
 
 ### مسار الـ ERP
 من **الإعدادات ← مسار قاعدة بيانات الـ ERP** اكتب المسار الكامل لملف `data\erp.db` الخاص بنظام الـ ERP على نفس الجهاز، مثلاً `C:\Trigon-ERP\data\erp.db`. ثم اضغط «زامن الآن» في شاشة تكاليف الشركة. تتم المزامنة تلقائياً كل ساعة. إذا فشلت المزامنة (الملف غير موجود أو مقفل) يبقى آخر سجل ناجح قيد الاستعمال ويظهر شريط أحمر بوقت آخر مزامنة ناجحة.
@@ -52,7 +52,7 @@ A construction tender estimating app. It reads company costs (payroll, overhead,
 5. The window prints this PC's IPv4 addresses. The QS opens `http://<that-address>:3100` from their own PC.
 
 ### First admin setup
-The first time the app opens it asks you to create the admin account: choose a username and a strong password. The admin then creates users in Settings: `qs` (prices and submits tenders) and `viewer` (read only). Only the admin gives the final approval of a tender.
+The first time the app opens it asks you to create the admin account: choose a username and a strong password. The admin then creates users in Settings: `qs` (prices and submits tenders) and `viewer` (read only). Only the admin gives the final approval of a tender. On the same screen the admin changes a user's role, disables a user or resets a password; any change signs that user out, and the last active admin cannot be demoted or disabled.
 
 ### Set the ERP path
 Go to **Settings → ERP database path** and enter the full path of the ERP's `data\erp.db` on the same PC, for example `C:\Trigon-ERP\data\erp.db`. Then press **Sync now** on the Company costs screen. The app also syncs every hour. If a sync fails (file missing or locked) the last good snapshot stays in use and a red banner shows the time of the last good sync.

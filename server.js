@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT 
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, user TEXT, action TEXT NOT NULL, entity TEXT, entity_id TEXT, detail TEXT);
 `);
+if (!db.prepare('PRAGMA table_info(users)').all().some(c => c.name === 'disabled')) db.exec('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0');
 
 const ROLES = ['admin', 'qs', 'viewer'];
 const DEFAULTS = { erp_db_path: '..\\Trigon-ERP\\data\\erp.db', work_days: 26, work_hours: 8, finance_rate_pct: 8, min_profit_pct: 5, default_margin_pct: 12, stale_days: 7, material_stale_days: 60, sync_minutes: 60 };
@@ -32,6 +33,7 @@ const readBody = (req, max = 20e6) => req._body !== undefined ? Promise.resolve(
   req.on('end', () => { if (over) return; try { const j = b ? JSON.parse(b) : {}; if (!j || typeof j !== 'object' || Array.isArray(j)) throw 0; ok(req._body = j); } catch (e) { no(Object.assign(new Error('invalid request body'), { status: 400 })); } });
   req.on('error', no);
 });
+const tx = fn => { db.exec('BEGIN'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 const audit = (user, action, entity, id, detail) => db.prepare('INSERT INTO audit_log(at,user,action,entity,entity_id,detail) VALUES(?,?,?,?,?,?)')
   .run(new Date().toISOString(), user && user.username || (typeof user === 'string' ? user : null), action, entity || null, id == null ? null : String(id), detail == null ? null : (typeof detail === 'string' ? detail : JSON.stringify(detail)));
 const getSettings = () => {
@@ -59,17 +61,43 @@ const sessionToken = req => { const m = /(?:^|;\s*)sid=([a-f0-9]+)/.exec(req.hea
 function sessionUser(req) {
   const t = sessionToken(req); if (!t) return null;
   const s = db.prepare('SELECT user_id FROM sessions WHERE token=? AND created>?').get(t, Date.now() - 30 * 864e5);
-  return s ? db.prepare('SELECT id,username,role FROM users WHERE id=?').get(s.user_id) || null : null;
+  return s ? db.prepare('SELECT id,username,role FROM users WHERE id=? AND disabled=0').get(s.user_id) || null : null;
 }
+const newSalt = () => crypto.randomBytes(16).toString('hex');
+const checkPw = password => { if (typeof password !== 'string' || password.length < 6) bad('password must be at least 6 characters'); };
 const createUser = (username, password, role) => {
   username = String(username || '').trim();
   if (!username) bad('username is required');
   if (!ROLES.includes(role)) bad('role must be one of ' + ROLES.join(', '));
-  if (typeof password !== 'string' || password.length < 6) bad('password must be at least 6 characters');
+  checkPw(password);
   if (db.prepare('SELECT 1 FROM users WHERE username=?').get(username)) bad('username already exists');
-  const salt = crypto.randomBytes(16).toString('hex');
+  const salt = newSalt();
   return db.prepare('INSERT INTO users(username,pw,salt,role,created) VALUES(?,?,?,?,?)').run(username, hashPw(password, salt), salt, role, new Date().toISOString()).lastInsertRowid;
 };
+
+// admin: change a user's role, disable/enable, reset the password. Every change ends that user's sessions; the change
+// that would leave no active admin is refused.
+async function updateUser(req, idStr, me) {
+  const u = /^\d+$/.test(idStr) ? db.prepare('SELECT * FROM users WHERE id=?').get(Number(idStr)) : null;
+  if (!u) bad('user not found', 404);
+  const b = await readBody(req);
+  for (const k of Object.keys(b)) if (!['role', 'disabled', 'password'].includes(k)) bad('unknown field: ' + k);
+  if (!Object.keys(b).length) bad('nothing to change: role, disabled or password');
+  const after = {};
+  if ('role' in b) { if (!ROLES.includes(b.role)) bad('role must be one of ' + ROLES.join(', ')); after.role = b.role; }
+  if ('disabled' in b) { if (typeof b.disabled !== 'boolean') bad('disabled must be true or false'); after.disabled = b.disabled ? 1 : 0; }
+  if ('password' in b) { checkPw(b.password); after.password_reset = true; }
+  const role = after.role ?? u.role, disabled = after.disabled ?? u.disabled;
+  tx(() => {
+    if (u.role === 'admin' && !u.disabled && (role !== 'admin' || disabled)
+      && db.prepare("SELECT COUNT(*) n FROM users WHERE role='admin' AND disabled=0 AND id<>?").get(u.id).n === 0) bad('the last active admin cannot be demoted or disabled', 409);
+    if ('password' in b) { const salt = newSalt(); db.prepare('UPDATE users SET pw=?, salt=? WHERE id=?').run(hashPw(b.password, salt), salt, u.id); }
+    db.prepare('UPDATE users SET role=?, disabled=? WHERE id=?').run(role, disabled, u.id);
+    db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+    audit(me, 'update', 'users', u.id, { username: u.username, before: { role: u.role, disabled: u.disabled }, after });
+  });
+  return db.prepare('SELECT id,username,role,disabled,created FROM users WHERE id=?').get(u.id);
+}
 
 // ---- modules (later tasks append require('./modules/x') here) -------------------
 const MODULES = [require('./modules/costs'), require('./modules/library'), require('./modules/tenders')].map(f => f(ctx));
@@ -92,6 +120,8 @@ async function api(req, res, url) {
     const u = db.prepare('SELECT * FROM users WHERE username=?').get(String(username || ''));
     if (!u || !pwMatches(password, u)) { recentFails(key); fails.set(key, [...(fails.get(key) || []), Date.now()]); return send(res, 401, { error: 'invalid credentials' }); }
     fails.delete(key);
+    if (u.disabled) return send(res, 403, { error: 'this account is disabled' });
+    db.prepare('DELETE FROM sessions WHERE created<=?').run(Date.now() - 30 * 864e5);   // expired sessions
     return send(res, 200, { ok: 1 }, { 'Set-Cookie': cookie(req, createSession(u.id), 2592000) });
   }
   if (a === 'logout' && method === 'POST') {
@@ -103,12 +133,17 @@ async function api(req, res, url) {
   if (!me) return send(res, 401, { error: 'unauthorized' });
   if (a === 'users') {
     need(me, 'admin');
-    if (method === 'GET') return send(res, 200, db.prepare('SELECT id,username,role,created FROM users ORDER BY id').all());
-    if (method === 'POST') {
-      const b = await readBody(req), id = createUser(b.username, b.password, b.role);
-      audit(me, 'create', 'users', id, { username: String(b.username).trim(), role: b.role });
+    if (parts.length === 1 && method === 'GET') return send(res, 200, db.prepare('SELECT id,username,role,disabled,created FROM users ORDER BY id').all());
+    if (parts.length === 1 && method === 'POST') {
+      const b = await readBody(req);
+      const id = tx(() => {
+        const uid = createUser(b.username, b.password, b.role);
+        audit(me, 'create', 'users', uid, { username: String(b.username).trim(), role: b.role });
+        return uid;
+      });
       return send(res, 200, { id });
     }
+    if (parts.length === 2 && method === 'PUT') return send(res, 200, await updateUser(req, parts[1], me));
   }
   if (a === 'settings') {
     if (method === 'GET') return send(res, 200, getSettings());

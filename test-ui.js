@@ -190,6 +190,11 @@ server.listen(0, async () => {
       await page.goto(origin + '/' + hash); await page.waitForSelector(sel);
     }
 
+    // Settings → Users: role, active and password reset per user
+    await page.goto(origin + '/#/settings'); await page.waitForSelector('#page-settings');
+    assert.ok(await page.$('#user-1 select') && await page.$('#user-1 input[type=checkbox]') && await page.$('#user-1 input[type=password]'), 'user row has role, active and reset password');
+    await page.goto(origin + '/#/'); await page.waitForSelector('#page-home');
+
     // Arabic: rtl, kept after reload
     await page.click('#lang-toggle');
     await page.waitForFunction(() => document.dir === 'rtl');

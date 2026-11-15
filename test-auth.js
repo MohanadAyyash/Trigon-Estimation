@@ -50,6 +50,52 @@ server.listen(0, async () => {
     assert.ok(au.j.some(e => e.action === 'create' && e.entity === 'users'), 'audit has users create');
     assert.ok(!JSON.stringify(au.j).includes('secret12'), 'no password in audit');
     assert.ok(!JSON.stringify((await call('GET', 'users', null, admin)).j).match(/"pw"|"salt"/), 'no hash leaked');
+    // ---- user management: role, disable, password reset (admin only); sessions end on every change ----
+    const db = require('./server.js').db;
+    const login = async (u, pw) => call('POST', 'login', { username: u, password: pw });
+    assert.strictEqual((await call('POST', 'users', { username: 'qs2', password: 'secret12', role: 'qs' }, admin)).s, 200);
+    const qs2Id = db.prepare("SELECT id FROM users WHERE username='qs2'").get().id, adminId = db.prepare("SELECT id FROM users WHERE username=?").get(su === race[0] ? 'admin' : 'admin2').id;
+    let qs2 = (await login('qs2', 'secret12')).ck;
+    assert.strictEqual((await call('GET', 'settings', null, qs2)).s, 200);
+    assert.strictEqual((await call('PUT', `users/${qs2Id}`, { role: 'viewer' }, qs2)).s, 403, 'only admin manages users');
+    assert.strictEqual((await call('PUT', 'users/99999', { role: 'viewer' }, admin)).s, 404);
+    for (const b of [{ role: 'root' }, { disabled: 'yes' }, { password: '123' }, { username: 'x' }, {}])
+      assert.strictEqual((await call('PUT', `users/${qs2Id}`, b, admin)).s, 400, 'bad user change ' + JSON.stringify(b));
+    // role change: sessions end, audited
+    assert.strictEqual((await call('PUT', `users/${qs2Id}`, { role: 'viewer' }, admin)).s, 200);
+    assert.strictEqual((await call('GET', 'settings', null, qs2)).s, 401, 'role change ends the sessions');
+    qs2 = (await login('qs2', 'secret12')).ck;
+    assert.strictEqual((await call('GET', 'status', null, qs2)).j.user.role, 'viewer');
+    // password reset: sessions end, old password refused, new one works; never in the audit log
+    assert.strictEqual((await call('PUT', `users/${qs2Id}`, { password: 'newpass99' }, admin)).s, 200);
+    assert.strictEqual((await call('GET', 'settings', null, qs2)).s, 401, 'password reset ends the sessions');
+    assert.strictEqual((await login('qs2', 'secret12')).s, 401);
+    qs2 = (await login('qs2', 'newpass99')).ck;
+    assert.strictEqual((await call('GET', 'settings', null, qs2)).s, 200);
+    // disable: sessions end, cannot sign in; enable again
+    assert.strictEqual((await call('PUT', `users/${qs2Id}`, { disabled: true }, admin)).s, 200);
+    assert.strictEqual((await call('GET', 'settings', null, qs2)).s, 401, 'disabling ends the sessions');
+    assert.strictEqual((await login('qs2', 'newpass99')).s, 403, 'a disabled user cannot sign in');
+    assert.strictEqual((await call('GET', 'users', null, admin)).j.find(u => u.id === qs2Id).disabled, 1);
+    assert.strictEqual((await call('PUT', `users/${qs2Id}`, { disabled: false }, admin)).s, 200);
+    assert.strictEqual((await login('qs2', 'newpass99')).s, 200);
+    const ua = db.prepare("SELECT detail FROM audit_log WHERE entity='users' AND action='update' AND entity_id=? ORDER BY id").all(String(qs2Id)).map(r => JSON.parse(r.detail));
+    assert.deepStrictEqual(ua.map(d => Object.keys(d.after || {}).sort().join()), ['role', 'password_reset', 'disabled', 'disabled']);
+    assert.ok(!JSON.stringify(ua).includes('newpass99'), 'no password in the audit log');
+    // the last active admin cannot demote or disable themselves; with a second admin they can be changed
+    const lastAdmin = await call('PUT', `users/${adminId}`, { role: 'qs' }, admin);
+    assert.strictEqual(lastAdmin.s, 409, 'last admin cannot be demoted'); assert.ok(/admin/.test(lastAdmin.j.error));
+    assert.strictEqual((await call('PUT', `users/${adminId}`, { disabled: true }, admin)).s, 409, 'last admin cannot be disabled');
+    assert.strictEqual((await call('GET', 'settings', null, admin)).s, 200, 'refused change ends nothing');
+    assert.strictEqual((await call('POST', 'users', { username: 'admin3', password: 'secret12', role: 'admin' }, admin)).s, 200);
+    const a3 = db.prepare("SELECT id FROM users WHERE username='admin3'").get().id;
+    assert.strictEqual((await call('PUT', `users/${a3}`, { disabled: true }, admin)).s, 200, 'another admin can be disabled while one stays active');
+    assert.strictEqual((await call('PUT', `users/${adminId}`, { role: 'qs' }, admin)).s, 409, 'a disabled admin does not count');
+    // expired sessions are purged on login
+    db.prepare('INSERT INTO sessions(token,user_id,created) VALUES(?,?,?)').run('ab'.repeat(24), qs2Id, Date.now() - 31 * 864e5);
+    await login('qs2', 'newpass99');
+    assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM sessions WHERE token=?').get('ab'.repeat(24)).n, 0, 'expired session purged');
+
     // lockout: 5 failures per username -> 429, even with the right password
     for (let i = 0; i < 5; i++) assert.strictEqual((await call('POST', 'login', { username: 'qs1', password: 'nope' })).s, 401);
     assert.strictEqual((await call('POST', 'login', { username: 'qs1', password: 'secret12' })).s, 429);

@@ -959,7 +959,22 @@
 
     // users
     const un = inp('u-name', ''), upw = inp('u-pw', '', { type: 'password', autocomplete: 'new-password' }), ur = sel('u-role', 'qs', [['qs', t('role_qs')], ['viewer', t('role_viewer')], ['admin', t('role_admin')]]);
-    page.append(card(t('users'), table([t('username'), t('role'), t('created')], users.map(u => h('tr', null, h('td', null, u.username), h('td', null, roleLabel(u.role)), h('td', null, fmtTime(u.created)))), { class: 'grid' }),
+    const roleOpts = [['qs', t('role_qs')], ['viewer', t('role_viewer')], ['admin', t('role_admin')]];
+    const urow = u => {
+      const role = sel('', u.role, roleOpts), on = h('input', { type: 'checkbox', checked: !u.disabled }), pw = inp('', '', { type: 'password', autocomplete: 'new-password', placeholder: t('new_password') });
+      const put = async (b, done) => { try { await api('PUT', 'users/' + u.id, b); flash(done, 'ok'); rerender(); } catch (e) { fail(e); } };
+      return h('tr', { id: 'user-' + u.id, class: u.disabled ? 'muted' : null }, h('td', null, u.username), h('td', null, role), h('td', null, on), h('td', null, fmtTime(u.created)),
+        h('td', null, h('button', { class: 'small', onclick: () => {
+          const b = {};
+          if (role.value !== u.role) b.role = role.value;
+          if (on.checked === !!u.disabled) b.disabled = !on.checked;
+          if (!Object.keys(b).length) { flash(t('nothing_changed'), 'ok'); return; }
+          if (confirm(t('user_change_confirm'))) put(b, t('saved'));
+        } }, t('save'))),
+        h('td', null, h('span', { class: 'row' }, pw, h('button', { class: 'small secondary', onclick: () => { if (confirm(t('user_change_confirm'))) put({ password: pw.value }, t('password_reset_done')); } }, t('reset_password')))));
+    };
+    page.append(card(t('users'), h('p', { class: 'muted small' }, t('users_note')),
+      h('div', { class: 'scroll' }, table([t('username'), t('role'), t('active'), t('created'), '', t('reset_password')], users.map(urow), { class: 'grid' })),
       h('h3', null, t('add_user')), h('div', { class: 'form-grid' }, field(t('username'), un), field(t('password'), upw), field(t('role'), ur)),
       h('button', { onclick: async () => { try { await api('POST', 'users', { username: un.value, password: upw.value, role: ur.value }); flash(t('saved'), 'ok'); rerender(); } catch (e) { fail(e); } } }, t('add'))));
 
