@@ -304,10 +304,11 @@ server.listen(0, async () => {
       const r = await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, ck);
       assert.strictEqual(r.s, 200);
       assert.strictEqual(r.h.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      assert.strictEqual(r.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client.xlsx"');
+      assert.strictEqual(r.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client-DRAFT.xlsx"', 'a draft client file is named DRAFT');
       const cs = sheetsOf(r.b);
       assert.deepStrictEqual(Object.keys(cs), ['BOQ']);
-      const rowsX = cs.BOQ;
+      assert.deepStrictEqual(cs.BOQ[0], ['DRAFT — NOT APPROVED', 'مسودة — غير معتمدة'], 'a draft client sheet starts with the DRAFT row');
+      const rowsX = cs.BOQ.slice(1);
       assert.deepStrictEqual(rowsX[0], ['No', 'Description', 'Unit', 'Qty', 'Rate', 'Amount']);
       const body = pr.rows.map(r2 => [r2.no, r2.description, r2.unit, r2.qty, r2.rate, r2.amount]);
       assert.deepStrictEqual(rowsX.slice(1, 1 + body.length), body, 'rows in BOQ order, rates as priced, headings blank, text kept verbatim');
@@ -323,14 +324,15 @@ server.listen(0, async () => {
     const cc = await getBin(base, `tenders/${tid}/export?format=csv&kind=client`, viewer);
     assert.strictEqual(cc.s, 200);
     assert.strictEqual(cc.h.get('content-type'), 'text/csv; charset=utf-8');
-    assert.strictEqual(cc.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client.csv"');
+    assert.strictEqual(cc.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client-DRAFT.csv"');
     assert.deepStrictEqual([...cc.b.subarray(0, 3)], [0xEF, 0xBB, 0xBF], 'UTF-8 BOM');
     const ctext = cc.b.toString('utf8').slice(1);
     assert.ok(!/(^|[^\r])\n/.test(ctext.replace(/"[^"]*"/g, '""')), 'CRLF line endings outside quoted fields');
     assert.ok(ctext.endsWith('\r\n'));
     assert.ok(ctext.includes('"Pipe, ""DN100""\nsecond line"'), 'RFC 4180 quoting');
     const crows = parseCsv(ctext);
-    assert.deepStrictEqual(crows[0], ['No', 'Description', 'Unit', 'Qty', 'Rate', 'Amount']);
+    assert.deepStrictEqual(crows[0], ['DRAFT — NOT APPROVED', 'مسودة — غير معتمدة'], 'a draft client CSV starts with the DRAFT row');
+    assert.deepStrictEqual(crows[1], ['No', 'Description', 'Unit', 'Qty', 'Rate', 'Amount']);
     assert.ok(crows.some(x => x[1] === "'=SUM(1,2)"), 'formula injection guarded');
     assert.ok(crows.some(x => x[1] === 'Pipe, "DN100"\nsecond line'));
     assert.ok(crows.some(x => x[1] === 'حفر التربة Excavation' && x[3] === '1250.5'), 'Arabic text and numbers round-trip');
@@ -464,7 +466,9 @@ server.listen(0, async () => {
     for (const ck of [qs, viewer]) {
       const r = await getBin(base, `tenders/${tid}/export?format=xlsx&kind=client`, ck);
       assert.strictEqual(r.s, 200, 'frozen client export allowed');
-      assert.deepStrictEqual(sheetsOf(r.b).BOQ, beforeX, 'frozen export unchanged by later data changes');
+      assert.deepStrictEqual(beforeX[0], ['DRAFT — NOT APPROVED', 'مسودة — غير معتمدة']);
+      assert.deepStrictEqual(sheetsOf(r.b).BOQ, beforeX.slice(1), 'frozen export: the draft numbers without the DRAFT row, unchanged by later data changes');
+      assert.strictEqual(r.h.get('content-disposition'), 'attachment; filename="tender-T-01___x-rev1-client.xlsx"', 'an approved client file is not named DRAFT');
     }
     const fz = sheetsOf((await getBin(base, `tenders/${tid}/export?format=xlsx&kind=internal`, qs)).b);
     assert.ok(Math.abs(fz.Summary.find(x => String(x[0]).startsWith('P '))[1] - pr.result.P) <= 0.0051, 'frozen P');

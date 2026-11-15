@@ -339,6 +339,7 @@
     const ready = price && (price.frozen || (price.result && price.complete && !price.blocking.length));
     const a = (kind, format, label) => h('a', { class: 'button secondary', href: `/api/tenders/${T.id}/export?format=${format}&kind=${kind}`, download: true }, label);
     const out = [h('span', { class: 'muted' }, t('export') + ':')];
+    if (ready && !price.frozen) out.push(h('span', { class: 'tag', title: t('export_draft_note') }, t('export_draft')));   // the file is marked DRAFT until approved
     if (ready) out.push(a('client', 'xlsx', t('export_client_xlsx')), a('client', 'csv', t('export_client_csv')));
     else out.push(h('span', { class: 'button secondary disabled', title: t('export_client_blocked') }, t('export_client_xlsx')));
     if (canWrite()) out.push(a('internal', 'xlsx', t('export_internal_xlsx')), a('internal', 'csv', t('export_internal_csv')));

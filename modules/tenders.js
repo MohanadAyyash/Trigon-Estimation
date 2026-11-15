@@ -47,6 +47,7 @@ const takeoffQty = lines => lines.reduce((s, x) => {
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const PARTIAL_EN = 'PARTIAL — not a tender price', PARTIAL_AR = 'سعر ناقص — ليس سعر المناقصة';
 const NO_PRICE_EN = 'NO PRICE — pricing is blocked', NO_PRICE_AR = 'لا يوجد سعر — التسعير متوقف';
+const DRAFT_EN = 'DRAFT — NOT APPROVED', DRAFT_AR = 'مسودة — غير معتمدة';
 // CSV: a text cell that a spreadsheet could read as a formula gets a leading quote (the client's BOQ text is untrusted)
 const csvCell = v => {
   if (v === null || v === undefined) return '';
@@ -398,7 +399,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
   }
 
   // ---- exports (xlsx / csv) ---------------------------------------------------------------------------------
-  // client: only a complete price; internal: also a draft, but a partial price is marked on its first row.
+  // client: only a complete price, and before approval marked DRAFT (first row + file name); internal: also a partial
+  // price, marked on its first row.
   // approved/sent/won/lost tenders read the frozen result only.
   function exportApi(res, url, t, me) {
     need(me, 'admin', 'qs', 'viewer');
@@ -426,6 +428,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         [null, 'Total', null, null, null, r.total],
         [null, 'Prices exclude VAT'], [null, 'الأسعار لا تشمل ضريبة القيمة المضافة'],
       ] }];
+      // before approval a client file is a draft: it says so on its first row and in its name
+      if (!FROZEN_STATUSES.includes(t.status)) sheets[0].rows.unshift([DRAFT_EN, DRAFT_AR]);
     } else {
       const label = o => [o.no, o.description].filter(Boolean).join(' ');
       const sum = [];
@@ -453,7 +457,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
           ...(r ? r.schedule.map(x => [x.month, round2(x.out), round2(x.in), round2(x.balance), round2(x.cost)]) : [])] },
       ];
     }
-    const name = `tender-${safeRef(t.ref, t.id)}-rev${t.rev}-${kind}.${format}`;
+    const draft = kind === 'client' && !FROZEN_STATUSES.includes(t.status);
+    const name = `tender-${safeRef(t.ref, t.id)}-rev${t.rev}-${kind}${draft ? '-DRAFT' : ''}.${format}`;
     const head = { 'Content-Disposition': `attachment; filename="${name}"` };
     if (format === 'xlsx') return reply(res, 200, writeXlsx(sheets), { ...head, 'Content-Type': XLSX_TYPE });
     return reply(res, 200, toCsv(sheets), { ...head, 'Content-Type': 'text/csv; charset=utf-8' });
