@@ -1,7 +1,8 @@
 // Drawings: raw DXF upload into a sha256 file store, parse in a worker thread into a gzipped JSON cache,
 // units confirmation and the per-layer table. Spec 5.1-5.2; plan Task 4.
 // Files live in DATA_DIR/drawings as <sha256>.dxf, <sha256>.json.gz (full cache, for later batches) and
-// <sha256>.summary.json.gz (what the GET routes read), never in the database.
+// <sha256>.summary.json.gz (what the GET routes read) and <sha256>.render.bin.gz (the viewer's display file, lib/dxf/render.js),
+// never in the database.
 const fs = require('fs'), fsp = require('fs/promises'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 const { Worker } = require('worker_threads');
 const { UNIT_TO_M, normUom } = require('../lib/units');
@@ -44,6 +45,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // temp uploads left by a stopped server are never valid: remove them
   for (const f of fs.readdirSync(DIR)) if (f.startsWith('tmp-')) { try { fs.unlinkSync(path.join(DIR, f)); } catch (e) { /* in use or gone */ } }
   const dxfFile = sha => path.join(DIR, sha + '.dxf'), cacheFile = sha => path.join(DIR, sha + '.json.gz'), summaryFile = sha => path.join(DIR, sha + '.summary.json.gz');
+  const renderFile = sha => path.join(DIR, sha + '.render.bin.gz');
   const tmpName = (ext = '') => path.join(DIR, 'tmp-' + crypto.randomBytes(12).toString('hex') + ext);
   // tmp -> dest. Content-addressed, so an existing dest is the same content: on Windows rename onto it can fail
   // (EPERM/EEXIST); then the tmp copy is dropped and the existing file kept.
@@ -202,7 +204,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (inflight.has(sha)) return inflight.get(sha);
     const p = enqueue(sha).then(async r => {
       if (!r.ok) return { ok: false, transient: !!r.transient, error: String(r.error || 'parse failed') };
-      try { await writeGz(r.cache, cacheFile(sha)); await writeGz(r.summary, summaryFile(sha)); }
+      // the summary last: a current summary means the other files are there too
+      try { await writeGz(r.render, renderFile(sha)); await writeGz(r.cache, cacheFile(sha)); await writeGz(r.summary, summaryFile(sha)); }
       catch (e) { return { ok: false, transient: true, error: 'could not save the parse result (' + (e.code || 'error') + ')' }; }
       summaries.delete(sha);
       return { ok: true, suggested_units: r.suggested_units ?? null };
@@ -234,8 +237,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     try { buf = await fsp.readFile(summaryFile(sha)); } catch (e) { bad('the parsed drawing is missing: upload the drawing again', 409); }
     return JSON.parse((await gunzip(buf)).toString('utf8'));
   };
-  // true when the stored summary was written by this parser version (never reuse another version's numbers)
-  const summaryCurrent = async sha => { try { return (await loadSummary(sha)).version === PARSER_VERSION; } catch (e) { return false; } };
+  // true when the stored summary was written by this parser version (never reuse another version's numbers) and the
+  // display file written with it is there
+  const summaryCurrent = async sha => { try { return (await loadSummary(sha)).version === PARSER_VERSION && fs.existsSync(renderFile(sha)); } catch (e) { return false; } };
   // parse the stored .dxf again (shared queue). A failure is recorded on the drawings that were 'ready', so later views
   // answer with it at once instead of queueing the same parse again.
   async function reparse(sha) {
@@ -258,7 +262,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const gone = () => bad('the parsed drawing is missing: upload the drawing again', 409);
     let v = null;
     try { v = await loadSummary(sha); } catch (e) { if (!fs.existsSync(dxfFile(sha))) gone(); }   // missing or unreadable summary: rebuild it when the .dxf is still there
-    if (!v || v.version !== PARSER_VERSION) {   // missing, unreadable, or written by another parser version: parse the file again
+    if (!v || v.version !== PARSER_VERSION || !fs.existsSync(renderFile(sha))) {   // missing, unreadable, another parser version, or no display file: parse the file again
       if (!fs.existsSync(dxfFile(sha))) bad('the parsed drawing is out of date: upload the drawing again', 409);
       await reparse(sha);
       v = await loadSummary(sha);
@@ -323,6 +327,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       const c = await readSummary(d.sha256), lt = scaledTable(c.raw, d.units);
       return reply(res, 200, { units: d.units, units_confirmed: d.units !== null, layers: lt.layers, warnings: [...c.warnings, ...lt.warnings] });
     }
+    if (sub === 'render' && parts.length === 3 && method === 'GET') return serveRender(req, res, d, me);
     if (sub === 'units' && parts.length === 3 && method === 'PUT') {
       need(me, 'admin', 'qs'); mustDraft(t);
       const b = await ctx.readBody(req);
@@ -341,6 +346,27 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     }
     if (sub === 'measurements' && parts.length === 3 && method === 'POST') return createMeasurement(req, res, d, t, me);
     return false;
+  }
+
+  // the display file, gzipped bytes as stored. Geometry is not a quantity: served before units are confirmed.
+  async function serveRender(req, res, d, me) {
+    need(me, 'admin', 'qs', 'viewer');
+    if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to show yet`, 409);
+    const sha = d.sha256, etag = `"${sha}-${PARSER_VERSION}"`;
+    if (!fs.existsSync(renderFile(sha))) summaries.delete(sha);   // readSummary then parses the file again
+    await readSummary(sha);
+    const tags = String(req.headers['if-none-match'] || '').split(',').map(t => t.trim().replace(/^W\//, ''));
+    if (tags.includes(etag) || tags.includes('*')) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'private, max-age=86400' }); res.end(); return true; }
+    let fh;
+    try { fh = await fsp.open(renderFile(sha), 'r'); } catch (e) { bad('the parsed drawing is missing: upload the drawing again', 409); }
+    let size;
+    try { size = (await fh.stat()).size; } catch (e) { await fh.close().catch(() => {}); throw e; }
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Encoding': 'gzip', 'Content-Length': size, ETag: etag, 'Cache-Control': 'private, max-age=86400' });
+    const rs = fh.createReadStream();   // closes the file when done
+    rs.on('error', () => res.destroy());
+    res.on('close', () => rs.destroy());
+    rs.pipe(res);
+    return true;
   }
 
   // ---- measurements: a layer metric or a block count linked to a tender row -----------------------------------

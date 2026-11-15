@@ -157,7 +157,7 @@ server.listen(0, async () => {
     assert.strictEqual(d.header.insunits, 4);
     assert.strictEqual(d.ignored.XLINE, 1, 'ignored entity types are reported');
     assert.ok(Array.isArray(d.warnings));
-    assert.deepStrictEqual(dirFiles(), [d.sha256 + '.dxf', d.sha256 + '.json.gz', d.sha256 + '.summary.json.gz']);
+    assert.deepStrictEqual(dirFiles(), [d.sha256 + '.dxf', d.sha256 + '.json.gz', d.sha256 + '.render.bin.gz', d.sha256 + '.summary.json.gz']);
     // the cache holds flat entries without codes
     const cache = JSON.parse(require('zlib').gunzipSync(fs.readFileSync(path.join(DDIR, d.sha256 + '.json.gz'))));
     assert.deepStrictEqual(Object.keys(cache).sort(), ['flat', 'header', 'ignored', 'layers', 'version', 'warnings']);
@@ -203,6 +203,50 @@ server.listen(0, async () => {
     assert.deepStrictEqual((await call('GET', `drawings/${id}/layers`, null, qs)).j, expectLayers('m'), 'layers in m = layerTable(full flat, m)');
     assert.ok(!fs.existsSync(path.join(DDIR, d.sha256 + '.json.gz')), 'the full cache was not needed');
     assert.strictEqual((await call('PUT', `drawings/${id}/units`, { units: 'mm' }, qs)).s, 200);
+
+    // ---- display file: GET /drawings/:id/render → the stored gz bytes as they are, ETag, 304; any reader, before units ----
+    {
+      const port = server.address().port, { PARSER_VERSION } = require('./lib/dxf/summary.js');
+      const getRaw = (u, ck, headers = {}) => new Promise((ok, no) => {
+        http.get({ port, path: '/api/' + u, headers: { cookie: ck, ...headers } }, rs => { const b = []; rs.on('data', c => b.push(c)); rs.on('end', () => ok({ s: rs.statusCode, h: rs.headers, b: Buffer.concat(b) })); }).on('error', no);
+      });
+      const rf = path.join(DDIR, d.sha256 + '.render.bin.gz');
+      const r1 = await getRaw(`drawings/${id}/render`, viewer);
+      assert.strictEqual(r1.s, 200, r1.b.toString());
+      assert.strictEqual(r1.h['content-type'], 'application/octet-stream'); assert.strictEqual(r1.h['content-encoding'], 'gzip');
+      assert.strictEqual(r1.h.etag, `"${d.sha256}-${PARSER_VERSION}"`); assert.strictEqual(r1.h['cache-control'], 'private, max-age=86400');
+      assert.ok(r1.b.equals(fs.readFileSync(rf)), 'the stored gz bytes as they are');
+      assert.strictEqual(Number(r1.h['content-length']), r1.b.length);
+      const raw = zlib.gunzipSync(r1.b), header = JSON.parse(raw.subarray(4, 4 + raw.readUInt32LE(0)).toString('utf8'));
+      assert.strictEqual(header.version, 1);
+      assert.deepStrictEqual(header.handles, cache.flat.map(f => f.handle), 'one entity per cache entry, same order');
+      assert.ok(header.layers.some(l => l.name === 'أسفلت'), 'Arabic layer name round-trips');
+      assert.deepStrictEqual(header.blocks, ['MH1']);
+      const r2 = await getRaw(`drawings/${id}/render`, qs, { 'If-None-Match': r1.h.etag });
+      assert.strictEqual(r2.s, 304); assert.strictEqual(r2.b.length, 0); assert.strictEqual(r2.h.etag, r1.h.etag);
+      assert.strictEqual((await getRaw(`drawings/${id}/render`, qs, { 'If-None-Match': '"other", ' + r1.h.etag })).s, 304, 'a list of tags');
+      assert.strictEqual((await getRaw(`drawings/${id}/render`, qs, { 'If-None-Match': `"${d.sha256}-1"` })).s, 200, 'another parser version: full body');
+      assert.strictEqual((await getRaw(`drawings/${id}/render`, '')).s, 401);
+      assert.strictEqual((await getRaw('drawings/99999/render', qs)).s, 404);
+      // before units are confirmed: geometry is not a quantity
+      const units = db.prepare('SELECT units FROM drawings WHERE id=?').get(id).units;
+      db.prepare('UPDATE drawings SET units=NULL WHERE id=?').run(id);
+      assert.strictEqual((await getRaw(`drawings/${id}/render`, viewer)).s, 200, 'served before units are confirmed');
+      db.prepare('UPDATE drawings SET units=? WHERE id=?').run(units, id);
+      // not ready → 409
+      for (const st of ['failed', 'parsing']) {
+        const nid = Number(db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(?,?,?,1,?,'x')").run(tid, 'nr', 'f'.repeat(64), st).lastInsertRowid);
+        const r = await getRaw(`drawings/${nid}/render`, qs);
+        assert.strictEqual(r.s, 409, st); assert.match(JSON.parse(r.b).error, new RegExp('drawing is ' + st));
+        db.prepare('DELETE FROM drawings WHERE id=?').run(nid);
+      }
+      // the display file is missing (a parse by an older version): parsed again through the shared queue, then served
+      fs.unlinkSync(rf);
+      const w = ctx.drawings._workers, started = w.started;
+      const r3 = await getRaw(`drawings/${id}/render`, qs);
+      assert.strictEqual(r3.s, 200, r3.b.toString()); assert.strictEqual(w.started - started, 1, 'one re-parse');
+      assert.ok(fs.existsSync(rf)); assert.ok(zlib.gunzipSync(r3.b).equals(raw), 'the same display file');
+    }
 
     // missing drawing → 404
     assert.strictEqual((await call('GET', 'drawings/99999', null, qs)).s, 404);
@@ -301,7 +345,7 @@ server.listen(0, async () => {
       assert.strictEqual(again.s, 200, JSON.stringify(again.j));
       assert.deepStrictEqual(again.j.layers, before.layers, 'the rebuilt summary gives the same totals');
       assert.strictEqual(w.started - started, 1, 'rebuilt by one parse');
-      assert.ok(fs.existsSync(path.join(DDIR, sha1 + '.summary.json.gz')) && fs.existsSync(path.join(DDIR, sha1 + '.json.gz')), 'both caches rewritten');
+      assert.ok(fs.existsSync(path.join(DDIR, sha1 + '.summary.json.gz')) && fs.existsSync(path.join(DDIR, sha1 + '.json.gz')) && fs.existsSync(path.join(DDIR, sha1 + '.render.bin.gz')), 'all caches rewritten');
       // the .dxf is gone as well: the old 409, and no worker starts, however often it is asked
       const id2 = await up('rebuild gone', FIXTURE.replace('NOTE', 'NOTE-GONE')), sha2 = shaOf(id2);
       rm(sha2, '.summary.json.gz', '.json.gz', '.dxf'); ctx.drawings._summaries().clear();

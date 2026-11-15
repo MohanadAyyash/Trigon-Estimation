@@ -505,4 +505,139 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   assert.strictEqual(byL(layerTable(flatten(att), att.layers, 'm'), 'MH').dropped, 0, 'ATTRIB is not a shape');
 }
 
+// ---- display file (render payload): Float32 points relative to the drawing origin, arcs tessellated ----
+{
+  const { buildRender } = require('./lib/dxf/render.js');
+  const zlib = require('zlib');
+  // tiny decoder (the real one is the browser's): uint32 headerLen, JSON, pad 4, layer/start/count u32, kind u8, pad 4,
+  // block u32, len/area f64, pts f32
+  const decode = buf => {
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const hl = dv.getUint32(0, true), header = JSON.parse(buf.subarray(4, 4 + hl).toString('utf8'));
+    let o = (4 + hl + 3) & ~3; const n = header.handles.length;
+    const arr = (get, size) => { const a = []; for (let i = 0; i < n; i++) { a.push(get(o)); o += size; } return a; };
+    const layer = arr(p => dv.getUint32(p, true), 4), start = arr(p => dv.getUint32(p, true), 4), count = arr(p => dv.getUint32(p, true), 4);
+    const kind = arr(p => dv.getUint8(p), 1); o = (o + 3) & ~3;
+    const block = arr(p => dv.getUint32(p, true), 4), len = arr(p => dv.getFloat64(p, true), 8), area = arr(p => dv.getFloat64(p, true), 8);
+    assert.strictEqual((buf.byteLength - o) % 8, 0, 'pts are whole (x, y) Float32 pairs');
+    const pts = []; for (; o < buf.byteLength; o += 8) pts.push([dv.getFloat32(o, true), dv.getFloat32(o + 4, true)]);
+    for (let i = 0; i < n; i++) assert.ok(start[i] + count[i] <= pts.length, 'entity ' + i + ' points in range');
+    const P = i => pts.slice(start[i], start[i] + count[i]).map(([x, y]) => [x + header.origin[0], y + header.origin[1]]);
+    return { header, layer, start, count, kind, block, len, area, pts, P, n };
+  };
+  const render = pairs => { const d = parseDxf(dxf(pairs)), f = flatten(d, { withSegs: true }); return { d, f, r: decode(buildRender(d, f)) }; };
+
+  // withSegs leaves every existing field and warning as it is
+  {
+    const pairs = [...sec('BLOCKS', block('BW', [...line('L', '0', 0, 0, 1, 0), [0, 'ARC'], [5, 'A'], [8, '0'], [10, 0], [20, 0], [40, 1], [50, 0], [51, 90]], [5, 6])),
+      ...ents([...insert('IW', 'BW', 'MH', [[41, 2], [42, 3]]), ...line('L2', 'K', 0, 0, 5, 0), ...hatch('HX', [], 0, 'K'), ...lwp('BOW', [[0, 0], [10, 10], [10, 0], [0, 10]], true, 'K')])];
+    const a = parseDxf(dxf(pairs)), b = parseDxf(dxf(pairs));
+    const fa = flatten(a), fb = flatten(b, { withSegs: true });
+    assert.ok(fa.every(e => !('segs' in e) && !('ins' in e)), 'default call: no segs, no ins');
+    assert.deepStrictEqual(fb.map(e => { const o = { ...e }; delete o.segs; delete o.ins; return o; }), fa);
+    assert.deepStrictEqual(b.warnings, a.warnings);
+    assert.ok(fb.filter(e => e.kind !== 'dropped').every(e => Array.isArray(e.segs)), 'segs on every non-dropped entity');
+    assert.ok(fb.filter(e => e.kind === 'dropped').every(e => !('segs' in e)));
+    assert.deepStrictEqual(fb.find(e => e.kind === 'insert').ins, [0, 0], 'ins = the insertion point in world coordinates');
+    assert.deepStrictEqual(fb.find(e => e.handle === 'L2').segs.map(s => [s.t, s.p0, s.p1]), [['L', [0, 0], [5, 0]]]);
+  }
+  // georeferenced: LINE (0,0)-(3,4) and a closed square, offset by (500000, 2700000) → origin there, points exact to 1e-3
+  {
+    const X = 500000, Y = 2700000;
+    const { f, r } = render([...tables([layerRec('ROAD'), layerRec('OFF', -3)]), ...ents([...line('G1', 'ROAD', X, Y, X + 3, Y + 4), ...lwp('G2', sq(X + 10, Y + 20, 10), true, 'NEW')])]);
+    assert.deepStrictEqual(r.header.origin, [X, Y]); assert.deepStrictEqual(r.header.bbox, [X, Y, X + 20, Y + 30]);
+    assert.strictEqual(r.header.version, 1);
+    assert.strictEqual(r.len[0], 5); assert.strictEqual(r.kind[0], 0); assert.ok(Number.isNaN(r.area[0]), 'null area → NaN');
+    r.P(0).forEach((p, k) => { near(p[0], [X, X + 3][k], 1e-3); near(p[1], [Y, Y + 4][k], 1e-3); });
+    assert.strictEqual(r.count[0], 2);
+    assert.strictEqual(r.kind[1], 1); assert.strictEqual(r.count[1], 4, 'closed: the closing point is not repeated');
+    r.P(1).forEach((p, k) => { near(p[0], sq(X + 10, Y + 20, 10)[k][0], 1e-3); near(p[1], sq(X + 10, Y + 20, 10)[k][1], 1e-3); });
+    near(r.len[1], 40); near(r.area[1], 100);
+    assert.deepStrictEqual(r.header.handles, f.map(e => e.handle));
+    // layers: the LAYER table (ACI colour; off/frozen), then layers only used by entities (colour 7)
+    assert.deepStrictEqual(r.header.layers, [{ name: 'ROAD', color: 7, off: false, frozen: false }, { name: 'OFF', color: 3, off: true, frozen: false },
+      { name: '0', color: 7, off: false, frozen: false }, { name: 'NEW', color: 7, off: false, frozen: false }]);
+    assert.deepStrictEqual(r.layer.map(i => r.header.layers[i].name), ['ROAD', 'NEW']);
+    assert.deepStrictEqual(r.block, [0xFFFFFFFF, 0xFFFFFFFF]); assert.deepStrictEqual(r.header.blocks, []);
+  }
+  // CIRCLE r 10: 4..256 points, chord error ≤ 0.02; ARC: ends exact; ELLIPSE: chord error ≤ 0.002 × major radius
+  {
+    const { r } = render(ents([[0, 'CIRCLE'], [5, 'C'], [8, '0'], [10, 100], [20, 100], [40, 10], [0, 'ARC'], [5, 'A'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 90],
+      [0, 'ELLIPSE'], [5, 'E'], [8, '0'], [10, 0], [20, 0], [11, 20], [21, 0], [40, 0.5], [41, 0], [42, 2 * Math.PI]]));
+    assert.strictEqual(r.kind[0], 1); assert.ok(r.count[0] >= 4 && r.count[0] <= 256, 'circle points ' + r.count[0]);
+    const cp = r.P(0); let worst = 0;
+    for (let k = 0; k < cp.length; k++) {
+      const p = cp[k], q = cp[(k + 1) % cp.length];
+      near(Math.hypot(p[0] - 100, p[1] - 100), 10, 1e-4);
+      worst = Math.max(worst, 10 - Math.hypot((p[0] + q[0]) / 2 - 100, (p[1] + q[1]) / 2 - 100));
+    }
+    assert.ok(worst <= 0.02, 'circle chord error ' + worst);
+    console.log('render: circle r 10 → ' + r.count[0] + ' points, max chord error ' + worst.toFixed(5));
+    const ap0 = r.P(1);
+    assert.strictEqual(r.kind[1], 0); near(ap0[0][0], 10, 1e-4); near(ap0[0][1], 0, 1e-4); near(ap0[ap0.length - 1][0], 0, 1e-4); near(ap0[ap0.length - 1][1], 10, 1e-4);
+    assert.ok(ap0.length >= 3 && ap0.length < r.count[0], 'a quarter arc takes fewer points than the full circle');
+    near(r.len[1], 5 * Math.PI, 1e-9);
+    const ep = r.P(2); let ew = 0;
+    for (let k = 0; k < ep.length; k++) {
+      const p = ep[k], q = ep[(k + 1) % ep.length], m = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+      near((p[0] / 20) ** 2 + (p[1] / 10) ** 2, 1, 1e-5);
+      // distance from the chord midpoint out to the ellipse along the ray from the centre
+      const s = 1 / Math.sqrt((m[0] / 20) ** 2 + (m[1] / 10) ** 2); ew = Math.max(ew, Math.hypot(m[0], m[1]) * (s - 1));
+    }
+    assert.ok(ew <= 0.002 * 20, 'ellipse chord error ' + ew);
+    assert.ok(r.count[2] >= 4 && r.count[2] <= 256);
+  }
+  // INSERT: one kind-2 marker at the insertion point (block base applied), the right block index; content drawn as flattened
+  {
+    const { f, r } = render([...sec('BLOCKS', [...block('B0', []), ...block('BR', line('L1', '0', 5, 6, 7, 6), [5, 6])]),
+      ...ents([...insert('I0', 'B0', 'MH', [[10, 1], [20, 2]]), ...insert('I1', 'BR', 'MH', [[10, 100], [20, 200], [50, 90]]), [0, 'MTEXT'], [5, 'T'], [8, 'MH'], [10, 3], [20, 4], [1, 'NOTE']])]);
+    assert.deepStrictEqual(f.map(e => [e.handle, e.kind]), [['I0', 'insert'], ['I1', 'insert'], ['I1/L1', 'open'], ['T', 'text']]);
+    assert.deepStrictEqual(r.header.blocks, ['B0', 'BR']);
+    assert.deepStrictEqual(r.kind, [2, 2, 0, 3]); assert.deepStrictEqual(r.count, [1, 1, 2, 1]);
+    assert.deepStrictEqual(r.block, [0, 1, 0xFFFFFFFF, 0xFFFFFFFF]);
+    near(r.P(0)[0][0], 1, 1e-5); near(r.P(0)[0][1], 2, 1e-5);
+    near(r.P(1)[0][0], 100, 1e-4); near(r.P(1)[0][1], 200, 1e-4);
+    near(r.P(2)[1][0], 100, 1e-4); near(r.P(2)[1][1], 202, 1e-4);   // rotated 90°: (7,6) - base → (0,2)
+    near(r.P(3)[0][0], 3, 1e-5); near(r.P(3)[0][1], 4, 1e-5);
+    assert.strictEqual(r.len[0], 0); assert.ok(Number.isNaN(r.area[0]));
+  }
+  // dropped → kind 4 with no points; handles round-trip in order
+  {
+    const { f, r } = render(ents([...line('A1', 'K', 0, 0, 1, 0), [0, 'MLINE'], [5, 'M1'], [8, 'K'], ...hatch('HX', [], 0, 'K'), ...line('A2', 'K', 0, 1, 1, 1)]));
+    assert.deepStrictEqual(r.header.handles, ['A1', 'M1', 'HX', 'A2']); assert.deepStrictEqual(r.header.handles, f.map(e => e.handle));
+    assert.deepStrictEqual(r.kind, [0, 4, 4, 0]); assert.deepStrictEqual(r.count, [2, 0, 0, 2]);
+    assert.ok(Number.isNaN(r.area[1])); assert.strictEqual(r.len[1], 0);
+    near(r.P(3)[0][1], 1, 1e-6);
+  }
+  // nothing to draw: origin (0,0), empty bbox, zero entities
+  {
+    const { r } = render(ents([]));
+    assert.deepStrictEqual(r.header.origin, [0, 0]); assert.deepStrictEqual(r.header.bbox, [0, 0, 0, 0]);
+    assert.strictEqual(r.n, 0); assert.strictEqual(r.pts.length, 0);
+  }
+  // the Float64 section starts on an 8-byte boundary (the browser can view it in place)
+  {
+    for (const k of [1, 2, 3, 5]) {
+      const d = parseDxf(dxf(ents(Array.from({ length: k }, (_, i) => line('Z' + i, 'L' + 'x'.repeat(i), 0, 0, i + 1, 0)).flat())));
+      const buf = buildRender(d, flatten(d, { withSegs: true })), hl = buf.readUInt32LE(0), n = k;
+      const o = ((4 + hl + 3) & ~3) + 12 * n + ((n + 3) & ~3) + 4 * n;
+      assert.strictEqual(o % 8, 0, 'Float64 offset ' + o);
+    }
+  }
+  // 100,000 LINEs: buildRender < 3000 ms
+  {
+    const parts = ['0\nSECTION\n2\nENTITIES'];
+    for (let i = 0; i < 100000; i++) parts.push('0\nLINE\n5\nH' + i + '\n8\nL' + (i % 20) + '\n10\n' + (500000 + i) + '\n20\n2700000\n11\n' + (500000 + i + 3) + '\n21\n2700004');
+    parts.push('0\nENDSEC\n0\nEOF\n');
+    const d = parseDxf(parts.join('\n')), f = flatten(d, { withSegs: true });
+    const t0 = performance.now(), buf = buildRender(d, f), ms = performance.now() - t0;
+    const gz = zlib.gzipSync(buf);
+    console.log('render 100k LINEs: buildRender ' + Math.round(ms) + ' ms, ' + buf.length + ' bytes, gz ' + gz.length + ' bytes');
+    assert.ok(ms < 3000, 'buildRender ' + ms + ' ms');
+    const r = decode(buf);
+    assert.strictEqual(r.n, 100000); assert.strictEqual(r.pts.length, 200000);
+    near(r.P(99999)[1][0], 500000 + 99999 + 3, 1e-3); near(r.P(99999)[1][1], 2700004, 1e-3);
+  }
+}
+
 console.log('ok test-dxf');
