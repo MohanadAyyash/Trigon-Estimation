@@ -188,6 +188,105 @@ server.listen(0, async () => {
     assert.ok((await page.textContent('#tab-body-quantities')).includes('<b id="xss">concrete</b>'), 'BOQ description shown literally');
     assert.ok(await page.$('#tab-body-quantities tr.heading'), 'heading rows are marked');
 
+    // ---- Drawings tab: upload a DXF, confirm units, link layers to rows, measured vs client qty ----------------
+    // fixture (mm): KERB = one 3000×4000 line (5 m open length in plan; its Z differs → z_ignored); أسفلت = a 10 m square (100 m2);
+    // MH = three MH1 inserts, two at the same point (a possible duplicate)
+    const dxf = pairs => [...pairs, [0, 'EOF']].map(([c, v]) => c + '\n' + v).join('\n') + '\n';
+    const dsec = (name, pairs) => [[0, 'SECTION'], [2, name], ...pairs, [0, 'ENDSEC']];
+    const layerRec = name => [[0, 'LAYER'], [2, name], [70, 0], [62, 7], [6, 'CONTINUOUS']];
+    const lwp = (hd, pts, layer) => [[0, 'LWPOLYLINE'], [5, hd], [8, layer], [90, pts.length], [70, 1], ...pts.flatMap(([x, y]) => [[10, x], [20, y]])];
+    const ins = (hd, x) => [[0, 'INSERT'], [5, hd], [8, 'MH'], [2, 'MH1'], [10, x], [20, 0]];
+    const FIX = dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
+      ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 3], ...layerRec('KERB'), ...layerRec('MH'), ...layerRec('أسفلت'), [0, 'ENDTAB']]),
+      ...dsec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
+      ...dsec('ENTITIES', [[0, 'LINE'], [5, 'K1'], [8, 'KERB'], [10, 0], [20, 0], [30, 0], [11, 3000], [21, 4000], [31, 500],
+        ...lwp('A1', [[0, 0], [10000, 0], [10000, 10000], [0, 10000]], 'أسفلت'), ...ins('M1', 0), ...ins('M2', 5000), ...ins('M3', 0),
+        [0, 'XLINE'], [5, 'X1'], [8, 'KERB']])]);
+    const { writeXlsx } = require('./lib/xlsx.js');
+    const dwg = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Drawings' }, admin), 'drawings tender')).id;
+    await ok(call('POST', `tenders/${dwg}/import`, { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Test asphalt', 'm2', 95]] }]).toString('base64'),
+      sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } }, admin), 'import');
+    const kerbRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '2', description: 'Test kerb', unit: 'm' }, admin), 'kerb row')).id;
+    const asphRow = (await call('GET', `tenders/${dwg}/rows`, null, admin)).j.find(r => r.description === 'Test asphalt').id;
+    const D = `#drawings[data-tender="${dwg}"]`;
+    await page.goto(`${origin}/#/tender/${dwg}/drawings`);
+    await page.waitForSelector(D + ' #dw-upload');
+    assert.ok((await page.textContent('.tabs')).match(/Quantities\s*Drawings\s*Links/), 'Drawings tab sits between Quantities and Links');
+    await page.fill('#dw-name', 'Test site plan');
+    await page.setInputFiles('#dw-file', { name: 'plan.dxf', mimeType: 'application/octet-stream', buffer: Buffer.from(FIX, 'utf8') });
+    await page.click('#dw-upload');
+    // parsed → the drawing opens with its units panel; nothing measured before the units are confirmed
+    await page.waitForSelector(D + ' #dw-confirm-units');
+    assert.strictEqual(await page.inputValue('#dw-unit-select'), 'mm', 'suggested units pre-selected');
+    const kerbBefore = await page.textContent(D + ' tr[data-layer="KERB"]');
+    assert.ok(kerbBefore.includes('—') && !kerbBefore.includes('5.00'), 'no quantity before the units are confirmed: ' + kerbBefore);
+    assert.strictEqual(await page.$(D + ' .lk-btn'), null, 'no Link buttons before the units are confirmed');
+    assert.ok((await page.textContent(D + ' #dw-ignored')).includes('XLINE × 1'), 'ignored entity types listed');
+    await page.click('#dw-confirm-units');
+    await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    assert.ok((await page.textContent(D + ' tr[data-layer="KERB"] td.m-open_length')).includes('5.00'), 'KERB open length 5.00 m');
+    assert.strictEqual((await page.textContent(D + ' tr[data-layer="أسفلت"] td.layer-name')).trim(), 'أسفلت', 'Arabic layer name unchanged');
+    assert.ok((await page.textContent(D + ' tr[data-layer="MH"] td.m-blocks')).includes('MH1: 3 / 0'), 'block counts top / nested');
+    assert.ok((await page.textContent(D + ' tr[data-layer="MH"] td.notes')).includes('MH1: 1 possible duplicate copies'), 'duplicate warning next to its layer');
+    assert.ok((await page.textContent(D + ' #dw-warnings li[data-code="z_ignored"]')).includes('Height (Z) differences ignored'), 'drawing warning in plain words');
+
+    // link KERB open length to the take-off row (m)
+    const linkTo = async (layer, metric, rowId) => {
+      await page.click(`${D} tr[data-layer="${layer}"] td.m-${metric} .lk-btn`);
+      await page.waitForSelector(D + ' #lk-form');
+      await page.selectOption('#lk-row', String(rowId));
+      await page.click('#lk-save');
+    };
+    await linkTo('KERB', 'open_length', kerbRow);
+    await page.waitForSelector(`${D} #dw-measurements tr[data-row="${kerbRow}"]`);
+    // the same layer on the same row again: the server's 409 with a confirm checkbox; untick → nothing saved
+    await linkTo('KERB', 'open_length', kerbRow);
+    await page.waitForSelector(D + ' #lk-confirm-overlap');
+    assert.ok((await page.textContent(D + ' #lk-msg')).includes('already measured on this row'), 'overlap message shown');
+    assert.strictEqual(await page.$(D + ' #lk-confirm-uom'), null, 'no unit checkbox for an overlap');
+    // a known unit mismatch (m into m2): message and the width/depth hint, no checkbox
+    await page.selectOption('#lk-row', String(asphRow));
+    await page.click('#lk-save');
+    await page.waitForFunction(() => (document.querySelector('#lk-msg') || {}).textContent.includes('unit mismatch'));
+    assert.ok(await page.$(D + ' #lk-hint-width'), 'width/depth hint for a unit mismatch');
+    assert.strictEqual(await page.$(D + ' #lk-confirm-uom'), null, 'no override for known units');
+    await page.click('#lk-cancel');
+    // the browser logs the two refusals asked for above (409 overlap, 400 unit mismatch); nothing else may be logged
+    for (const code of ['409 (Conflict)', '400 (Bad Request)']) {
+      const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes(code));
+      assert.ok(i >= 0, 'expected refusal logged: ' + code); errors.splice(i, 1);
+    }
+    // the Arabic asphalt layer's area → the imported m2 row (100 vs client 95: +5.26 %)
+    await linkTo('أسفلت', 'area', asphRow);
+    await page.waitForSelector(`${D} #dw-measurements tr[data-row="${asphRow}"]`);
+    assert.strictEqual((await call('GET', `tenders/${dwg}/measurements`, null, admin)).j.measurements.length, 2, 'two measurements saved');
+    if (process.env.DRAWINGS_SCREENSHOT) await page.screenshot({ path: process.env.DRAWINGS_SCREENSHOT, fullPage: true });
+
+    // Quantities: the take-off row qty is the measurement; the imported row keeps 95 and shows measured 100 with a warning badge
+    await page.click('#tab-quantities'); await page.waitForSelector('#tab-body-quantities');
+    assert.strictEqual(Number((await page.textContent(`#row-${kerbRow} td.qty`)).trim()), 5, 'take-off row qty 5 from the drawing');
+    const mtxt = await page.textContent(`#row-${asphRow} td.measured`);
+    assert.ok(mtxt.includes('100') && mtxt.includes('+5.3 %'), 'measured qty and diff on the imported row: ' + mtxt);
+    assert.ok(await page.$(`#row-${asphRow} td.measured .tag.bad`), 'diff above 5 % in the warning colour');
+    assert.ok((await page.textContent(`#row-${asphRow} td.qty`)).includes('95') || await page.inputValue(`#row-${asphRow} td.qty input`) === '95', 'client qty unchanged');
+    // Summary lists the measure warning (not blocking)
+    await page.click('#tab-summary'); await page.waitForSelector(`#summary[data-tender="${dwg}"]`);
+    const mw = await page.textContent('#measure-warnings');
+    assert.ok(mw.includes('Test asphalt') && mw.includes('+5.3 %'), 'measure warning listed: ' + mw);
+
+    // delete a measurement from the list → the row qty goes back to 0
+    await page.click('#tab-drawings'); await page.waitForSelector(`${D} #dw-measurements tr[data-row="${kerbRow}"]`);
+    await page.click(`${D} #dw-measurements tr[data-row="${kerbRow}"] .m-delete`);
+    await page.waitForFunction(r => !document.querySelector(`#dw-measurements tr[data-row="${r}"]`), kerbRow);
+    assert.strictEqual((await call('GET', `tenders/${dwg}/rows`, null, admin)).j.find(r => r.id === kerbRow).qty, 0, 'row qty after delete');
+
+    // a submitted tender: read-only (no upload, link, delete or units controls), numbers still shown
+    await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
+    await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
+    await page.click('#tab-drawings'); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    for (const s of ['#dw-upload', '#dw-confirm-units', '.lk-btn', '.m-delete']) assert.strictEqual(await page.$(D + ' ' + s), null, 'read-only: no ' + s);
+    assert.ok((await page.textContent(D + ' tr[data-layer="KERB"] td.m-open_length')).includes('5.00'), 'read-only still shows the numbers');
+
     // other screens
     for (const [hash, sel] of [['#/costs', '#page-costs'], ['#/library', '#page-library'], ['#/settings', '#page-settings'], ['#/', '#page-home']]) {
       await page.goto(origin + '/' + hash); await page.waitForSelector(sel);
@@ -207,6 +306,10 @@ server.listen(0, async () => {
     await page.goto(`${origin}/#/tender/${partial}/summary`);
     await page.waitForSelector(`#summary[data-tender="${partial}"] #num-P`);
     assert.ok((await page.textContent('#price-banner')).includes('سعر ناقص — ليس سعر المناقصة'), 'Arabic partial banner');
+    await page.goto(`${origin}/#/tender/${dwg}/drawings`);
+    await page.waitForSelector(`#drawings[data-tender="${dwg}"] #dw-layers[data-units="mm"]`);
+    assert.strictEqual((await page.textContent('#tab-drawings')).trim(), 'المخططات', 'Arabic tab label');
+    assert.strictEqual((await page.textContent(`#drawings tr[data-layer="أسفلت"] td.layer-name`)).trim(), 'أسفلت', 'Arabic layer name in the Arabic UI');
 
     assert.deepStrictEqual(errors, [], 'no console errors');
     await browser.close();

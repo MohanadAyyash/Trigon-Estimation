@@ -278,7 +278,7 @@
       page.append(previewBox);
     }
 
-    const tabs = [['info', t('tab_info')], ['quantities', t('tab_quantities')], ['links', t('tab_links')], ['hidden', t('tab_hidden')], ['summary', t('tab_summary')]];
+    const tabs = [['info', t('tab_info')], ['quantities', t('tab_quantities')], ['drawings', t('tab_drawings')], ['links', t('tab_links')], ['hidden', t('tab_hidden')], ['summary', t('tab_summary')]];
     if (!tabs.some(x => x[0] === tab)) tab = 'info';
     page.append(h('div', { class: 'tabs' }, tabs.map(([k, l]) => h('a', { id: 'tab-' + k, href: `#/tender/${id}/${k}`, class: k === tab ? 'active' : null }, l))));
     const body = h('div', { id: 'tab-body-' + tab, class: 'tab-body' });
@@ -286,6 +286,7 @@
     const ctx = { T, id, price, priceErr, frozen, editable, focusId };
     if (tab === 'info') tabInfo(body, ctx);
     else if (tab === 'quantities') await tabQuantities(body, ctx);
+    else if (tab === 'drawings') await tabDrawings(body, ctx);
     else if (tab === 'links') await tabLinks(body, ctx);
     else if (tab === 'hidden') await tabHidden(body, ctx);
     else tabSummary(body, ctx);
@@ -369,6 +370,21 @@
 
   // ---- tab: quantities (import + take-off) ----
   const colName = i => { let s = ''; for (let n = i + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s; return s; };
+  // measured vs client qty of a row (spec: a measurement never changes an imported row's qty). Mixed units are
+  // never added together: shown as "mixed units" with each unit in the tooltip.
+  const diffTxt = v => iso((v > 0 ? '+' : '') + v.toFixed(1) + ' %');
+  function measuredCell(r) {
+    if (r.is_heading) return null;
+    const units = r.measured_units || [], out = [];
+    if (units.length > 1) out.push(h('span', { class: 'tag bad', title: units.map(u => fmtQ(u.qty) + ' ' + u.unit).join(' · ') }, t('mixed_units')));
+    else if (units.length === 1 && r.source === 'import') {
+      out.push(h('span', { class: 'num' }, fmtQ(r.measured_qty) + ' ' + (r.measured_unit || '')));
+      if (fin(r.measured_diff_pct)) out.push(h('span', { class: 'tag' + (r.measure_diff ? ' bad' : ''), title: t('measured_diff_title') }, diffTxt(r.measured_diff_pct)));
+    }
+    if (r.measured_incomplete) out.push(h('span', { class: 'tag bad' }, t('measured_incomplete')));
+    return out;
+  }
+
   async function tabQuantities(body, { T, id, editable }) {
     const rows = await api('GET', `tenders/${id}/rows`);
     if (editable) body.append(importPanel(id, rows.some(r => r.source === 'import')));
@@ -384,16 +400,16 @@
           } }, t('save')));
         })() : h('span', { class: 'num' }, fmtQ(r.qty));
       tb.push(h('tr', { id: 'row-' + r.id, class: r.is_heading ? 'heading' : null },
-        h('td', null, r.no || ''), h('td', { class: 'desc' }, r.description || ''), h('td', null, r.unit || ''), h('td', { class: 'num' }, qtyCell),
-        h('td', null, isTake ? t('src_takeoff') : t('src_import')),
+        h('td', null, r.no || ''), h('td', { class: 'desc' }, r.description || ''), h('td', null, r.unit || ''), h('td', { class: 'num qty' }, qtyCell),
+        h('td', { class: 'num measured' }, measuredCell(r)), h('td', null, isTake ? t('src_takeoff') : t('src_import')),
         h('td', null, editable ? h('button', { class: 'small danger', onclick: async () => {
           if (!confirm(t('delete_row_confirm'))) return;
           try { await api('DELETE', `tenders/${id}/rows/${r.id}`); rerender(); } catch (e) { fail(e); }
         } }, t('delete')) : null)));
-      if (isTake && !r.is_heading) tb.push(h('tr', { class: 'lines-row' }, h('td'), h('td', { colspan: 5 }, takeoffLines(id, r, editable))));
+      if (isTake && !r.is_heading) tb.push(h('tr', { class: 'lines-row' }, h('td'), h('td', { colspan: 6 }, takeoffLines(id, r, editable))));
     }
     body.append(card(t('boq_rows'), h('p', { class: 'muted small' }, t('heading_hint')),
-      rows.length ? table([t('no'), t('description'), t('unit'), t('qty'), t('source'), ''], tb, { class: 'grid boq' }) : h('p', { class: 'muted' }, t('no_rows'))));
+      rows.length ? table([t('no'), t('description'), t('unit'), t('qty'), t('measured'), t('source'), ''], tb, { class: 'grid boq' }) : h('p', { class: 'muted' }, t('no_rows'))));
 
     if (editable) {
       const no = inp('to-no', ''), desc = inp('to-desc', ''), unit = inp('to-unit', ''), head = h('input', { type: 'checkbox', id: 'to-heading' });
@@ -468,6 +484,218 @@
       rd.readAsDataURL(f);
     });
     return card(t('import_boq'), field(t('xlsx_file'), file), box);
+  }
+
+  // ---- tab: drawings (DXF upload, units, layer table, links to rows, measurements) ----
+  // The server measures; the UI never computes a quantity. No number is shown before the units are confirmed.
+  const DW_UNITS = ['mm', 'cm', 'm', 'km', 'ft', 'in'];
+  const DW_MAX = 100 * 1024 * 1024;
+  const metricLabel = m => ({ open_length: t('mt_open_length'), closed_perimeter: t('mt_closed_perimeter'), area: t('mt_area'), count: t('mt_count') })[m] || m;
+  const dwStatusLabel = s => ({ parsing: t('dws_parsing'), ready: t('dws_ready'), failed: t('dws_failed') })[s] || s;
+  const warnLabel = c => ({ unsupported_polyline: t('wc_unsupported_polyline'), self_intersecting: t('wc_self_intersecting'), hatch_open_loop: t('wc_hatch_open_loop'),
+    hatch_cw_edge_unverified: t('wc_hatch_cw_edge_unverified'), hatch_no_boundary: t('wc_hatch_no_boundary'), hatch_loops_overlap: t('wc_hatch_loops_overlap'),
+    unsupported_hatch_edge: t('wc_unsupported_hatch_edge'), paper_space: t('wc_paper_space'), xref: t('wc_xref'), nonplanar: t('wc_nonplanar'),
+    missing_block: t('wc_missing_block'), z_ignored: t('wc_z_ignored'), degenerate_arc: t('wc_degenerate_arc'), possible_duplicate: t('wc_possible_duplicate') })[c] || c;
+  const rowText = r => [r.no, r.description].filter(Boolean).join(' — ') || '#' + r.id;
+  const rowOpts = rows => [['', t('lk_choose_row')], ...rows.filter(r => !r.is_heading).map(r => [String(r.id), rowText(r) + ' (' + (r.unit || '—') + ') · ' + (r.source === 'takeoff' ? t('src_takeoff') : t('src_import'))])];
+
+  // a drawing being parsed: ask again with backoff (0.3 s doubling, at most 3 s) while the same page is shown
+  function watchParse(did, onDone) {
+    const tok = routeTok;
+    let delay = 300;
+    const tick = async () => {
+      if (tok !== routeTok) return;
+      let d;
+      try { d = await api('GET', 'drawings/' + did); } catch (e) { if (tok === routeTok) fail(e); return; }
+      if (tok !== routeTok) return;
+      if (d.status === 'parsing') { delay = Math.min(delay * 2, 3000); setTimeout(tick, delay); return; }
+      onDone(d);
+    };
+    setTimeout(tick, delay);
+  }
+
+  function uploadPanel(id) {
+    const name = inp('dw-name', '', { maxlength: 200 }), file = h('input', { type: 'file', id: 'dw-file', accept: '.dxf' });
+    const msg = h('p', { id: 'dw-progress', class: 'muted' });
+    const say = (text, cls) => { msg.className = cls || 'muted'; msg.textContent = text; };
+    const btn = h('button', { id: 'dw-upload', onclick: async () => {
+      const f = file.files && file.files[0];
+      if (!f) return say(t('dw_no_file'), 'err');
+      if (f.size > DW_MAX) return say(t('dw_too_large'), 'err');
+      const title = val(name) || f.name.replace(/\.dxf$/i, '');
+      btn.disabled = true;
+      say(t('dw_uploading', { mb: (f.size / 1048576).toFixed(1) }));
+      let r, j = null;
+      try {
+        r = await fetch(`/api/tenders/${id}/drawings?name=${encodeURIComponent(title)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: f });
+        try { j = await r.json(); } catch (e) { j = null; }
+      } catch (e) { btn.disabled = false; return say(t('error') + ': ' + e.message, 'err'); }
+      if (r.status === 401) { me = null; return renderLogin(); }
+      // 413 (over 100 MB), 400 (binary DXF, no name), 409 (not a draft): the server's own words
+      if (!r.ok) { btn.disabled = false; return say(t('error') + ': ' + ((j && j.error) || r.statusText || r.status), 'err'); }
+      say(t('dw_parsing'));
+      watchParse(j.id, d => { location.hash = `#/tender/${id}/drawings/${d.id}`; });
+    } }, t('dw_upload'));
+    return card(t('dw_upload_title'), h('div', { class: 'form-grid' }, field(t('dw_name'), name), field(t('dw_file'), file)), btn, msg);
+  }
+
+  async function tabDrawings(body, { T, id, editable, focusId }) {
+    const [list, ms, rows] = await Promise.all([api('GET', `tenders/${id}/drawings`), api('GET', `tenders/${id}/measurements`), api('GET', `tenders/${id}/rows`)]);
+    const box = h('div', { id: 'drawings', 'data-tender': String(id) });
+    if (!editable) box.append(h('p', { class: 'muted' }, canWrite() && T.status !== 'draft' ? t('dw_read_only_note') : t('read_only')));
+    if (editable) box.append(uploadPanel(id));
+    const cur = list.find(d => d.id === focusId) || [...list].reverse().find(d => d.status === 'ready') || list[list.length - 1] || null;
+    box.append(card(t('dw_list'), list.length ? h('div', { class: 'scroll' }, table([t('dw_name'), t('dw_status'), t('dw_units'), t('dw_size_mb'), t('created')], list.map(d =>
+      h('tr', { class: cur && d.id === cur.id ? 'selected' : null }, h('td', null, h('a', { href: `#/tender/${id}/drawings/${d.id}`, dir: 'auto' }, d.name || '#' + d.id)),
+        h('td', null, h('span', { class: 'tag' + (d.status === 'failed' ? ' bad' : d.status === 'ready' ? ' good' : '') }, dwStatusLabel(d.status))),
+        h('td', null, d.units || '—'), h('td', { class: 'num' }, !fin(d.bytes) ? '—' : d.bytes < 10486 ? '< 0.01' : (d.bytes / 1048576).toFixed(2)),
+        h('td', null, (fmtTime(d.created) || '') + (d.created_by ? ' · ' + d.created_by : '')))), { class: 'grid' })) : h('p', { class: 'muted' }, t('dw_none'))));
+    for (const d of list.filter(x => x.status === 'parsing')) watchParse(d.id, () => rerender());
+    if (cur && cur.status === 'ready') await drawingPanel(box, cur, ms, rows, editable);
+    else if (cur && cur.status === 'failed') box.append(h('div', { class: 'banner banner-red' }, h('strong', null, t('dw_parse_failed')), ': ', cur.error || ''));
+    else if (cur) box.append(h('p', { class: 'muted' }, t('dw_parsing')));
+    box.append(measurementList(ms, rows, editable));
+    body.append(box);
+  }
+
+  async function drawingPanel(box, cur, ms, rows, editable) {
+    const [d, lt] = await Promise.all([api('GET', 'drawings/' + cur.id), api('GET', `drawings/${cur.id}/layers`)]);
+    const confirmed = lt.units_confirmed, measured = [...ms.measurements, ...ms.unlinked].some(m => m.drawing_id === d.id);
+    // units: the suggestion is pre-selected, nothing is computed until Confirm
+    const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable || measured });
+    const ignored = Object.entries(d.ignored || {});
+    box.append(h('section', { class: 'card', id: 'dw-units' }, h('h2', null, t('dw_units_title'), ' — ', h('span', { dir: 'auto' }, d.name || '')),
+      h('p', { class: 'muted small' }, d.suggested_units ? t('dw_suggested', { u: d.suggested_units }) : t('dw_no_suggested')),
+      h('div', { class: 'row wrap' }, unitSel, editable && !measured ? h('button', { id: 'dw-confirm-units', onclick: async ev => {
+        if (!unitSel.value) return flash(t('dw_choose_units'));
+        ev.target.disabled = true;
+        try { await api('PUT', `drawings/${d.id}/units`, { units: unitSel.value }); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+      } }, t('dw_confirm_units')) : null),
+      confirmed ? h('p', { class: 'small' }, h('span', { class: 'tag good' }, t('dw_units_confirmed', { u: lt.units }))) : h('p', { class: 'warn' }, t('dw_units_note')),
+      ignored.length ? h('p', { id: 'dw-ignored', class: 'small muted' }, t('dw_ignored') + ': ', ignored.map(([k, n]) => k + ' × ' + n).join(', ')) : null,
+      drawingWarnings((lt.warnings || []).filter(w => w.code !== 'possible_duplicate'))));
+
+    // layer table; possible duplicates sit next to their layer
+    const dups = new Map();
+    for (const w of lt.warnings || []) if (w.code === 'possible_duplicate' && w.detail && typeof w.detail === 'object') {
+      if (!dups.has(w.detail.layer)) dups.set(w.detail.layer, []);
+      dups.get(w.detail.layer).push(w.detail);
+    }
+    const canLink = editable && confirmed;
+    const linkBtn = (tr, target, ncols) => h('button', { class: 'small secondary lk-btn', onclick: () => {
+      const old = box.querySelector('#lk-form-row');
+      if (old) old.remove();
+      const fr = h('tr', { id: 'lk-form-row' }, h('td', { colspan: ncols }, linkForm({ drawing_id: d.id, ...target }, rows, () => fr.remove())));
+      tr.after(fr);
+    } }, t('dw_link'));
+    const heads = [t('dw_layer'), t('dw_open_length'), t('dw_closed_perimeter'), t('dw_area'), t('dw_blocks'), t('dw_notes')];
+    const trs = lt.layers.map(l => {
+      const tr = h('tr', { 'data-layer': l.layer });
+      const cell = metric => h('td', { class: 'num m-' + metric }, fin(l[metric])
+        ? [h('span', { class: 'num' }, fmt2(l[metric])), canLink && l[metric] > 0 ? [' ', linkBtn(tr, { tool: 'dxf_layer', layer: l.layer, metric }, heads.length)] : null]
+        : missing(t('dw_confirm_first')));
+      const blocks = h('td', { class: 'm-blocks' }, !Array.isArray(l.blocks) ? missing(t('dw_confirm_first'))
+        : l.blocks.map(b => h('div', { class: 'blk' }, h('span', { dir: 'auto' }, b.name), h('span', { class: 'num' }, ': ' + b.top + ' / ' + b.nested),
+          canLink && b.top + b.nested > 0 ? [' ', linkBtn(tr, { tool: 'dxf_blocks', layer: l.layer, block: b.name, metric: 'count', has_nested: b.nested > 0 }, heads.length)] : null)));
+      const notes = h('td', { class: 'notes' }, l.off ? h('span', { class: 'tag' }, t('dw_off')) : null, l.frozen ? h('span', { class: 'tag' }, t('dw_frozen')) : null,
+        l.area_excluded > 0 ? h('span', { class: 'tag warn-tag' }, t('dw_area_excluded', { n: l.area_excluded })) : null,
+        l.approx > 0 ? h('span', { class: 'tag warn-tag' }, t('dw_approx', { n: l.approx })) : null,
+        (dups.get(l.layer) || []).map(x => h('span', { class: 'tag warn-tag' }, x.block ? t('dw_block_duplicates', { block: x.block, n: x.count }) : t('dw_duplicates', { n: x.count }))));
+      tr.append(h('td', { class: 'layer-name' }, h('span', { dir: 'auto' }, l.layer)), cell('open_length'), cell('closed_perimeter'), cell('area'), blocks, notes);
+      return tr;
+    });
+    box.append(card(t('dw_layers'), h('div', { class: 'scroll' }, table(heads, trs, { class: 'grid layers', id: 'dw-layers', 'data-units': confirmed ? lt.units : null }))));
+  }
+
+  // drawing-level warnings, one line per code with how many and the first few entity handles
+  function drawingWarnings(ws) {
+    if (!ws.length) return null;
+    const by = new Map();
+    for (const w of ws) { if (!by.has(w.code)) by.set(w.code, []); by.get(w.code).push(w.detail); }
+    const det = v => v === null || v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+    return h('details', { id: 'dw-warnings', class: 'dw-warnings' }, h('summary', null, t('dw_warnings') + ' (' + ws.length + ')'),
+      h('ul', null, [...by].map(([code, list]) => h('li', { 'data-code': code }, h('strong', null, warnLabel(code)), ' × ' + list.length + ' ', h('code', { class: 'muted' }, code),
+        list.some(x => det(x)) ? h('div', { class: 'small muted', dir: 'auto' }, list.slice(0, 5).map(det).filter(Boolean).join(', ') + (list.length > 5 ? ', …' : '')) : null))));
+  }
+
+  // the server's refusal of a link: its message, plus a confirm box only for the refusals a user may confirm
+  function linkRefusal(e, msg, addConfirm) {
+    const j = e.body || {};
+    msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message));
+    let box = false;
+    if (e.status === 409 && j.error === 'unit mismatch') box = addConfirm('confirm_uom', t('lk_confirm_uom', { row: j.row_unit || '', qty: j.qty_unit || '' }));
+    else if (e.status === 409 && j.error === 'already measured on this row') box = addConfirm('confirm_overlap', t('lk_confirm_overlap'));
+    else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0 }));
+    else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
+    if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
+  }
+  // confirm checkboxes that stay once shown (a second refusal can follow the first)
+  function confirmBoxes(prefix) {
+    const boxes = {}, el = h('div');
+    const add = (key, text) => {
+      if (!boxes[key]) { boxes[key] = h('input', { type: 'checkbox', id: prefix + key.replace('_', '-') }); el.append(h('label', { class: 'field check' }, h('span', null, text), boxes[key])); }
+      return true;
+    };
+    const flags = () => Object.fromEntries(Object.entries(boxes).filter(([, cb]) => cb.checked).map(([k]) => [k, true]));
+    return { el, add, flags };
+  }
+
+  function linkForm(target, rows, close) {
+    const len = target.metric === 'open_length' || target.metric === 'closed_perimeter', count = target.metric === 'count';
+    const rowSel = sel('lk-row', '', rowOpts(rows));
+    const w = len ? inp('lk-width', '', { class: 'w-num', inputmode: 'decimal' }) : null, dp = count ? null : inp('lk-depth', '', { class: 'w-num', inputmode: 'decimal' });
+    const fac = inp('lk-factor', '', { class: 'w-num', inputmode: 'decimal', placeholder: '1' }), label = inp('lk-label', '', { maxlength: 200 });
+    const nested = count && target.has_nested ? h('input', { type: 'checkbox', id: 'lk-nested' }) : null;
+    const msg = h('div', { id: 'lk-msg' }), cb = confirmBoxes('lk-');
+    const what = target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
+      : [h('span', { dir: 'auto' }, target.layer), ' — ' + metricLabel(target.metric)];
+    const save = h('button', { id: 'lk-save', onclick: async () => {
+      const b = { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, layer: target.layer, metric: target.metric, ...cb.flags() };
+      if (target.tool === 'dxf_blocks') { b.block = target.block; if (nested) b.nested = nested.checked; }
+      if (w && !blank(w.value)) b.width = pnum(w.value);
+      if (dp && !blank(dp.value)) b.depth = pnum(dp.value);
+      if (!blank(fac.value)) b.factor = pnum(fac.value);
+      if (!blank(label.value)) b.label = label.value.trim();
+      save.disabled = true;
+      try { await api('POST', `drawings/${target.drawing_id}/measurements`, b); flash(t('saved'), 'ok'); rerender(); }
+      catch (e) { save.disabled = false; linkRefusal(e, msg, cb.add); }
+    } }, t('lk_save'));
+    return h('div', { id: 'lk-form', class: 'lk-form' }, h('h3', null, t('lk_title')), h('p', null, t('lk_what') + ': ', what),
+      h('div', { class: 'form-grid' }, field(t('lk_row'), rowSel, 'wide'), w ? field(t('width'), w) : null, dp ? field(t('depth'), dp) : null, field(t('lk_factor'), fac),
+        field(t('lk_label'), label), nested ? field(t('lk_nested'), nested, 'check') : null),
+      len || target.metric === 'area' ? h('p', { class: 'muted small' }, t('lk_dims_note')) : null,
+      msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'lk-cancel', class: 'secondary', onclick: close }, t('cancel'))));
+  }
+
+  // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink
+  function measurementList(ms, rows, editable) {
+    const src = m => [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
+    const how = m => metricLabel(m.metric) + [m.width, m.depth].filter(fin).map(x => ' × ' + fmtQ(x)).join('') + (fin(m.factor) && m.factor !== 1 ? ' × ' + fmtQ(m.factor) : '');
+    const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null];
+    const del = m => editable ? h('button', { class: 'small danger m-delete', onclick: async ev => {
+      if (!confirm(t('m_delete_confirm'))) return;
+      ev.target.disabled = true;
+      try { await api('DELETE', 'measurements/' + m.id); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+    } }, t('delete')) : null;
+    const relink = m => {
+      if (!editable) return null;
+      const rs = sel('', '', rowOpts(rows), { class: 'w-item' }), msg = h('div'), cb = confirmBoxes('rl-' + m.id + '-');
+      const go = h('button', { class: 'small', onclick: async () => {
+        go.disabled = true;
+        try { await api('PUT', 'measurements/' + m.id, { row_id: rs.value ? Number(rs.value) : null, ...cb.flags() }); rerender(); }
+        catch (e) { go.disabled = false; linkRefusal(e, msg, cb.add); }
+      } }, t('m_relink'));
+      return h('div', null, h('div', { class: 'row' }, rs, go), msg, cb.el);
+    };
+    const line = (m, last) => h('tr', { 'data-measurement': String(m.id), 'data-row': m.row_id === null ? null : String(m.row_id) },
+      h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', null, how(m)),
+      h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, del(m)));
+    const heads = [t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
+    return h('section', { class: 'card', id: 'dw-measurements' }, h('h2', null, t('measurements')),
+      ms.unlinked.length ? [h('h3', { class: 'err' }, t('m_unlinked') + ' (' + ms.unlinked.length + ')'),
+        h('div', { class: 'scroll' }, table(heads, ms.unlinked.map(m => line(m, relink)), { class: 'grid', id: 'dw-unlinked' }))] : null,
+      ms.measurements.length ? h('div', { class: 'scroll' }, table(heads, ms.measurements.map(m => line(m, x => h('span', { dir: 'auto' }, [x.row_no, x.row_description].filter(Boolean).join(' — ') + ' (' + (x.row_unit || '—') + ')'))), { class: 'grid' }))
+        : !ms.unlinked.length ? h('p', { class: 'muted' }, t('m_none')) : null);
   }
 
   // ---- tab: links (rows -> library items, manual unit rates, cost breakdown) ----
@@ -622,6 +850,18 @@
       })));
   }
 
+  // imported rows whose measured qty differs from the client's by more than 5 %: listed, never blocking
+  function measureWarningList(id, p) {
+    const rows = new Map((p.rows || []).map(r => [r.id, r]));
+    return h('section', { class: 'card', id: 'measure-warnings' }, h('h2', null, t('measure_warnings_title') + ' (' + p.measure_warnings.length + ')'),
+      h('p', { class: 'muted small' }, t('measure_warnings_note')),
+      h('ul', null, p.measure_warnings.map(w => {
+        const r = rows.get(w.row_id);
+        return h('li', null, h('a', { href: `#/tender/${id}/quantities/${w.row_id}` }, t('row') + ' ' + (r ? [r.no, r.description].filter(Boolean).join(' — ') : '#' + w.row_id)),
+          ' ', h('span', { class: 'tag bad' }, fin(w.diff_pct) ? diffTxt(w.diff_pct) : '—'));
+      })));
+  }
+
   function drawSummary(box, ctx, p, whatIf) {
     const { id, T } = ctx, r = p.result, st = priceState(p);
     box.replaceChildren();
@@ -633,6 +873,7 @@
     else if (st === 'blocked') box.append(h('div', { class: 'banner banner-red', id: 'price-banner' }, h('strong', null, t('blocked_banner')), ' ', t('blocked_detail')));
     if (p.blocking.length) box.append(blockingList(id, p));
     if ((p.snapshot_warnings || []).length) box.append(snapshotWarnings(p.snapshot_warnings));
+    if ((p.measure_warnings || []).length) box.append(measureWarningList(id, p));
 
     if (r) {
       box.append(threeNumbers(r, st));
