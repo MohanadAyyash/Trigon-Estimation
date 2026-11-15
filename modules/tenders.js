@@ -115,11 +115,12 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     return qty;
   }
   ctx.tenders = { recomputeTakeoffQty };
+  // measured_incomplete: a measurement saved with confirm_incomplete (its layer total left shapes out or approximated).
   // measured vs client qty. measured_qty only when one unit (else null, see measured_units); the difference only for an
   // imported row measured in its own unit with a non-zero qty
   const measuredView = r => {
     const m = ctx.drawings ? ctx.drawings.rowMeasuredQty(r.id) : null;
-    const v = { measured_qty: m ? m.qty : null, measured_unit: m ? m.unit : null, measured_units: m ? m.units : [], measured_diff_pct: null, measure_diff: false };
+    const v = { measured_qty: m ? m.qty : null, measured_unit: m ? m.unit : null, measured_units: m ? m.units : [], measured_diff_pct: null, measure_diff: false, measured_incomplete: !!(m && m.incomplete) };
     if (m && r.source === 'import' && !r.is_heading && m.unit !== null && m.unit === normUom(r.unit) && finNum(r.qty) && r.qty !== 0) {
       v.measured_diff_pct = (m.qty - r.qty) / r.qty * 100;
       v.measure_diff = Math.abs(v.measured_diff_pct) > 5;

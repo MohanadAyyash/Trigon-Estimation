@@ -30,6 +30,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
 `);
   // 1 = saved with confirm_uom: the user accepted that qty_unit differs from the row's unit
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'uom_confirmed')) db.exec('ALTER TABLE measurements ADD COLUMN uom_confirmed INTEGER NOT NULL DEFAULT 0');
+  // 1 = saved with confirm_incomplete: its layer had shapes with no area (area) or approximated curves
+  if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'incomplete')) db.exec('ALTER TABLE measurements ADD COLUMN incomplete INTEGER NOT NULL DEFAULT 0');
   const DIR = path.join(DATA_DIR, 'drawings');
   fs.mkdirSync(DIR, { recursive: true });
   // temp uploads left by a stopped server are never valid: remove them
@@ -57,11 +59,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   const hasMeasurements = rowId => !!db.prepare('SELECT 1 FROM measurements WHERE row_id=? LIMIT 1').get(rowId);
   // Σ qty per unit of the measurements linked to a row; qty/unit only when they share one unit (never add m to m2)
   const rowMeasuredQty = rowId => {
-    const units = db.prepare('SELECT qty_unit unit, SUM(qty) qty, COUNT(*) count FROM measurements WHERE row_id=? GROUP BY qty_unit ORDER BY qty_unit').all(rowId)
-      .map(u => ({ unit: u.unit, qty: u.qty, count: u.count }));
-    if (!units.length) return null;
-    const one = units.length === 1;
-    return { qty: one ? units[0].qty : null, unit: one ? units[0].unit : null, count: units.reduce((s, u) => s + u.count, 0), units };
+    const rows = db.prepare('SELECT qty_unit unit, SUM(qty) qty, COUNT(*) count, MAX(incomplete) inc FROM measurements WHERE row_id=? GROUP BY qty_unit ORDER BY qty_unit').all(rowId);
+    if (!rows.length) return null;
+    const units = rows.map(u => ({ unit: u.unit, qty: u.qty, count: u.count })), one = units.length === 1;
+    return { qty: one ? units[0].qty : null, unit: one ? units[0].unit : null, count: units.reduce((s, u) => s + u.count, 0), units, incomplete: rows.some(u => u.inc === 1) };
   };
   // what a take-off row's qty is built from (tenders.js applies the unit rule)
   const rowMeasurements = rowId => db.prepare('SELECT id, qty, qty_unit, uom_confirmed FROM measurements WHERE row_id=? ORDER BY id').all(rowId);
@@ -83,15 +84,15 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
-    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,created,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     let n = 0;
     for (const m of db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(oldTid)) {
       // never drop or detach a measurement silently: a broken link stops the revision
       if (!dmap.has(m.drawing_id)) bad(`measurement ${m.id}: its drawing is not in this tender`, 409);
       if (m.row_id !== null && !rowIdMap.has(m.row_id)) bad(`measurement ${m.id}: its row is not in this tender`, 409);
       insM.run(dmap.get(m.drawing_id), newTid, m.row_id === null ? null : rowIdMap.get(m.row_id), m.tool, m.layer, m.block, m.metric, m.nested, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.created, m.created_by);
+        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.created, m.created_by);
       n++;
     }
     // a copy taken while its file was still parsing gets its own result once the caller's transaction is over
@@ -291,7 +292,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // ---- measurements: a layer metric or a block count linked to a tender row -----------------------------------
   // qty = base × (width ?? 1) × (depth ?? 1) × factor, base from the same scaled layer table as GET layers.
   const LAYER_METRICS = ['open_length', 'closed_perimeter', 'area'];
-  const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap'];
+  const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap', 'confirm_incomplete'];
   const finNum = v => typeof v === 'number' && Number.isFinite(v);
   const optBool = (b, k) => { if (b[k] !== undefined && typeof b[k] !== 'boolean') bad(k + ' must be true or false'); return b[k] === true; };
   const optText = (b, k, max) => {
@@ -330,7 +331,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if ((m.metric === 'open_length' || m.metric === 'closed_perimeter') && m.depth !== null && m.width === null) bad('depth needs a width');
     m.qty_unit = m.metric === 'count' ? 'nr' : ['m', 'm2', 'm3'][(m.metric === 'area' ? 1 : 0) + (m.width !== null) + (m.depth !== null)];
     m.label = optText(b, 'label', 200); m.color = optText(b, 'color', 32);
-    m.confirm_uom = optBool(b, 'confirm_uom'); m.confirm_overlap = optBool(b, 'confirm_overlap');
+    m.confirm_uom = optBool(b, 'confirm_uom'); m.confirm_overlap = optBool(b, 'confirm_overlap'); m.confirm_incomplete = optBool(b, 'confirm_incomplete');
     return m;
   }
   const summaryOf = m => ({ drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, layer: m.layer, ...(m.tool === 'dxf_blocks' ? { block: m.block, nested: !!m.nested } : {}), metric: m.metric, qty: m.qty, qty_unit: m.qty_unit });
@@ -363,12 +364,15 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const c = await readSummary(d.sha256), lt = scaledTable(c.raw, d.units);
     const layer = lt.layers.find(l => l.layer === m.layer);
     if (!layer) bad('layer not found in this drawing: ' + m.layer);
-    let base, handles;
-    const warnings = [];
+    let base, handles, incomplete = null;
     if (m.tool === 'dxf_layer') {
       base = layer[m.metric]; handles = layer.entities;
-      if (m.metric === 'area' && layer.area_excluded) warnings.push({ code: 'area_excluded', count: layer.area_excluded });
-      if (layer.approx) warnings.push({ code: 'approx', count: layer.approx });
+      // closed shapes left out of the area, or approximated curves: the layer total is not the whole story
+      const area_excluded = m.metric === 'area' ? layer.area_excluded || 0 : 0, approx = layer.approx || 0;
+      if (area_excluded || approx) {
+        if (!m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', area_excluded, approx });
+        incomplete = { area_excluded, approx };
+      }
     } else {
       const bl = (layer.blocks || []).find(x => x.name === m.block);
       if (!bl) bad(`block ${m.block} not found on layer ${m.layer}`);
@@ -384,14 +388,15 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap);
-      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,created,created_by)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.layer, m.block, m.metric, m.nested ? 1 : 0, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, handles, ch.uomConfirmed, new Date().toISOString(), me.username).lastInsertRowid);
+      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,created,created_by)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.layer, m.block, m.metric, m.nested ? 1 : 0, m.width, m.depth, m.factor, m.label, m.color,
+        m.qty, m.qty_unit, handles, ch.uomConfirmed, incomplete ? 1 : 0, new Date().toISOString(), me.username).lastInsertRowid);
       const sum = summaryOf(m);
       audit(me, 'measure', 'measurements', id, sum);
       if (ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', id, { ...sum, row_unit: ch.row.unit });
       if (ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', id, { ...sum, overlaps: ch.overlaps });
-      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), warnings };
+      if (incomplete) audit(me, 'measure_incomplete_confirmed', 'measurements', id, { drawing_id: d.id, row_id: m.row_id, layer: m.layer, metric: m.metric, ...incomplete });
+      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete: !!incomplete };
     });
     return reply(res, 200, out);
   }

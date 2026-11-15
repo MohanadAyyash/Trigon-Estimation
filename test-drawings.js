@@ -281,9 +281,9 @@ server.listen(0, async () => {
       const ins = db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,metric,qty,qty_unit,created,created_by) VALUES(?,?,?,'dxf_layer','KERB','open_length',?,?,'2026-11-15','qs1')");
       ins.run(id, tid, rowA, 5, 'm'); ins.run(id, tid, rowA, 2.5, 'm'); ins.run(id, tid, null, 9, 'm');
       assert.strictEqual(ctx.drawings.hasMeasurements(rowA), true);
-      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowA), { qty: 7.5, unit: 'm', count: 2, units: [{ unit: 'm', qty: 7.5, count: 2 }] });
+      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowA), { qty: 7.5, unit: 'm', count: 2, units: [{ unit: 'm', qty: 7.5, count: 2 }], incomplete: false });
       ins.run(id, tid, rowB, 1, 'm'); ins.run(id, tid, rowB, 1, 'm2');
-      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowB), { qty: null, unit: null, count: 2, units: [{ unit: 'm', qty: 1, count: 1 }, { unit: 'm2', qty: 1, count: 1 }] }, 'mixed units: never one total');
+      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowB), { qty: null, unit: null, count: 2, units: [{ unit: 'm', qty: 1, count: 1 }, { unit: 'm2', qty: 1, count: 1 }], incomplete: false }, 'mixed units: never one total');
       const r = await call('PUT', `drawings/${id}/units`, { units: 'm' }, qs);
       assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'units cannot change after measuring (batch 4 adds a before/after flow)');
       // the second drawing (same file) has no measurements: its units can still be set
@@ -314,12 +314,14 @@ server.listen(0, async () => {
       const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
       const audits = action => db.prepare("SELECT detail FROM audit_log WHERE action=? ORDER BY id").all(action).map(a => JSON.parse(a.detail));
       const ins5 = (h, x, y) => [[0, 'INSERT'], [5, h], [8, 'MH'], [2, 'MH1'], [10, x], [20, y]];
-      // the Task 4 fixture plus an ASPHALT layer (one 10 m square = 100 m2) and a second MH1 insert
+      // the Task 4 fixture plus an ASPHALT layer (one 10 m square = 100 m2) and a second MH1 insert; BOW: a 2 m square and a
+      // self-intersecting bowtie (no area: excluded); CURVE: a SPLINE (approximated)
       const FIX5 = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
-        ...tables([layerRec('KERB'), layerRec('MH'), layerRec('ASPHALT')]),
+        ...tables([layerRec('KERB'), layerRec('MH'), layerRec('ASPHALT'), layerRec('BOW'), layerRec('CURVE')]),
         ...sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
         ...sec('ENTITIES', [...lwp('K1', sq(0, 0, 1000), true, 'KERB'), ...line('K2', 'KERB', 0, 0, 3000, 4000), ...ins5('M1', 0, 0), ...ins5('M2', 5000, 0),
-          ...lwp('A1', sq(0, 0, 10000), true, 'ASPHALT')])]);
+          ...lwp('A1', sq(0, 0, 10000), true, 'ASPHALT'), ...lwp('B1', sq(20000, 0, 2000), true, 'BOW'), ...lwp('B2', [[0, 20000], [1000, 21000], [1000, 20000], [0, 21000]], true, 'BOW'),
+          [0, 'SPLINE'], [5, 'S1'], [8, 'CURVE'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3000], [20, 4000]])]);
       const { writeXlsx } = require('./lib/xlsx.js');
       const boq = rows => ({ file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ...rows] }]).toString('base64'), sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } });
       const BOQ = boq([['1', 'ROADS', null, null], ['1.1', 'ASPHALT surfacing', 'm2', 95], ['1.2', 'Mobilisation', 'LS', 1]]);
@@ -412,6 +414,42 @@ server.listen(0, async () => {
       await ok(call('PUT', `drawings/${upB.j.id}/units`, { units: 'mm' }, qs), 'units B');
       assert.strictEqual((await measure({ row_id: rM2, ...kerb, width: 0.5 }, qs, upB.j.id)).s, 409, 'same sha256 → overlap');
 
+      // a layer total that leaves shapes out (bowtie: no area) or approximates curves (SPLINE): 409 unless confirm_incomplete
+      {
+        const lyr = (await ok(call('GET', `drawings/${D}/layers`, null, qs), 'layers')).layers;
+        assert.strictEqual(lyr.find(l => l.layer === 'BOW').area_excluded, 1); assert.ok(lyr.find(l => l.layer === 'CURVE').approx > 0);
+        const rA = await newRow('Paving', 'm2'), rC = await newRow('Edge', 'm');
+        r = await measure({ row_id: rA, tool: 'dxf_layer', layer: 'BOW', metric: 'area' });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'layer quantity is incomplete', area_excluded: 1, approx: 0 });
+        assert.strictEqual(await qtyOf(rA), 0, 'refused: nothing saved');
+        assert.strictEqual(audits('measure_incomplete_confirmed').length, 0);
+        const bi = await ok(measure({ row_id: rA, tool: 'dxf_layer', layer: 'BOW', metric: 'area', confirm_incomplete: true }), 'confirm_incomplete area');
+        near(bi.qty, 4, 'the square only'); assert.strictEqual(bi.incomplete, true); near(await qtyOf(rA), 4, 'row qty');
+        // the perimeter of the same layer is complete (no approximation): no confirmation needed
+        const bp = await ok(measure({ row_id: rC, tool: 'dxf_layer', layer: 'BOW', metric: 'closed_perimeter' }), 'perimeter');
+        assert.strictEqual(bp.incomplete, false);
+        r = await measure({ row_id: rC, tool: 'dxf_layer', layer: 'CURVE', metric: 'open_length' });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'layer quantity is incomplete'); assert.strictEqual(r.j.area_excluded, 0); assert.ok(r.j.approx > 0);
+        const ci = await ok(measure({ row_id: rC, tool: 'dxf_layer', layer: 'CURVE', metric: 'open_length', confirm_incomplete: true }), 'confirm_incomplete spline');
+        near(ci.qty, 5, 'spline length');
+        const ia = audits('measure_incomplete_confirmed');
+        assert.strictEqual(ia.length, 2);
+        assert.deepStrictEqual(ia[0], { drawing_id: D, row_id: rA, layer: 'BOW', metric: 'area', area_excluded: 1, approx: 0 }, 'counts only');
+        const vr = await rowsOf(T);
+        assert.strictEqual(vr.find(x => x.id === rA).measured_incomplete, true); assert.strictEqual(vr.find(x => x.id === rC).measured_incomplete, true);
+        assert.strictEqual(vr.find(x => x.id === rM2).measured_incomplete, false);
+        const il = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements;
+        assert.strictEqual(il.find(x => x.id === bi.id).incomplete, 1); assert.strictEqual(il.find(x => x.id === bp.id).incomplete, 0);
+        // relink keeps the flag
+        const rA2 = await newRow('Paving 2', 'm2');
+        await ok(call('PUT', `measurements/${bi.id}`, { row_id: rA2 }, qs), 'relink incomplete');
+        assert.strictEqual(db.prepare('SELECT incomplete FROM measurements WHERE id=?').get(bi.id).incomplete, 1);
+        assert.strictEqual((await rowsOf(T)).find(x => x.id === rA2).measured_incomplete, true);
+        // tidy up: these rows are not part of the checks below
+        for (const id of [bi.id, bp.id, ci.id]) await ok(call('DELETE', `measurements/${id}`, null, qs), 'tidy');
+        for (const id of [rA, rA2, rC]) await ok(call('DELETE', `tenders/${T}/rows/${id}`, null, qs), 'tidy row');
+      }
+
       // refusals: LS, heading, another tender's row, bad numbers, unknown fields, unknown layer/block
       const LS = await measure({ row_id: ls.id, ...kerb });
       assert.strictEqual(LS.s, 400, 'LS row'); assert.match(LS.j.error, /lump/i);
@@ -450,7 +488,7 @@ server.listen(0, async () => {
       assert.strictEqual((await call('PUT', `measurements/${ma1.id}`, { row_id: asph2.id }, viewer)).s, 403);
       await ok(call('PUT', `measurements/${ma1.id}`, { row_id: asph2.id }, qs), 'relink');
       assert.strictEqual((await rowsOf(T)).find(x => x.id === asph2.id).measure_diff, true);
-      assert.strictEqual(audits('measure_relink').length, 1);
+      assert.strictEqual(audits('measure_relink').at(-1).row_id, asph2.id);
       // moving a take-off measurement recomputes both rows
       await ok(call('PUT', `measurements/${m2.id}`, { row_id: rM, confirm_uom: true }, qs), 'move m2 → m row');
       near(await qtyOf(rM2), 4, 'old row recomputed'); near(await qtyOf(rM), 4.5, 'new row recomputed');
@@ -516,6 +554,19 @@ server.listen(0, async () => {
       near(del2.row_qty, 2.5, 'rev row recomputed'); near(await qtyOf(rM2), 6.5, 'original row untouched');
       assert.ok(nM);
       assert.ok(audits('revise').at(-1).measurements_copied === before.length);
+      // a drawing copied while it is still parsing gets its own parse in the Rev
+      {
+        const X = (await ok(call('POST', 'tenders', info, qs), 'x')).id;
+        const sha = odr[0].sha256;
+        const px = Number(db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(?,'still parsing',?,1,'parsing','x')").run(X, sha).lastInsertRowid);
+        db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(X);   // as if approved while the parse ran (uploads need a draft)
+        const rx = await ok(call('POST', `tenders/${X}/revise`, null, qs), 'revise x');
+        const copy = db.prepare('SELECT id, status FROM drawings WHERE tender_id=?').all(rx.id);
+        assert.strictEqual(copy.length, 1); assert.strictEqual(copy[0].status, 'parsing', 'copied as parsing');
+        const fin = await waitDone(copy[0].id, qs);
+        assert.strictEqual(fin.status, 'ready', fin.error); assert.strictEqual(fin.suggested_units, 'mm'); assert.strictEqual(fin.sha256, sha);
+        assert.strictEqual(db.prepare('SELECT status FROM drawings WHERE id=?').get(px).status, 'parsing', 'the original row is not touched by the copy');
+      }
     }
 
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------
