@@ -100,7 +100,7 @@ async function updateUser(req, idStr, me) {
 }
 
 // ---- modules (later tasks append require('./modules/x') here) -------------------
-const MODULES = [require('./modules/costs'), require('./modules/library'), require('./modules/tenders')].map(f => f(ctx));
+const MODULES = [require('./modules/costs'), require('./modules/library'), require('./modules/tenders'), require('./modules/drawings')].map(f => f(ctx));
 
 async function api(req, res, url) {
   const parts = url.pathname.split('/').slice(2), [a] = parts, method = req.method;
