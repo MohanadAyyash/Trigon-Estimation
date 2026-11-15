@@ -205,7 +205,11 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const p = enqueue(sha).then(async r => {
       if (!r.ok) return { ok: false, transient: !!r.transient, error: String(r.error || 'parse failed') };
       // the summary last: a current summary means the other files are there too
-      try { await writeGz(r.render, renderFile(sha)); await writeGz(r.cache, cacheFile(sha)); await writeGz(r.summary, summaryFile(sha)); }
+      // no display file (the summary says why): a stale one of an earlier parse is removed
+      try {
+        if (r.render) await writeGz(r.render, renderFile(sha)); else await fsp.unlink(renderFile(sha)).catch(e => { if (e.code !== 'ENOENT') throw e; });
+        await writeGz(r.cache, cacheFile(sha)); await writeGz(r.summary, summaryFile(sha));
+      }
       catch (e) { return { ok: false, transient: true, error: 'could not save the parse result (' + (e.code || 'error') + ')' }; }
       summaries.delete(sha);
       return { ok: true, suggested_units: r.suggested_units ?? null };
@@ -237,9 +241,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     try { buf = await fsp.readFile(summaryFile(sha)); } catch (e) { bad('the parsed drawing is missing: upload the drawing again', 409); }
     return JSON.parse((await gunzip(buf)).toString('utf8'));
   };
-  // true when the stored summary was written by this parser version (never reuse another version's numbers) and the
-  // display file written with it is there
-  const summaryCurrent = async sha => { try { return (await loadSummary(sha)).version === PARSER_VERSION && fs.existsSync(renderFile(sha)); } catch (e) { return false; } };
+  // the display file written with a summary is there, or the summary records why there is none
+  const renderDone = (v, sha) => (v.render && v.render.ok === false) || fs.existsSync(renderFile(sha));
+  // true when the stored summary was written by this parser version (never reuse another version's numbers) and is complete
+  const summaryCurrent = async sha => { try { const v = await loadSummary(sha); return v.version === PARSER_VERSION && renderDone(v, sha); } catch (e) { return false; } };
   // parse the stored .dxf again (shared queue). A failure is recorded on the drawings that were 'ready', so later views
   // answer with it at once instead of queueing the same parse again.
   async function reparse(sha) {
@@ -262,7 +267,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const gone = () => bad('the parsed drawing is missing: upload the drawing again', 409);
     let v = null;
     try { v = await loadSummary(sha); } catch (e) { if (!fs.existsSync(dxfFile(sha))) gone(); }   // missing or unreadable summary: rebuild it when the .dxf is still there
-    if (!v || v.version !== PARSER_VERSION || !fs.existsSync(renderFile(sha))) {   // missing, unreadable, another parser version, or no display file: parse the file again
+    if (!v || v.version !== PARSER_VERSION || !renderDone(v, sha)) {   // missing, unreadable, another parser version, or no display file: parse the file again
       if (!fs.existsSync(dxfFile(sha))) bad('the parsed drawing is out of date: upload the drawing again', 409);
       await reparse(sha);
       v = await loadSummary(sha);
@@ -354,7 +359,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to show yet`, 409);
     const sha = d.sha256, etag = `"${sha}-${PARSER_VERSION}"`;
     if (!fs.existsSync(renderFile(sha))) summaries.delete(sha);   // readSummary then parses the file again
-    await readSummary(sha);
+    const v = await readSummary(sha);
+    if (v.render && v.render.ok === false) bad('display not available for this drawing: ' + plain(v.render.error), 409);   // recorded: no re-parse
     const tags = String(req.headers['if-none-match'] || '').split(',').map(t => t.trim().replace(/^W\//, ''));
     if (tags.includes(etag) || tags.includes('*')) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'private, max-age=86400' }); res.end(); return true; }
     let fh;

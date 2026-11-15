@@ -218,7 +218,7 @@ server.listen(0, async () => {
       assert.ok(r1.b.equals(fs.readFileSync(rf)), 'the stored gz bytes as they are');
       assert.strictEqual(Number(r1.h['content-length']), r1.b.length);
       const raw = zlib.gunzipSync(r1.b), header = JSON.parse(raw.subarray(4, 4 + raw.readUInt32LE(0)).toString('utf8'));
-      assert.strictEqual(header.version, 1);
+      assert.strictEqual(header.version, 2);
       assert.deepStrictEqual(header.handles, cache.flat.map(f => f.handle), 'one entity per cache entry, same order');
       assert.ok(header.layers.some(l => l.name === 'أسفلت'), 'Arabic layer name round-trips');
       assert.deepStrictEqual(header.blocks, ['MH1']);
@@ -246,6 +246,32 @@ server.listen(0, async () => {
       const r3 = await getRaw(`drawings/${id}/render`, qs);
       assert.strictEqual(r3.s, 200, r3.b.toString()); assert.strictEqual(w.started - started, 1, 'one re-parse');
       assert.ok(fs.existsSync(rf)); assert.ok(zlib.gunzipSync(r3.b).equals(raw), 'the same display file');
+      // a display file that cannot be built (cap lowered for the test) never blocks the quantities: ready, layers with
+      // numbers; GET render → 409 with the reason, recorded in the summary, and no re-parse however often it is asked
+      process.env.DRAWINGS_RENDER_MAX_POINTS = '3';
+      const big = await upload(tid, 'too big to show', Buffer.from(FIXTURE.replace('NOTE', 'NOTE-NODISPLAY')), qs);
+      const db2 = await waitDone(big.j.id, qs);
+      delete process.env.DRAWINGS_RENDER_MAX_POINTS;
+      assert.strictEqual(db2.status, 'ready', db2.error);
+      assert.ok(!fs.existsSync(path.join(DDIR, db2.sha256 + '.render.bin.gz')), 'no display file');
+      const sm = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.join(DDIR, db2.sha256 + '.summary.json.gz'))));
+      assert.deepStrictEqual(sm.render, { ok: false, error: 'drawing too large to display' });
+      assert.strictEqual((await call('PUT', `drawings/${big.j.id}/units`, { units: 'mm' }, qs)).s, 200);
+      const bl = await call('GET', `drawings/${big.j.id}/layers`, null, qs);
+      assert.strictEqual(bl.s, 200); assert.ok(Math.abs(bl.j.layers.find(l => l.layer === 'KERB').open_length - 5) < 1e-9, 'quantities unaffected');
+      const s0 = w.started;
+      for (let i = 0; i < 2; i++) {
+        ctx.drawings._summaries().clear();
+        const g = await getRaw(`drawings/${big.j.id}/render`, viewer);
+        assert.strictEqual(g.s, 409); assert.deepStrictEqual(JSON.parse(g.b), { error: 'display not available for this drawing: drawing too large to display' });
+      }
+      assert.strictEqual(w.started - s0, 0, 'a recorded display failure is not parsed again');
+      // the same file uploaded again: the complete summary (with its recorded failure) is reused at once
+      const again = await upload(tid, 'too big again', Buffer.from(FIXTURE.replace('NOTE', 'NOTE-NODISPLAY')), qs);
+      assert.strictEqual(db.prepare('SELECT status FROM drawings WHERE id=?').get(again.j.id).status, 'ready'); assert.strictEqual(w.started - s0, 0);
+      // leave the store as the tests below expect it (one .dxf)
+      db.prepare('DELETE FROM drawings WHERE id IN (?, ?)').run(big.j.id, again.j.id);
+      for (const f of dirFiles()) if (f.startsWith(db2.sha256)) fs.unlinkSync(path.join(DDIR, f));
     }
 
     // missing drawing → 404

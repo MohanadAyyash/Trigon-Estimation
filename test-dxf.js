@@ -510,20 +510,23 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   const { buildRender } = require('./lib/dxf/render.js');
   const zlib = require('zlib');
   // tiny decoder (the real one is the browser's): uint32 headerLen, JSON, pad 4, layer/start/count u32, kind u8, pad 4,
-  // block u32, len/area f64, pts f32
+  // block u32, pad 8, len/area f64, eo f64 × 2n, pts f32 (relative to their entity's eo)
   const decode = buf => {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const hl = dv.getUint32(0, true), header = JSON.parse(buf.subarray(4, 4 + hl).toString('utf8'));
-    let o = (4 + hl + 3) & ~3; const n = header.handles.length;
+    const pad = (o, m) => { const e = Math.ceil(o / m) * m; for (let k = o; k < e; k++) assert.strictEqual(buf[k], 0, 'padding byte ' + k + ' is 0'); return e; };
+    let o = pad(4 + hl, 4); const n = header.handles.length;
     const arr = (get, size) => { const a = []; for (let i = 0; i < n; i++) { a.push(get(o)); o += size; } return a; };
     const layer = arr(p => dv.getUint32(p, true), 4), start = arr(p => dv.getUint32(p, true), 4), count = arr(p => dv.getUint32(p, true), 4);
-    const kind = arr(p => dv.getUint8(p), 1); o = (o + 3) & ~3;
-    const block = arr(p => dv.getUint32(p, true), 4), len = arr(p => dv.getFloat64(p, true), 8), area = arr(p => dv.getFloat64(p, true), 8);
+    const kind = arr(p => dv.getUint8(p), 1); o = pad(o, 4);
+    const block = arr(p => dv.getUint32(p, true), 4); o = pad(o, 8);
+    const len = arr(p => dv.getFloat64(p, true), 8), area = arr(p => dv.getFloat64(p, true), 8);
+    const eo = arr(p => [dv.getFloat64(p, true), dv.getFloat64(p + 8, true)], 16);
     assert.strictEqual((buf.byteLength - o) % 8, 0, 'pts are whole (x, y) Float32 pairs');
     const pts = []; for (; o < buf.byteLength; o += 8) pts.push([dv.getFloat32(o, true), dv.getFloat32(o + 4, true)]);
     for (let i = 0; i < n; i++) assert.ok(start[i] + count[i] <= pts.length, 'entity ' + i + ' points in range');
-    const P = i => pts.slice(start[i], start[i] + count[i]).map(([x, y]) => [x + header.origin[0], y + header.origin[1]]);
-    return { header, layer, start, count, kind, block, len, area, pts, P, n };
+    const P = i => pts.slice(start[i], start[i] + count[i]).map(([x, y]) => [x + eo[i][0], y + eo[i][1]]);
+    return { header, layer, start, count, kind, block, len, area, eo, pts, P, n };
   };
   const render = pairs => { const d = parseDxf(dxf(pairs)), f = flatten(d, { withSegs: true }); return { d, f, r: decode(buildRender(d, f)) }; };
 
@@ -546,7 +549,8 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     const X = 500000, Y = 2700000;
     const { f, r } = render([...tables([layerRec('ROAD'), layerRec('OFF', -3)]), ...ents([...line('G1', 'ROAD', X, Y, X + 3, Y + 4), ...lwp('G2', sq(X + 10, Y + 20, 10), true, 'NEW')])]);
     assert.deepStrictEqual(r.header.origin, [X, Y]); assert.deepStrictEqual(r.header.bbox, [X, Y, X + 20, Y + 30]);
-    assert.strictEqual(r.header.version, 1);
+    assert.strictEqual(r.header.version, 2);
+    assert.deepStrictEqual(r.eo, [[X, Y], [X + 10, Y + 20]], 'each entity\'s own bbox min');
     assert.strictEqual(r.len[0], 5); assert.strictEqual(r.kind[0], 0); assert.ok(Number.isNaN(r.area[0]), 'null area → NaN');
     r.P(0).forEach((p, k) => { near(p[0], [X, X + 3][k], 1e-3); near(p[1], [Y, Y + 4][k], 1e-3); });
     assert.strictEqual(r.count[0], 2);
@@ -618,7 +622,7 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     const p = r.pts.slice(r.start[0], r.start[0] + r.count[0]), brk = p.map((q, k) => Number.isNaN(q[0]) || Number.isNaN(q[1]) ? k : -1).filter(k => k >= 0);
     assert.deepStrictEqual(brk, [4], 'exactly one break, between the loops');
     assert.ok(Number.isNaN(p[4][0]) && Number.isNaN(p[4][1]), 'the break is a NaN,NaN pair');
-    const o = r.header.origin, abs = q => [q[0] + o[0], q[1] + o[1]];
+    const o = r.eo[0], abs = q => [q[0] + o[0], q[1] + o[1]];
     assert.deepStrictEqual(p.slice(0, 4).map(abs), sq(0, 0, 10)); assert.deepStrictEqual(p.slice(5).map(abs), sq(4, 4, 2));
     // drawn as consecutive pairs, never across the break: no segment from loop 1's last point to loop 2's first
     const segs = []; for (let k = 0; k + 1 < p.length; k++) if (!Number.isNaN(p[k][0]) && !Number.isNaN(p[k + 1][0])) segs.push([abs(p[k]), abs(p[k + 1])]);
@@ -633,14 +637,54 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     assert.deepStrictEqual(r.header.origin, [0, 0]); assert.deepStrictEqual(r.header.bbox, [0, 0, 0, 0]);
     assert.strictEqual(r.n, 0); assert.strictEqual(r.pts.length, 0);
   }
-  // the Float64 section starts on an 8-byte boundary (the browser can view it in place)
+  // zero padding at every alignment (the decoder checks it), whatever the header and entity counts
+  for (const k of [1, 2, 3, 5]) {
+    const { r } = render(ents(Array.from({ length: k }, (_, i) => line('Z' + i, 'L' + 'x'.repeat(i), 0, 0, i + 1, 0)).flat()));
+    assert.strictEqual(r.n, k); near(r.P(k - 1)[1][0], k, 0);
+  }
+  // review fix 1: a georeferenced drawing in mm with a stray entity near (0,0). Each entity has its own origin, so a 5 mm
+  // line at (500,000,000; 2,700,000,000) keeps its length and position (a shared origin gave a 256 mm Float32 spacing)
   {
-    for (const k of [1, 2, 3, 5]) {
-      const d = parseDxf(dxf(ents(Array.from({ length: k }, (_, i) => line('Z' + i, 'L' + 'x'.repeat(i), 0, 0, i + 1, 0)).flat())));
-      const buf = buildRender(d, flatten(d, { withSegs: true })), hl = buf.readUInt32LE(0), n = k;
-      const o = ((4 + hl + 3) & ~3) + 12 * n + ((n + 3) & ~3) + 4 * n;
-      assert.strictEqual(o % 8, 0, 'Float64 offset ' + o);
-    }
+    const X = 500000000, Y = 2700000000;
+    const { r, f } = render([...sec('BLOCKS', block('BA', [[0, 'ARC'], [5, 'A1'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 90]])),
+      ...ents([...insert('I1', 'BA', '0', [[210, 0], [220, 0], [230, -1]]), ...line('S', '0', X, Y, X + 3, Y + 4)])]);
+    assert.deepStrictEqual(f.map(e => e.handle), ['I1', 'I1/A1', 'S']);
+    assert.deepStrictEqual(r.header.origin, [-10, 0]);
+    const p = r.P(2);
+    near(p[0][0], X, 1e-3); near(p[0][1], Y, 1e-3); near(p[1][0], X + 3, 1e-3); near(p[1][1], Y + 4, 1e-3);
+    near(Math.hypot(p[1][0] - p[0][0], p[1][1] - p[0][1]), 5, 1e-3);
+    assert.deepStrictEqual(r.eo[2], [X, Y]);
+  }
+  // review fix 3: negative sweeps. A mirrored INSERT (extrusion 0,0,-1) of a 0..90° arc lies in the second quadrant;
+  // a clockwise hatch arc edge (270..360 stored clockwise) in the first. Points on the circle, tessellated, ends exact.
+  {
+    const onArc = (pts, r, inQuad, what) => {
+      const arc = pts.filter(q => Math.abs(Math.hypot(q[0], q[1]) - r) <= 1e-4);
+      assert.ok(arc.length >= 13, what + ': tessellated (' + arc.length + ' points on the circle)');
+      assert.ok(arc.every(inQuad), what + ': every point in the right quadrant');
+      assert.ok(arc.some(q => Math.abs(Math.atan2(Math.abs(q[1]), Math.abs(q[0])) - Math.PI / 4) < 0.07), what + ': passes through the middle of the quadrant');
+      return arc;
+    };
+    const m = render([...sec('BLOCKS', block('BA', [[0, 'ARC'], [5, 'A1'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 90]])),
+      ...ents(insert('I1', 'BA', '0', [[210, 0], [220, 0], [230, -1]]))]).r;
+    const mp = m.P(1);
+    assert.strictEqual(mp.length, m.count[1]);
+    onArc(mp, 10, q => q[0] <= 1e-4 && q[1] >= -1e-4, 'mirrored INSERT arc');
+    near(mp[0][0], -10, 1e-4); near(mp[0][1], 0, 1e-4); near(mp[mp.length - 1][0], 0, 1e-4); near(mp[mp.length - 1][1], 10, 1e-4);
+    const q10 = [[92, 1], [93, 3], [72, 1], [10, 0], [20, 0], [11, 0], [21, 10], ...arcEdge(0, 0, 10, 270, 360, 0), [72, 1], [10, 10], [20, 0], [11, 0], [21, 0], [97, 0]];
+    const h = render(ents(hatch('HC', [q10]))).r, hp = h.P(0);
+    assert.ok(hp.every(q => Number.isFinite(q[0])), 'one loop: no break');
+    onArc(hp, 10, q => q[0] >= -1e-4 && q[1] >= -1e-4, 'clockwise hatch arc');
+    assert.ok(hp.some(q => Math.abs(q[0]) < 1e-4 && Math.abs(q[1]) < 1e-4), 'the corner at the centre');
+  }
+  // review fix 4: flats without segs → a clear error; review fix 2: more points than the cap → 'drawing too large to display'
+  {
+    const d = parseDxf(dxf(ents([...line('A', '0', 0, 0, 1, 0), ...insert('I', 'NONE', '0')])));
+    assert.throws(() => buildRender(d, flatten(d)), /^Error: buildRender needs flatten\(doc, \{ withSegs: true \}\)$/);
+    const f = flatten(d, { withSegs: true });
+    assert.throws(() => buildRender(d, f.filter(e => e.kind === 'insert').map(e => ({ ...e, ins: undefined }))), /needs flatten/);
+    assert.throws(() => buildRender(d, f, { maxPoints: 2 }), /^Error: drawing too large to display$/);
+    assert.strictEqual(decode(buildRender(d, f, { maxPoints: 3 })).pts.length, 3);
   }
   // 100,000 LINEs: buildRender < 3000 ms
   {
