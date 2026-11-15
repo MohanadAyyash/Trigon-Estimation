@@ -382,6 +382,7 @@
       if (fin(r.measured_diff_pct)) out.push(h('span', { class: 'tag' + (r.measure_diff ? ' bad' : ''), title: t('measured_diff_title') }, diffTxt(r.measured_diff_pct)));
     }
     if (r.measured_incomplete) out.push(h('span', { class: 'tag bad' }, t('measured_incomplete')));
+    if (r.measured_duplicate) out.push(h('span', { class: 'tag bad' }, t('measured_duplicate')));
     return out;
   }
 
@@ -633,6 +634,7 @@
     let box = false;
     if (e.status === 409 && j.error === 'unit mismatch') box = addConfirm('confirm_uom', t('lk_confirm_uom', { row: j.row_unit || '', qty: j.qty_unit || '' }));
     else if (e.status === 409 && j.error === 'already measured on this row') box = addConfirm('confirm_overlap', t('lk_confirm_overlap'));
+    else if (e.status === 409 && j.error === 'possible duplicates on this layer') box = addConfirm('confirm_duplicate', t('lk_confirm_duplicate', { n: j.duplicates || 0 }));
     else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0, c: j.dropped || 0 }));
     else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
     if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
@@ -692,7 +694,7 @@
   function measurementList(ms, rows, editable) {
     const src = m => [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
     const how = m => metricLabel(m.metric) + [m.width, m.depth].filter(fin).map(x => ' × ' + fmtQ(x)).join('') + (fin(m.factor) && m.factor !== 1 ? ' × ' + fmtQ(m.factor) : '');
-    const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null];
+    const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null];
     const del = m => editable ? h('button', { class: 'small danger m-delete', onclick: async ev => {
       if (!confirm(t('m_delete_confirm'))) return;
       ev.target.disabled = true;

@@ -342,9 +342,9 @@ server.listen(0, async () => {
       const ins = db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,metric,qty,qty_unit,created,created_by) VALUES(?,?,?,'dxf_layer','KERB','open_length',?,?,'2026-11-15','qs1')");
       ins.run(id, tid, rowA, 5, 'm'); ins.run(id, tid, rowA, 2.5, 'm'); ins.run(id, tid, null, 9, 'm');
       assert.strictEqual(ctx.drawings.hasMeasurements(rowA), true);
-      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowA), { qty: 7.5, unit: 'm', count: 2, units: [{ unit: 'm', qty: 7.5, count: 2 }], incomplete: false });
+      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowA), { qty: 7.5, unit: 'm', count: 2, units: [{ unit: 'm', qty: 7.5, count: 2 }], incomplete: false, duplicate: false });
       ins.run(id, tid, rowB, 1, 'm'); ins.run(id, tid, rowB, 1, 'm2');
-      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowB), { qty: null, unit: null, count: 2, units: [{ unit: 'm', qty: 1, count: 1 }, { unit: 'm2', qty: 1, count: 1 }], incomplete: false }, 'mixed units: never one total');
+      assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowB), { qty: null, unit: null, count: 2, units: [{ unit: 'm', qty: 1, count: 1 }, { unit: 'm2', qty: 1, count: 1 }], incomplete: false, duplicate: false }, 'mixed units: never one total');
       const r = await call('PUT', `drawings/${id}/units`, { units: 'm' }, qs);
       assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'units cannot change after measuring (batch 4 adds a before/after flow)');
       // the second drawing (same file) has no measurements: its units can still be set
@@ -378,7 +378,7 @@ server.listen(0, async () => {
       // the Task 4 fixture plus an ASPHALT layer (one 10 m square = 100 m2) and a second MH1 insert; BOW: a 2 m square and a
       // self-intersecting bowtie (no area: excluded); CURVE: a SPLINE (approximated)
       const FIX5 = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
-        ...tables([layerRec('KERB'), layerRec('MH'), layerRec('ASPHALT'), layerRec('BOW'), layerRec('CURVE'), layerRec('DROP'), layerRec('DROPB')]),
+        ...tables([layerRec('KERB'), layerRec('MH'), layerRec('ASPHALT'), layerRec('BOW'), layerRec('CURVE'), layerRec('DROP'), layerRec('DROPB'), layerRec('DUPL'), layerRec('DUPB')]),
         ...sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
         ...sec('ENTITIES', [...lwp('K1', sq(0, 0, 1000), true, 'KERB'), ...line('K2', 'KERB', 0, 0, 3000, 4000), ...ins5('M1', 0, 0), ...ins5('M2', 5000, 0),
           ...lwp('A1', sq(0, 0, 10000), true, 'ASPHALT'), ...lwp('B1', sq(20000, 0, 2000), true, 'BOW'), ...lwp('B2', [[0, 20000], [1000, 21000], [1000, 20000], [0, 21000]], true, 'BOW'),
@@ -386,7 +386,10 @@ server.listen(0, async () => {
           // DROP: a 2 m square and a HATCH with a spline edge (not measured: dropped); DROPB: an MH1 insert and an MLINE (unsupported: dropped)
           ...lwp('Q1', sq(40000, 0, 2000), true, 'DROP'), [0, 'HATCH'], [5, 'QH'], [8, 'DROP'], [10, 0], [20, 0], [30, 0], [210, 0], [220, 0], [230, 1], [2, 'SOLID'], [70, 1], [71, 0],
           [91, 1], [92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0], [75, 0], [76, 1], [98, 0],
-          [0, 'INSERT'], [5, 'QI'], [8, 'DROPB'], [2, 'MH1'], [10, 0], [20, 50000], [0, 'MLINE'], [5, 'QM'], [8, 'DROPB']])]);
+          [0, 'INSERT'], [5, 'QI'], [8, 'DROPB'], [2, 'MH1'], [10, 0], [20, 50000], [0, 'MLINE'], [5, 'QM'], [8, 'DROPB'],
+          // DUPL: the same 3 m line drawn twice (possible duplicate); DUPB: two MH1 inserts at one point
+          ...line('U1', 'DUPL', 0, 60000, 3000, 60000), ...line('U2', 'DUPL', 3000, 60000, 0, 60000),
+          [0, 'INSERT'], [5, 'UI1'], [8, 'DUPB'], [2, 'MH1'], [10, 0], [20, 70000], [0, 'INSERT'], [5, 'UI2'], [8, 'DUPB'], [2, 'MH1'], [10, 0], [20, 70000]])]);
       const { writeXlsx } = require('./lib/xlsx.js');
       const boq = rows => ({ file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ...rows] }]).toString('base64'), sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } });
       const BOQ = boq([['1', 'ROADS', null, null], ['1.1', 'ASPHALT surfacing', 'm2', 95], ['1.2', 'Mobilisation', 'LS', 1]]);
@@ -655,6 +658,34 @@ server.listen(0, async () => {
         near(await qtyOf(rM), 7, 'lines + measurement');
         near((await ok(call('DELETE', `measurements/${injected}`, null, qs), 'tidy')).row_qty, 2, 'tidy');
       }
+      // possible duplicates on the source layer (or block): 409 unless confirm_duplicate; stored, audited, shown, carried on relink
+      {
+        const rD = await newRow('Dup kerb', 'm'), rD2 = await newRow('Dup kerb 2', 'm'), rDn = await newRow('Dup manholes', 'nr');
+        const dupl = { tool: 'dxf_layer', layer: 'DUPL', metric: 'open_length' }, dupb = { tool: 'dxf_blocks', layer: 'DUPB', block: 'MH1', metric: 'count' };
+        r = await measure({ row_id: rD, ...dupl });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'possible duplicates on this layer', duplicates: 1 });
+        r = await measure({ row_id: rDn, ...dupb });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'possible duplicates on this layer', duplicates: 1 }, 'block');
+        assert.strictEqual(await qtyOf(rD), 0, 'refused: nothing saved'); assert.strictEqual(audits('measure_duplicate_confirmed').length, 0);
+        const md = await ok(measure({ row_id: rD, ...dupl, confirm_duplicate: true }), 'confirm_duplicate');
+        near(md.qty, 6, 'both lines counted (never merged)'); near(await qtyOf(rD), 6, 'row qty');
+        const mdb = await ok(measure({ row_id: rDn, ...dupb, confirm_duplicate: true }), 'confirm_duplicate block');
+        assert.strictEqual(mdb.qty, 2);
+        assert.strictEqual(db.prepare('SELECT duplicate FROM measurements WHERE id=?').get(md.id).duplicate, 1);
+        assert.deepStrictEqual(audits('measure_duplicate_confirmed'), [{ drawing_id: D, row_id: rD, layer: 'DUPL', metric: 'open_length', duplicates: 1 },
+          { drawing_id: D, row_id: rDn, layer: 'DUPB', block: 'MH1', metric: 'count', duplicates: 1 }], 'counts only');
+        // a layer without duplicates needs no confirmation and is not flagged
+        const vr = await rowsOf(T);
+        assert.strictEqual(vr.find(x => x.id === rD).measured_duplicate, true); assert.strictEqual(vr.find(x => x.id === rM2).measured_duplicate, false);
+        const dl = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements;
+        assert.strictEqual(dl.find(x => x.id === md.id).duplicate, 1); assert.strictEqual(dl.find(x => x.id === m2.id).duplicate, 0);
+        // relink keeps the flag; the measurement stays for the revision below
+        await ok(call('PUT', `measurements/${md.id}`, { row_id: rD2 }, qs), 'relink duplicate');
+        assert.strictEqual(db.prepare('SELECT duplicate FROM measurements WHERE id=?').get(md.id).duplicate, 1);
+        assert.strictEqual((await rowsOf(T)).find(x => x.id === rD2).measured_duplicate, true);
+        await ok(call('DELETE', `measurements/${mdb.id}`, null, qs), 'tidy');
+        for (const id of [rD, rDn]) await ok(call('DELETE', `tenders/${T}/rows/${id}`, null, qs), 'tidy row');
+      }
       // a second re-import leaves it unlinked for the revision below
       assert.strictEqual((await ok(call('POST', `tenders/${T}/import`, BOQ, qs), 're-import 2')).measurements_unlinked, 1);
 
@@ -704,8 +735,9 @@ server.listen(0, async () => {
         const o = before[i];
         assert.strictEqual(x.drawing_id, ndr[odr.findIndex(d => d.id === o.drawing_id)].id, 'drawing remapped');
         assert.strictEqual(x.row_id, o.row_id === null ? null : nBySeq.get(seqOf.get(o.row_id)), 'row remapped');
-        for (const k of ['tool', 'layer', 'block', 'metric', 'nested', 'width', 'depth', 'factor', 'qty', 'qty_unit', 'uom_confirmed']) assert.strictEqual(x[k], o[k], k);
+        for (const k of ['tool', 'layer', 'block', 'metric', 'nested', 'width', 'depth', 'factor', 'qty', 'qty_unit', 'uom_confirmed', 'incomplete', 'duplicate']) assert.strictEqual(x[k], o[k], k);
       });
+      assert.ok(nm.some(x => x.duplicate === 1), 'the duplicate flag is carried into the Rev');
       assert.strictEqual(nm.filter(x => x.row_id === null).length, 1, 'an unlinked measurement stays unlinked');
       assert.deepStrictEqual(db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(T).map(x => ({ ...x })), before, 'original measurements unchanged');
       for (const o of oRows) assert.strictEqual(nRows.find(x => x.seq === o.seq).qty, o.qty, 'Rev row qty = original');

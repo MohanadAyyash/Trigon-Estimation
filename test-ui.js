@@ -212,6 +212,7 @@ server.listen(0, async () => {
     const kerbRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '2', description: 'Test kerb', unit: 'm' }, admin), 'kerb row')).id;
     const kerbRowB = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '4', description: 'Test kerb B', unit: 'm' }, admin), 'kerb row B')).id;
     const bowRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '5', description: 'Test bow', unit: 'm2' }, admin), 'bow row')).id;
+    const mhRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '6', description: 'Test manholes', unit: 'nr' }, admin), 'manhole row')).id;
     const imported = (await call('GET', `tenders/${dwg}/rows`, null, admin)).j;
     const asphRow = imported.find(r => r.description === 'Test asphalt').id, legacyRow = imported.find(r => r.description === 'Test legacy row').id;
     const mCount = async () => { const j = (await call('GET', `tenders/${dwg}/measurements`, null, admin)).j; return j.measurements.length + j.unlinked.length; };
@@ -296,6 +297,18 @@ server.listen(0, async () => {
     await linkTo('أسفلت', 'area', asphRow);
     await page.waitForSelector(`${D} #dw-measurements tr[data-row="${asphRow}"]`);
     assert.strictEqual((await call('GET', `tenders/${dwg}/measurements`, null, admin)).j.measurements.length, 4, 'four measurements saved');
+    // MH1 twice at one point (possible duplicate): 409 with its own confirm box; ticked → saved and flagged
+    await page.click(`${D} tr[data-layer="MH"] td.m-blocks .lk-btn`);
+    await page.waitForSelector(D + ' #lk-form');
+    await page.selectOption('#lk-row', String(mhRow));
+    await page.click('#lk-save');
+    await page.waitForSelector(D + ' #lk-confirm-duplicate');
+    assert.ok((await page.textContent(D + ' #lk-msg')).includes('possible duplicates on this layer'), 'duplicate message shown');
+    await page.check('#lk-confirm-duplicate');
+    await page.click('#lk-save');
+    await page.waitForSelector(`${D} #dw-measurements tr[data-row="${mhRow}"]`);
+    assert.ok((await page.textContent(`${D} #dw-measurements tr[data-row="${mhRow}"]`)).includes('possible duplicates'), 'duplicate flag in the measurement list');
+    { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'duplicate refusal logged'); errors.splice(i, 1); }
     if (process.env.DRAWINGS_SCREENSHOT) await page.screenshot({ path: process.env.DRAWINGS_SCREENSHOT, fullPage: true });
     // legacy data (before the one-unit rule): a row measured in two units is shown as mixed, never summed
     const legacy = db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,metric,qty,qty_unit,created) VALUES(?,?,?,'dxf_layer','KERB',?,?,?,?)");
@@ -308,6 +321,7 @@ server.listen(0, async () => {
     assert.ok(mtxt.includes('100') && mtxt.includes('+5.26 %'), 'measured qty and diff on the imported row: ' + mtxt);
     assert.ok(await page.$(`#row-${asphRow} td.measured .tag.bad`), 'diff above 5 % in the warning colour');
     assert.ok((await page.textContent(`#row-${bowRow} td.measured`)).includes('incomplete'), 'measured_incomplete badge');
+    assert.ok((await page.textContent(`#row-${mhRow} td.measured`)).includes('possible duplicates'), 'measured_duplicate badge');
     const lg = await page.textContent(`#row-${legacyRow} td.measured`);
     assert.ok(lg.includes('mixed units') && !/\b5\b/.test(lg), 'mixed units, not a sum: ' + lg);
     assert.ok((await page.textContent(`#row-${asphRow} td.qty`)).includes('95') || await page.inputValue(`#row-${asphRow} td.qty input`) === '95', 'client qty unchanged');
