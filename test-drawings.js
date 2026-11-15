@@ -35,6 +35,8 @@ const bigStream = () => {
   o.stream = new ReadableStream({ pull(c) { if (o.sent >= 300 * 1024 * 1024) return c.close(); o.sent += chunk.length; c.enqueue(chunk); } });
   return o;
 };
+// timing caps: TEST_LATENCY_MS (an /api/status answer during a parse), TEST_WAIT_MS (waiting for a parse); raise on slow machines
+const LATENCY_MS = Number(process.env.TEST_LATENCY_MS) || 500, WAIT_MS = Number(process.env.TEST_WAIT_MS) || 10000;
 const dirFiles = () => fs.existsSync(DDIR) ? fs.readdirSync(DDIR).sort() : [];
 
 server.listen(0, async () => {
@@ -158,7 +160,7 @@ server.listen(0, async () => {
     assert.deepStrictEqual(dirFiles(), [d.sha256 + '.dxf', d.sha256 + '.json.gz', d.sha256 + '.summary.json.gz']);
     // the cache holds flat entries without codes
     const cache = JSON.parse(require('zlib').gunzipSync(fs.readFileSync(path.join(DDIR, d.sha256 + '.json.gz'))));
-    assert.deepStrictEqual(Object.keys(cache).sort(), ['flat', 'header', 'ignored', 'layers', 'warnings']);
+    assert.deepStrictEqual(Object.keys(cache).sort(), ['flat', 'header', 'ignored', 'layers', 'version', 'warnings']);
     assert.ok(cache.flat.length >= 3 && cache.flat.every(f => !('codes' in f) && 'geomKey' in f && 'bbox' in f));
     // the GET routes read only the small summary: they work with the full cache gone, and match layerTable(full flat)
     const expectLayers = unit => { const lt = layerTable(cache.flat, cache.layers, unit); return { units: unit, units_confirmed: unit !== null, layers: lt.layers, warnings: [...cache.warnings, ...lt.warnings] }; };
@@ -223,6 +225,42 @@ server.listen(0, async () => {
       assert.deepStrictEqual([da.status, dbb.status], ['ready', 'ready']); assert.strictEqual(da.sha256, dbb.sha256);
       assert.strictEqual(dirFiles().filter(f => f.endsWith('.dxf')).length, 2);
       assert.ok(!dirFiles().some(f => f.includes('tmp')), 'no temp files left');
+    }
+
+    // ---- PARSER_VERSION: a summary written by an older parser is never reused: it is parsed again ---------------
+    {
+      const { PARSER_VERSION } = require('./lib/dxf/summary.js');
+      assert.ok(Number.isInteger(PARSER_VERSION) && PARSER_VERSION > 1);
+      const F3 = FIXTURE.replace('K2\n8\nKERB', 'K4\n8\nKERB');
+      const u = await upload(tid, 'versioned', Buffer.from(F3), qs);
+      assert.strictEqual(u.s, 202);
+      // wait in the database: a GET would load the summary into the server's memory
+      for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(u.j.id).status === 'parsing';) {
+        if (Date.now() - t0 > WAIT_MS) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
+      }
+      const sha = db.prepare('SELECT sha256 FROM drawings WHERE id=?').get(u.j.id).sha256, sf = path.join(DDIR, sha + '.summary.json.gz');
+      const readV = () => JSON.parse(zlib.gunzipSync(fs.readFileSync(sf))).version;
+      assert.strictEqual(readV(), PARSER_VERSION, 'the summary carries the parser version');
+      assert.strictEqual(JSON.parse(zlib.gunzipSync(fs.readFileSync(path.join(DDIR, sha + '.json.gz')))).version, PARSER_VERSION, 'the cache too');
+      // a summary from before the version field (stubbed: same content, no version, no dropped counts)
+      const stale = () => { const v = JSON.parse(zlib.gunzipSync(fs.readFileSync(sf))); delete v.version; for (const l of v.raw.layers) delete l.dropped; fs.writeFileSync(sf, zlib.gzipSync(JSON.stringify(v))); };
+      stale();
+      const w = ctx.drawings._workers; let started = w.started;
+      const ly = await call('GET', `drawings/${u.j.id}/layers`, null, qs);
+      assert.strictEqual(ly.s, 200, JSON.stringify(ly.j));
+      assert.strictEqual(w.started - started, 1, 'GET layers: an old summary is parsed again');
+      assert.strictEqual(readV(), PARSER_VERSION); assert.ok(ly.j.layers.every(l => 'dropped' in l), 'the new parse is served');
+      // the same file uploaded again: an old summary is not reused
+      stale(); started = w.started;
+      const u2 = await upload(tid, 'versioned again', Buffer.from(F3), qs);
+      assert.strictEqual((await waitDone(u2.j.id, qs)).status, 'ready');
+      assert.strictEqual(w.started - started, 1, 'upload: an old summary is parsed again, not reused');
+      assert.strictEqual(readV(), PARSER_VERSION);
+      // a current summary is reused at once (no parse)
+      started = w.started;
+      const u3 = await upload(tid, 'versioned third', Buffer.from(F3), qs);
+      assert.strictEqual(db.prepare('SELECT status FROM drawings WHERE id=?').get(u3.j.id).status, 'ready', 'current summary: ready at once');
+      assert.strictEqual(w.started - started, 0);
     }
 
     // ---- a corrupt file → failed with the parser's message, audited --------------------------------------

@@ -5,6 +5,7 @@
 const fs = require('fs'), fsp = require('fs/promises'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
 const { Worker } = require('worker_threads');
 const { UNIT_TO_M, normUom } = require('../lib/units');
+const { PARSER_VERSION } = require('../lib/dxf/summary.js');
 
 const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit
 const BINARY = Buffer.from('AutoCAD Binary DXF', 'latin1');
@@ -211,11 +212,22 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // ---- summaries: { header, ignored, warnings, layers, raw } where raw = layerTable in drawing units (factor 1) -----
   const gunzip = require('util').promisify(zlib.gunzip);
   const summaries = new Map();   // sha256 -> parsed summary, least recently used first
-  async function readSummary(sha) {
-    if (summaries.has(sha)) { const v = summaries.get(sha); summaries.delete(sha); summaries.set(sha, v); return v; }
+  const loadSummary = async sha => {
     let buf;
     try { buf = await fsp.readFile(summaryFile(sha)); } catch (e) { bad('the parsed drawing is missing: upload the drawing again', 409); }
-    const v = JSON.parse((await gunzip(buf)).toString('utf8'));
+    return JSON.parse((await gunzip(buf)).toString('utf8'));
+  };
+  // true when the stored summary was written by this parser version (never reuse another version's numbers)
+  const summaryCurrent = async sha => { try { return (await loadSummary(sha)).version === PARSER_VERSION; } catch (e) { return false; } };
+  async function readSummary(sha) {
+    if (summaries.has(sha)) { const v = summaries.get(sha); summaries.delete(sha); summaries.set(sha, v); return v; }
+    let v = await loadSummary(sha);
+    if (v.version !== PARSER_VERSION) {   // written by another parser version: parse the file again
+      const r = await parseSha(sha);
+      if (!r.ok) bad('the drawing could not be read again: ' + plain(r.error), 409);
+      v = await loadSummary(sha);
+      if (v.version !== PARSER_VERSION) bad('the parsed drawing is out of date: upload the drawing again', 409);
+    }
     summaries.set(sha, v);
     while (summaries.size > SUMMARY_LRU) summaries.delete(summaries.keys().next().value);
     return v;
@@ -240,7 +252,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const cur = tenderRow(t.id);
     if (cur.status !== 'draft') bad(`tender is ${cur.status}: only a draft can be changed`, 409);   // changed while receiving
     // the same file already parsed (and not being parsed again) -> reuse its cache, ready at once
-    const prev = !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && fs.existsSync(summaryFile(got.sha))
+    const prev = !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && await summaryCurrent(got.sha)
       ? db.prepare("SELECT suggested_units FROM drawings WHERE sha256=? AND status='ready' ORDER BY id DESC LIMIT 1").get(got.sha) : null;
     const id = tx(() => {
       const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,rev,created,created_by) VALUES(?,?,?,?,?,?,?,1,?,?)')
