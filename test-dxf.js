@@ -716,7 +716,10 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   const st = (h, metric) => selectionTotals(sf, h, metric);
   // open_length over the two KERB lines → 10; the text on the layer is not a length (skipped)
   const k = st(['K1', 'K2', 'T1'], 'open_length');
-  assert.deepStrictEqual(k, { base: 10, used: 2, dropped: 0, area_null: 0, approx: 0, duplicates: 0, unknown: 0, skipped: 1, by_layer: { KERB: 2 }, blocks: [], used_handles: ['K1', 'K2'] });
+  assert.deepStrictEqual(k, { base: 10, used: 2, dropped: 0, area_null: 0, approx: 0, duplicates: 0, unknown: 0, skipped: 1, by_layer: { KERB: 2 }, blocks: [], used_handles: ['K1', 'K2'],
+    used_keys: [sf.find(f => f.handle === 'K1').geomKey, sf.find(f => f.handle === 'K2').geomKey] });
+  // an exact copy has the same key: what a second selection on the row is checked against
+  assert.strictEqual(st(['U1'], 'open_length').used_keys[0], st(['U2'], 'open_length').used_keys[0]);
   // area including the bowtie: the bowtie has no area → area_null 1, the square counts; the hatch counts as an area
   const a = st(['B1', 'B2', 'BH'], 'area');
   near(a.base, 4 + 9); assert.strictEqual(a.area_null, 1); assert.strictEqual(a.used, 2); assert.deepStrictEqual(a.used_handles, ['B2', 'BH']);

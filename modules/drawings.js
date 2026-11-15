@@ -47,6 +47,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'selection_summary')) db.exec('ALTER TABLE measurements ADD COLUMN selection_summary TEXT');
   // dxf_selection: the handles of the entities that made its qty (written, copied and deleted with the measurement)
   db.exec('CREATE TABLE IF NOT EXISTS measurement_handles(measurement_id INTEGER NOT NULL, handle TEXT NOT NULL, PRIMARY KEY(measurement_id, handle))');
+  // the entity's geomKey: an exact copy measured by another selection on the same row needs confirm_duplicate
+  if (!db.prepare('PRAGMA table_info(measurement_handles)').all().some(c => c.name === 'geom_key')) db.exec('ALTER TABLE measurement_handles ADD COLUMN geom_key TEXT');
   const DIR = path.join(DATA_DIR, 'drawings');
   fs.mkdirSync(DIR, { recursive: true });
   // temp uploads left by a stopped server are never valid: remove them
@@ -102,7 +104,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
     const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,base,selection_summary,created,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle) SELECT ?, handle FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
+    const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) SELECT ?, handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
     let n = 0;
     for (const m of db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(oldTid)) {
       // never drop or detach a measurement silently: a broken link stops the revision
@@ -471,8 +473,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     let n = 0;
     for (const o of others) {
       if (m.tool === 'dxf_selection') {
-        if (o.tool === 'dxf_layer') { if (m.sel.layers.has(o.layer)) n++; }
-        else if (o.tool === 'dxf_blocks') { if (m.sel.pairs.has(o.layer + '\0' + o.block)) n++; }
+        // its own summary unreadable (layers unknown): every layer/block measurement of the family counts
+        if (o.tool === 'dxf_layer') { if (m.sel.unreadable || m.sel.layers.has(o.layer)) n++; }
+        else if (o.tool === 'dxf_blocks') { if (m.sel.unreadable || m.sel.pairs.has(o.layer + '\0' + o.block)) n++; }
         else if (o.tool === 'dxf_selection') {
           for (const h of db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=?').iterate(o.id)) if (m.sel.handles.has(h.handle)) { n++; break; }
         }
@@ -485,11 +488,24 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     }
     return n;
   }
-  // a stored selection's handles, layers and block pairs, for the overlap check of a relink
+  // the same geometry (geomKey) as an entity another selection of the family on the row holds under another handle:
+  // how many such stored entities. The same handle is an overlap, not a duplicate. Runs inside the tx.
+  function crossDuplicates(m, sha, tenderId, selfId) {
+    const fam = FAMILY[m.metric];
+    const others = db.prepare(`SELECT m.id FROM measurements m JOIN drawings d ON d.id=m.drawing_id
+      WHERE m.row_id=? AND m.tender_id=? AND m.id<>? AND d.sha256=? AND m.tool='dxf_selection' AND m.metric IN (${fam.map(() => '?').join(',')})`).all(m.row_id, tenderId, selfId, sha, ...fam);
+    let n = 0;
+    for (const o of others)
+      for (const h of db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=?').iterate(o.id))
+        if (h.geom_key !== null && m.sel.keys.has(h.geom_key) && !m.sel.handles.has(h.handle)) n++;
+    return n;
+  }
+  // a stored selection's handles, geomKeys, layers and block pairs, for the checks of a relink
   const storedSel = cur => {
-    const s = parseSummary(cur.selection_summary) || {};
-    return { handles: new Set(db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=?').all(cur.id).map(x => x.handle)),
-      layers: new Set(Object.keys(s.by_layer || {})), pairs: new Set((s.blocks || []).map(x => x.layer + '\0' + x.block)) };
+    const s = parseSummary(cur.selection_summary);
+    const hs = db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=?').all(cur.id);
+    return { handles: new Set(hs.map(x => x.handle)), keys: new Set(hs.map(x => x.geom_key).filter(k => k !== null)), unreadable: !s,
+      layers: new Set(Object.keys((s && s.by_layer) || {})), pairs: new Set(((s && s.blocks) || []).map(x => x.layer + '\0' + x.block)) };
   };
   // the row checks shared by create and relink. Runs inside the tx.
   // Units: a known row unit must equal qty_unit (no override: m is never added into m2). Only a row whose unit text
@@ -591,35 +607,37 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const f = UNIT_TO_M[d.units];
     const base = m.metric === 'count' ? sel.base : m.metric === 'area' ? sel.base * f * f : sel.base * f;
     m.handles_count = sel.used; m.drawing_id = d.id;
-    m.sel = { handles: new Set(sel.used_handles), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(sel.blocks.map(x => x.layer + '\0' + x.block)) };
-    const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, ...(m.metric === 'count' ? { blocks: sel.blocks } : {}) });
+    m.sel = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(sel.blocks.map(x => x.layer + '\0' + x.block)) };
+    const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, skipped: sel.skipped, ...(m.metric === 'count' ? { blocks: sel.blocks } : {}) });
     const out = tx(() => {
       mustDraft(tenderRow(t.id));
       // the totals must still describe this drawing (units could change before the first measurement)
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
       const overlapping = overlapCount(m, d.sha256, t.id, -1);
-      const counts = { dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx, duplicates: sel.duplicates, overlapping };
+      // exact copies within the selection, and copies of entities other selections on the row already measured
+      const duplicates = sel.duplicates + crossDuplicates(m, d.sha256, t.id, -1);
+      const counts = { dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx, duplicates, overlapping };
       // the batch 1 gates and bodies (the link form keys on them), with the selection's counts added
       const incomplete = sel.dropped > 0 || sel.area_null > 0 || sel.approx > 0;
       if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', area_excluded: sel.area_null, approx: sel.approx, dropped: sel.dropped, ...counts });
-      if (sel.duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', ...counts });
+      if (duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', ...counts });
       if (!finNum(base) || !(base > 0)) bad('nothing in the selection can be measured as ' + m.metric);
       m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
       if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap, counts, overlapping);
       const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,base,selection_summary,created,created_by)
         VALUES(?,?,?,?,NULL,NULL,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.metric, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, sel.used, ch.uomConfirmed, incomplete ? 1 : 0, sel.duplicates ? 1 : 0, base, summary, new Date().toISOString(), me.username).lastInsertRowid);
-      const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle) VALUES(?,?)');
-      for (const h of sel.used_handles) insH.run(id, h);
+        m.qty, m.qty_unit, sel.used, ch.uomConfirmed, incomplete ? 1 : 0, duplicates ? 1 : 0, base, summary, new Date().toISOString(), me.username).lastInsertRowid);
+      const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) VALUES(?,?,?)');
+      for (let i = 0; i < sel.used_handles.length; i++) insH.run(id, sel.used_handles[i], sel.used_keys[i]);
       const sum = summaryOf(m), short = { drawing_id: d.id, row_id: m.row_id, tool: m.tool, metric: m.metric };
       audit(me, 'measure', 'measurements', id, sum);
       if (ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', id, { ...sum, row_unit: ch.row.unit });
       if (ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', id, { ...sum, overlaps: ch.overlaps });
-      if (sel.duplicates) audit(me, 'measure_duplicate_confirmed', 'measurements', id, { ...short, duplicates: sel.duplicates });
+      if (duplicates) audit(me, 'measure_duplicate_confirmed', 'measurements', id, { ...short, duplicates });
       if (incomplete) audit(me, 'measure_incomplete_confirmed', 'measurements', id, { ...short, dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx });
-      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete, duplicate: !!sel.duplicates, handles_count: sel.used };
+      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete, duplicate: !!duplicates, handles_count: sel.used, skipped: sel.skipped };
     });
     return reply(res, 200, out);
   }
@@ -657,8 +675,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     }
     if (method === 'PUT') {
       const b = await ctx.readBody(req);
-      for (const k of Object.keys(b)) if (!['row_id', 'confirm_uom', 'confirm_overlap'].includes(k)) bad('unknown field: ' + k);
+      for (const k of Object.keys(b)) if (!['row_id', 'confirm_uom', 'confirm_overlap', 'confirm_duplicate'].includes(k)) bad('unknown field: ' + k);
       const rowId = rowIdOf(b.row_id), confirmUom = optBool(b, 'confirm_uom'), confirmOverlap = optBool(b, 'confirm_overlap');
+      const confirmDuplicate = optBool(b, 'confirm_duplicate');   // a selection next to an exact copy on the target row
       const out = tx(() => {
         mustDraft(tenderRow(t.id));
         const cur = db.prepare('SELECT * FROM measurements WHERE id=?').get(m.id);
@@ -669,12 +688,16 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
         const isSel = cur.tool === 'dxf_selection';
         const mv = { ...cur, row_id: rowId, ...(isSel ? { sel: storedSel(cur) } : {}) };
         const overlaps = overlapCount(mv, d.sha256, t.id, cur.id);
+        const dups = isSel ? crossDuplicates(mv, d.sha256, t.id, cur.id) : 0;
+        if (dups && !confirmDuplicate) conflictBody({ error: 'possible duplicates on this layer', duplicates: dups, overlapping: overlaps });
         const ch = checkRow(me, mv, d.sha256, t.id, cur.id, confirmUom, confirmOverlap, isSel ? { overlapping: overlaps } : {}, overlaps);
         db.prepare('UPDATE measurements SET row_id=?, uom_confirmed=? WHERE id=?').run(rowId, ch.uomConfirmed, cur.id);
+        if (dups) db.prepare('UPDATE measurements SET duplicate=1 WHERE id=?').run(cur.id);
         const sum = { ...summaryOf({ ...cur, row_id: rowId }), from_row_id: cur.row_id };
         audit(me, 'measure_relink', 'measurements', cur.id, sum);
         if (ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', cur.id, { ...sum, row_unit: ch.row.unit });
         if (ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', cur.id, { ...sum, overlaps: ch.overlaps });
+        if (dups) audit(me, 'measure_duplicate_confirmed', 'measurements', cur.id, { drawing_id: cur.drawing_id, row_id: rowId, tool: cur.tool, metric: cur.metric, duplicates: dups });
         return { ok: 1, old_row_qty: recompute(cur.row_id), row_qty: recompute(rowId) };
       });
       return reply(res, 200, out);
