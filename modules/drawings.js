@@ -7,6 +7,7 @@ const { Worker } = require('worker_threads');
 const { UNIT_TO_M, normUom } = require('../lib/units');
 const { PARSER_VERSION } = require('../lib/dxf/summary.js');
 
+const MAX_QTY = 1e12;                          // the same cap as an imported or edited row qty (tenders.js MAX)
 const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit
 const BINARY = Buffer.from('AutoCAD Binary DXF', 'latin1');
 const BINARY_MSG = 'binary DXF is not supported — save as ASCII DXF';
@@ -415,7 +416,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', ...incomplete });
     if (!finNum(base) || !(base > 0)) bad(`nothing to measure: ${m.layer} ${m.block ? m.block + ' ' : ''}${m.metric} is ${base}`);
     m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
-    if (!Number.isFinite(m.qty)) bad('the quantity is out of range');
+    if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
     m.drawing_id = d.id;
     const out = tx(() => {
       mustDraft(tenderRow(t.id));

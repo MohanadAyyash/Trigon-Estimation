@@ -561,6 +561,12 @@ server.listen(0, async () => {
         assert.strictEqual((await measure({ row_id: rM, ...kerb, ...bad })).s, 400, 'bad ' + JSON.stringify(bad));
       assert.strictEqual((await measure({ row_id: rNr, ...mh, block: 'NOPE' })).s, 400, 'unknown block');
       assert.strictEqual((await measure({ row_id: rM2, ...kerb, width: 0.5, depth: 0.2, confirm_overlap: true, confirm_uom: true })).s, 400, 'm3 on an m2 row → unit mismatch');
+      // the quantity is capped like an imported qty (1e12): 5 m × 1e6 × 1e6 = 5e12 → 400; 5e11 → saved
+      r = await measure({ row_id: rM2, ...kerb, width: 1e6, factor: 1e6, confirm_overlap: true });
+      assert.strictEqual(r.s, 400, 'qty over 1e12'); assert.match(r.j.error, /at most 1000000000000/);
+      assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM measurements WHERE qty > 1e12').get().n, 0);
+      const capped = await ok(measure({ row_id: rM2, ...kerb, width: 1e6, factor: 1e5, confirm_overlap: true }), 'qty under 1e12');
+      assert.ok(Math.abs(capped.qty - 5e11) < 1, 'under the cap ' + capped.qty); await ok(call('DELETE', `measurements/${capped.id}`, null, qs), 'tidy');
       assert.strictEqual(await qtyOf(rM), 2, 'refusals saved nothing');
 
       // a row with measurements: delete → 409; its unit cannot change; it cannot become a heading
