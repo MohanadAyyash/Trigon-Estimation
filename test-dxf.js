@@ -332,7 +332,8 @@ assert.strictEqual(hov.f[0].area, null); near(hov.f[0].length, 80); assert.ok(wa
 const hdup = flDoc(ents(hatch('HD', [hpoly(sq(0, 0, 10)), hlines(sq(0, 0, 10))])));
 assert.strictEqual(hdup.f[0].area, null); assert.ok(warned(hdup.d, 'hatch_loops_overlap', 'HD'));
 const okShape = flDoc(ents([...lwp('OK1', [[0, 0], [10, 0], [10, 10], [5, 5], [0, 10]], true), ...hatch('OK2', [hpoly(sq(0, 0, 10)), hpoly(sq(0, 0, 5))])]));
-near(okShape.f[0].area, 75); near(okShape.f[1].area, 75); assert.strictEqual(okShape.d.warnings.length, 0); // touching island is still contained
+near(okShape.f[0].area, 75); assert.strictEqual(okShape.f[1].area, null); // island lying along the outer edges: flagged (fix round 3 ruling)
+assert.deepStrictEqual(okShape.d.warnings, [{ code: 'hatch_loops_overlap', detail: 'OK2' }]);
 // 4. clockwise hatch edges: computed, but flagged approx and warned
 const cw = flDoc(ents(hatch('H6', [quarter])));
 near(cw.f[0].area, Math.PI / 4); assert.strictEqual(cw.f[0].approx, true); assert.ok(warned(cw.d, 'hatch_cw_edge_unverified', 'H6'));
@@ -370,11 +371,25 @@ assert.strictEqual(ovv.f[0].area, null); assert.ok(warned(ovv.d, 'hatch_loops_ov
 const keyhole = [[0, 0], [10, 0], [10, 5], [7, 5], [7, 3], [3, 3], [3, 7], [7, 7], [7, 5], [10, 5], [10, 10], [0, 10]];
 const kh = flDoc(ents([...lwp('KH', keyhole, true), ...hatch('KHH', [hpoly(keyhole)]),
   ...hatch('TI', [hpoly(sq(0, 0, 10)), hpoly([[10, 5], [5, 8], [5, 2]])]), ...lwp('TV', [[0, 0], [10, 0], [5, 5], [10, 10], [0, 10], [5, 5]], true)]));
-near(kh.f[0].area, 84); near(kh.f[1].area, 84); near(kh.f[2].area, 85); near(kh.f[3].area, 50);
-assert.deepStrictEqual(kh.d.warnings, []);
+// keyhole slits are collinear overlaps: flagged, never measured (fix round 3 ruling); touching at a point still measures
+assert.strictEqual(kh.f[0].area, null); assert.strictEqual(kh.f[1].area, null); near(kh.f[2].area, 85); near(kh.f[3].area, 50);
+assert.deepStrictEqual(kh.d.warnings, [{ code: 'self_intersecting', detail: 'KH' }, { code: 'self_intersecting', detail: 'KHH' }]);
 // empty boundary loops are skipped; only empty loops -> hatch_no_boundary
 const emp = flDoc(ents([...hatch('EL', [[[92, 1], [93, 0], [97, 0]], hpoly(sq(0, 0, 10))]), ...hatch('EA', [[[92, 1], [93, 0], [97, 0]], [[92, 2], [72, 0], [73, 1], [93, 0], [97, 0]]])]));
 assert.strictEqual(emp.f.length, 1); near(emp.f[0].area, 100);
 assert.ok(warned(emp.d, 'hatch_no_boundary', 'EA')); assert.ok(!emp.d.warnings.some(w => w.detail === 'EL'));
+
+// ---- Task 2 fix round 3: crossings through a shared collinear stretch ----
+for (const [h, pts] of [['SB1', [[0, 0], [4, 5], [6, 5], [10, 10], [10, 0], [6, 5], [4, 5], [0, 10]]], ['SB2', [[0, 0], [3, 5], [7, 5], [10, 10], [10, 0], [6, 5], [4, 5], [0, 10]]]]) {
+  const a = flDoc(ents(lwp(h, pts, true)));
+  assert.strictEqual(a.f[0].area, null, h); assert.ok(warned(a.d, 'self_intersecting', h), h);
+  const b = flDoc(ents(hatch(h + 'H', [hpoly(pts)])));
+  assert.strictEqual(b.f[0].area, null, h + 'H'); assert.ok(warned(b.d, 'self_intersecting', h + 'H'), h + 'H');
+}
+const abl = flDoc(ents(hatch('AB', [hpoly(sq(0, 0, 10)), hpoly([[4, -5], [4, 0], [6, 0], [6, 5], [3, 5], [3, 0], [2, 0], [2, -5]])])));
+assert.strictEqual(abl.f[0].area, null); assert.ok(warned(abl.d, 'hatch_loops_overlap', 'AB'));
+near(abl.f[0].length, 40 + 28);
+// a spike back along the previous edge (adjacent edges) is not this check's business; non-collinear shapes still measure
+near(fl(ents(lwp('NC', [[0, 0], [10, 0], [10, 10], [5, 6], [0, 10]], true)))[0].area, 80);
 
 console.log('ok test-dxf');
