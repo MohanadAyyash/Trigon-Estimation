@@ -159,7 +159,9 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (r.is_heading) return o;
       // a priced row with qty 0 (e.g. a take-off row with no lines yet) would silently add nothing
       const zero = () => { if (r.qty === 0) block('row_zero_qty', { row_id: r.id }); };
-      if (r.manual_unit !== null) { o.direct_unit = r.manual_unit; zero(); return o; }   // a manual row is a direct cost; its links are not used
+      // a priced row whose unit cost is 0 (manual 0, or items that cost nothing) would understate the price silently
+      const zeroCost = () => { if (o.direct_unit !== null && !(o.direct_unit > 0)) block('row_zero_cost', { row_id: r.id }); };
+      if (r.manual_unit !== null) { o.direct_unit = r.manual_unit; zero(); zeroCost(); return o; }   // a manual row is a direct cost; its links are not used
       const links = linkQ.all(r.id);
       if (!links.length) { block('row_unlinked', { row_id: r.id }); return o; }
       zero();
@@ -184,6 +186,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (du !== null && !Number.isFinite(du)) { du = null; missing.push('overflow'); }
       o.direct_unit = du;
       if (du === null) block('row_unpriced', { row_id: r.id, detail: missing.join(', ') });
+      zeroCost();
       for (const id of stale) block('material_stale', { row_id: r.id, detail: 'material:' + id });
       return o;
     });

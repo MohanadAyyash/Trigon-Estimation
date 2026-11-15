@@ -404,6 +404,15 @@ server.listen(0, async () => {
     pz = await ok(call('GET', `tenders/${tZ}/price`, null, qs), 'price with a missing version');
     assert.ok(pz.blocking.some(b => b.code === 'row_unpriced' && b.row_id === zRows2[1].id && /version/.test(b.detail)), 'missing version → row_unpriced');
     assert.ok(pz.excluded_rows.includes(zRows2[1].id));
+    // a priced row whose direct unit cost is 0 would silently add nothing: blocking row_zero_cost
+    await ok(call('PUT', `tenders/${tZ}/rows/${zRows2[2].id}`, { manual_unit: 0 }, qs), 'manual unit 0');
+    const i6 = await item('T-6', [{ kind: 'fixed', amount: 0 }]);
+    const zFree = (await ok(call('POST', `tenders/${tZ}/rows`, { description: 'Free item row' }, qs), 'zero cost row')).id;
+    await ok(call('POST', `tenders/${tZ}/rows/${zFree}/lines`, { l: 2 }, qs), 'zero cost line');
+    await ok(call('PUT', `tenders/${tZ}/rows/${zFree}/links`, { links: [{ item_id: i6, share: 1 }] }, qs), 'zero cost link');
+    pz = await ok(call('GET', `tenders/${tZ}/price`, null, qs), 'price with zero-cost rows');
+    assert.deepStrictEqual(pz.blocking.filter(b => b.code === 'row_zero_cost').map(b => b.row_id), [zRows2[2].id, zFree], 'row_zero_cost for manual 0 and a 0-cost item');
+    assert.ok(!pz.blocking.some(b => b.code === 'row_zero_cost' && b.row_id === zRows2[0].id), 'headings are never zero-cost');
 
     // ---- templates: deactivation never changes existing tenders -----------------------------------------
     const site = tpl.find(x => x.name_en === 'Site office').id;

@@ -81,7 +81,7 @@
   const roleLabel = r => ({ admin: t('role_admin'), qs: t('role_qs'), viewer: t('role_viewer') })[r] || r;
   const catKindLabel = k => ({ overhead: t('ck_overhead'), labour_oncost: t('ck_labour_oncost'), equipment: t('ck_equipment'), project: t('ck_project'), ignore: t('ck_ignore') })[k] || k;
   const blockLabel = c => ({ no_snapshot: t('blk_no_snapshot'), snapshot_stale: t('blk_snapshot_stale'), overhead_missing: t('blk_overhead_missing'), row_unlinked: t('blk_row_unlinked'),
-    row_unpriced: t('blk_row_unpriced'), row_zero_qty: t('blk_row_zero_qty'), material_stale: t('blk_material_stale'), hidden_unanswered: t('blk_hidden_unanswered') })[c] || c;
+    row_unpriced: t('blk_row_unpriced'), row_zero_qty: t('blk_row_zero_qty'), row_zero_cost: t('blk_row_zero_cost'), material_stale: t('blk_material_stale'), hidden_unanswered: t('blk_hidden_unanswered') })[c] || c;
   const badge = s => h('span', { class: 'badge st-' + s }, statusLabel(s));
   const priceState = p => !p || !p.result ? 'none' : !p.complete ? 'partial' : p.blocking.length ? 'blocked' : 'complete';
   const stateLabel = st => ({ complete: t('complete'), partial: t('partial'), blocked: t('blocked'), none: t('no_price_short') })[st];
