@@ -135,4 +135,174 @@ assert.strictEqual(pp.warnings.filter(w => w.code === 'paper_space').length, 1);
 // Uint8Array input
 assert.strictEqual(parseDxf(decodeDxf(new Uint8Array(Buffer.from(full)))).entities.length, 2);
 
+// ---- Task 2: geometry ----
+const { flatten } = require('./lib/dxf/geometry.js');
+const near = (a, b, tol = 1e-9, msg) => assert.ok(Math.abs(a - b) <= tol, (msg || '') + ' ' + a + ' vs ' + b);
+const fl = pairs => flatten(parseDxf(dxf(pairs)));
+const ents = list => sec('ENTITIES', list);
+const lwp = (h, pts, closed, layer = '0') => [[0, 'LWPOLYLINE'], [5, h], [8, layer], [90, pts.length], [70, closed ? 1 : 0], ...pts.flatMap(([x, y, b]) => b ? [[10, x], [20, y], [42, b]] : [[10, x], [20, y]])];
+const block = (name, list, base = [0, 0]) => [[0, 'BLOCK'], [2, name], [70, 0], [10, base[0]], [20, base[1]], ...list, [0, 'ENDBLK']];
+const insert = (h, name, layer, extra = []) => [[0, 'INSERT'], [5, h], [8, layer], [2, name], ...[[10, 0], [20, 0]].filter(([c]) => !extra.some(x => x[0] === c)), ...extra];
+const sq = (x0, y0, s) => [[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s]];
+
+// lines, polylines, bulges
+const g1 = fl(ents(line('L1', 'A', 0, 0, 3, 4)));
+assert.strictEqual(g1.length, 1); assert.strictEqual(g1[0].length, 5); assert.strictEqual(g1[0].kind, 'open');
+assert.strictEqual(g1[0].area, null); assert.strictEqual(g1[0].depth, 0); assert.strictEqual(g1[0].approx, false);
+assert.deepStrictEqual(g1[0].bbox, [0, 0, 3, 4]); assert.strictEqual(g1[0].type, 'LINE'); assert.strictEqual(g1[0].layer, 'A');
+const sqf = fl(ents(lwp('S', sq(0, 0, 10), true)))[0];
+assert.strictEqual(sqf.kind, 'closed'); near(sqf.length, 40); near(sqf.area, 100);
+const arc1 = fl(ents(lwp('B', [[0, 0, 1], [2, 0]], false)))[0];
+near(arc1.length, Math.PI); assert.strictEqual(arc1.kind, 'open'); assert.strictEqual(arc1.area, null);
+near(arc1.bbox[1], -1); near(arc1.bbox[3], 0); // positive bulge = counter-clockwise: the arc passes below the chord
+const circ = fl(ents(lwp('C', [[0, 0, 1], [2, 0, 1]], true)))[0];
+near(circ.area, Math.PI); near(circ.length, 2 * Math.PI);
+const neg = fl(ents(lwp('N', [[0, 0, -1], [2, 0, -1]], true)))[0];
+near(neg.area, Math.PI); near(neg.length, 2 * Math.PI);
+// R12 POLYLINE gives the same geometry as LWPOLYLINE
+const r12sq = fl(ents([[0, 'POLYLINE'], [5, 'P'], [8, '0'], [66, 1], [70, 1], ...sq(0, 0, 10).flatMap(([x, y]) => v(x, y)), [0, 'SEQEND']]))[0];
+near(r12sq.length, 40); near(r12sq.area, 100); assert.strictEqual(r12sq.geomKey, sqf.geomKey);
+
+// circle, arc, ellipse
+const ca = fl(ents([[0, 'CIRCLE'], [5, 'CI'], [8, '0'], [10, 1], [20, 1], [40, 2], [0, 'ARC'], [5, 'AR'], [8, '0'], [10, 0], [20, 0], [40, 1], [50, 0], [51, 90]]));
+assert.strictEqual(ca[0].kind, 'closed'); near(ca[0].area, 4 * Math.PI); near(ca[0].length, 4 * Math.PI);
+assert.deepStrictEqual(ca[0].bbox, [-1, -1, 3, 3]);
+assert.strictEqual(ca[1].kind, 'open'); near(ca[1].length, Math.PI / 2); near(ca[1].bbox[2], 1); near(ca[1].bbox[3], 1);
+const wrap = fl(ents([[0, 'ARC'], [5, 'W'], [8, '0'], [10, 0], [20, 0], [40, 1], [50, 270], [51, 90]]))[0]; // end < start wraps through 0
+near(wrap.length, Math.PI); near(wrap.bbox[0], 0); near(wrap.bbox[2], 1);
+const ell = fl(ents([[0, 'ELLIPSE'], [5, 'E'], [8, '0'], [10, 0], [20, 0], [11, 2], [21, 0], [40, 0.5], [41, 0], [42, 2 * Math.PI]]))[0];
+assert.strictEqual(ell.kind, 'closed'); near(ell.area, 2 * Math.PI); near(ell.length, 9.688448220547675, 1e-6); assert.strictEqual(ell.approx, false);
+const qell = fl(ents([[0, 'ELLIPSE'], [5, 'Q'], [8, '0'], [10, 0], [20, 0], [11, 2], [21, 0], [40, 0.5], [41, 0], [42, Math.PI / 2]]))[0];
+assert.strictEqual(qell.kind, 'open'); near(qell.length, 9.688448220547676 / 4, 1e-8); near(qell.bbox[2], 2); near(qell.bbox[3], 1);
+
+// blocks
+const B1 = block('B1', line('L1', '0', 0, 0, 1, 0));
+const ib = fl([...sec('BLOCKS', B1), ...ents(insert('I1', 'B1', 'KERB', [[41, 2], [42, 2]]))]);
+const ins = ib.find(f => f.kind === 'insert'), bl = ib.find(f => f.type === 'LINE');
+assert.strictEqual(ins.count, 1); assert.strictEqual(ins.block, 'B1'); assert.strictEqual(ins.depth, 0); assert.strictEqual(ins.layer, 'KERB');
+assert.strictEqual(bl.layer, 'KERB'); near(bl.length, 2); assert.strictEqual(bl.depth, 1); assert.strictEqual(bl.block, null);
+const rot = fl([...sec('BLOCKS', B1), ...ents(insert('I1', 'B1', 'KERB', [[50, 90]]))]).find(f => f.type === 'LINE');
+assert.ok(rot.bbox[2] - rot.bbox[0] < 1e-9, 'rotated line is vertical'); near(rot.bbox[3] - rot.bbox[1], 1);
+const nest = fl([...sec('BLOCKS', [...B1, ...block('B2', insert('I0', 'B1', '0'))]), ...ents(insert('I2', 'B2', 'KERB'))]);
+assert.strictEqual(nest.find(f => f.type === 'LINE').depth, 2); assert.strictEqual(nest.find(f => f.type === 'LINE').layer, 'KERB');
+assert.deepStrictEqual(nest.filter(f => f.kind === 'insert').map(f => [f.block, f.depth, f.layer]), [['B2', 0, 'KERB'], ['B1', 1, 'KERB']]);
+// base point, layer kept when not 0, BYBLOCK colour inherits, instance handles are unique
+const lay = fl([...sec('BLOCKS', block('B3', [...line('K1', 'OWN', 5, 5, 6, 5), ...line('K2', 'OWN', 5, 5, 5, 6, [[62, 0]])], [5, 5])), ...ents([...insert('J1', 'B3', 'TOP'), ...insert('J2', 'B3', 'TOP', [[10, 100]])])]);
+const ll = lay.filter(f => f.type === 'LINE');
+assert.deepStrictEqual(ll.map(f => f.layer), ['OWN', 'TOP', 'OWN', 'TOP']);
+assert.deepStrictEqual(ll[0].bbox, [0, 0, 1, 0]); assert.deepStrictEqual(ll[2].bbox, [100, 0, 101, 0]);
+assert.strictEqual(new Set(lay.map(f => f.handle)).size, lay.length);
+// MINSERT: 70 columns, 71 rows, 44/45 spacing
+const mi = fl([...sec('BLOCKS', B1), ...ents(insert('M1', 'B1', 'KERB', [[70, 3], [71, 2], [44, 10], [45, 5]]))]);
+assert.strictEqual(mi.find(f => f.kind === 'insert').count, 6);
+const ml = mi.filter(f => f.type === 'LINE');
+assert.strictEqual(ml.length, 6); assert.strictEqual(new Set(ml.map(f => f.handle)).size, 6);
+assert.deepStrictEqual(ml.map(f => f.bbox[0] + ',' + f.bbox[1]).sort(), ['0,0', '0,5', '10,0', '10,5', '20,0', '20,5']);
+// non-uniform scale: arcs sampled and flagged
+const nu = fl([...sec('BLOCKS', block('BC', [[0, 'CIRCLE'], [5, 'C1'], [8, '0'], [10, 0], [20, 0], [40, 1]])), ...ents(insert('NU', 'BC', 'X', [[41, 2], [42, 1]]))]).find(f => f.type === 'CIRCLE');
+assert.strictEqual(nu.approx, true); near(nu.area, 2 * Math.PI, 1e-3); near(nu.length, 9.688448220547675, 1e-3);
+// uniform scale with a circle stays exact; negative uniform scale (mirror) too
+const us = fl([...sec('BLOCKS', block('BC', [[0, 'CIRCLE'], [5, 'C1'], [8, '0'], [10, 1], [20, 0], [40, 1]])), ...ents(insert('U', 'BC', 'X', [[41, -2], [42, 2]]))]).find(f => f.type === 'CIRCLE');
+assert.strictEqual(us.approx, false); near(us.area, 4 * Math.PI); near(us.length, 4 * Math.PI); near(us.bbox[0], -4); near(us.bbox[2], 0);
+
+// spline
+const sp = fl(ents([[0, 'SPLINE'], [5, 'SP'], [8, '0'], [70, 8], [71, 1], [72, 4], [73, 2], [40, 0], [40, 0], [40, 1], [40, 1], [10, 0], [20, 0], [10, 3], [20, 4]]))[0];
+assert.strictEqual(sp.approx, true); near(sp.length, 5); assert.strictEqual(sp.kind, 'open');
+const sp2 = fl(ents([[0, 'SPLINE'], [5, 'S2'], [8, '0'], [70, 8], [71, 2], [72, 6], [73, 3], ...[0, 0, 0, 1, 1, 1].map(k => [40, k]), [10, 0], [20, 0], [10, 1], [20, 1], [10, 2], [20, 0]]))[0];
+assert.strictEqual(sp2.approx, true); near(sp2.bbox[3], 0.5, 1e-6); near(sp2.bbox[2], 2);
+assert.throws(() => fl(ents([[0, 'SPLINE'], [5, 'S3'], [70, 8], [71, 2], [40, 0], [40, 1], [10, 0], [20, 0], [10, 1], [20, 1], [10, 2], [20, 0]])), /S3/);
+
+// hatch: outer 10x10 (polyline loop), inner 2x2 (line edges)
+const hpoly = (pts, flag = 3) => [[92, flag], [72, 0], [73, 1], [93, pts.length], ...pts.flatMap(([x, y]) => [[10, x], [20, y]]), [97, 0]];
+const hlines = (pts, flag = 0) => [[92, flag], [93, pts.length], ...pts.flatMap(([x, y], i) => { const [x2, y2] = pts[(i + 1) % pts.length]; return [[72, 1], [10, x], [20, y], [11, x2], [21, y2]]; }), [97, 0]];
+const hatch = (h, loops, style = 0, layer = 'H') => [[0, 'HATCH'], [5, h], [8, layer], [10, 0], [20, 0], [30, 0], [210, 0], [220, 0], [230, 1], [2, 'SOLID'], [70, 1], [71, 0], [91, loops.length], ...loops.flat(), [75, style], [76, 1], [98, 0]];
+const ht = fl(ents(hatch('H1', [hpoly(sq(0, 0, 10)), hlines(sq(4, 4, 2), 16)])))[0];
+assert.strictEqual(ht.kind, 'closed'); near(ht.area, 96); near(ht.length, 48); assert.deepStrictEqual(ht.bbox, [0, 0, 10, 10]);
+// hatch styles: 0 odd parity, 1 outermost, 2 ignore islands
+const three = [hpoly(sq(0, 0, 10)), hpoly(sq(2, 2, 6)), hpoly(sq(4, 4, 2))];
+near(fl(ents(hatch('H2', three, 0)))[0].area, 68); near(fl(ents(hatch('H3', three, 1)))[0].area, 64); near(fl(ents(hatch('H4', three, 2)))[0].area, 100);
+// arc edges: full circle (ccw), quarter disc with a clockwise arc (angles stored clockwise), polyline loop with bulges
+const arcEdge = (cx, cy, r, s, e, ccw) => [[72, 2], [10, cx], [20, cy], [40, r], [50, s], [51, e], [73, ccw]];
+near(fl(ents(hatch('H5', [[[92, 1], [93, 1], ...arcEdge(0, 0, 1, 0, 360, 1), [97, 0]]])))[0].area, Math.PI);
+const quarter = [[92, 1], [93, 3], [72, 1], [10, 0], [20, 0], [11, 0], [21, 1], ...arcEdge(0, 0, 1, 270, 360, 0), [72, 1], [10, 1], [20, 0], [11, 0], [21, 0], [97, 0]];
+const hq = fl(ents(hatch('H6', [quarter])))[0];
+near(hq.area, Math.PI / 4); near(hq.length, 2 + Math.PI / 2); near(hq.bbox[2], 1); near(hq.bbox[3], 1);
+const bulgeLoop = [[92, 3], [72, 1], [73, 1], [93, 2], [10, 0], [20, 0], [42, 1], [10, 2], [20, 0], [42, 1], [97, 0]];
+near(fl(ents(hatch('H7', [bulgeLoop])))[0].area, Math.PI);
+// ellipse edge (full)
+const ee = fl(ents(hatch('H8', [[[92, 1], [93, 1], [72, 3], [10, 0], [20, 0], [11, 2], [21, 0], [40, 0.5], [50, 0], [51, 360], [73, 1], [97, 0]]])))[0];
+near(ee.area, 2 * Math.PI);
+// an edge loop that does not close is excluded with a warning, never measured
+const gapDoc = parseDxf(dxf(ents(hatch('HG', [[[92, 1], [93, 2], [72, 1], [10, 0], [20, 0], [11, 1], [21, 0], [72, 1], [10, 5], [20, 5], [11, 0], [21, 1], [97, 0]]]))));
+assert.deepStrictEqual(flatten(gapDoc), []);
+assert.ok(gapDoc.warnings.some(w => w.code === 'hatch_open_loop' && w.detail === 'HG'));
+
+// text
+const tx = fl(ents([[0, 'TEXT'], [5, 'T1'], [8, 'TX'], [10, 1], [20, 2], [40, 1], [1, 'hello']]))[0];
+assert.strictEqual(tx.kind, 'text'); assert.strictEqual(tx.length, 0); assert.strictEqual(tx.area, null); assert.deepStrictEqual(tx.bbox, [1, 2, 1, 2]);
+assert.strictEqual(fl(ents([[0, 'MTEXT'], [5, 'T2'], [8, 'TX'], [10, 1], [20, 2], [1, 'x']]))[0].kind, 'text');
+
+// units are not applied (drawing units)
+near(fl([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...ents(line('U1', '0', 0, 0, 3000, 4000))])[0].length, 5000);
+
+// geomKey: direction-, start- and winding-independent; same boundary in a HATCH and a polyline match
+const key = list => fl(ents(list))[0].geomKey;
+assert.strictEqual(typeof sqf.geomKey, 'string');
+assert.strictEqual(key(line('a', '0', 0, 0, 3, 4)), key(line('b', '0', 3, 4, 0, 0)));
+assert.notStrictEqual(key(line('a', '0', 0, 0, 3, 4)), key(line('b', '0', 0, 0, 3, 4.001)));
+assert.strictEqual(key(line('a', '0', 0, 0, 3, 4)), key(line('b', '0', 0.0000001, 0, 3, 4)));
+const sqRev = [[10, 10], [10, 0], [0, 0], [0, 10]];
+assert.strictEqual(key(lwp('a', sqRev, true)), sqf.geomKey);
+assert.strictEqual(key(lwp('a', [[10, 0], [10, 10], [0, 10], [0, 0]], true)), sqf.geomKey);
+assert.strictEqual(key(hatch('h', [hpoly(sq(0, 0, 10))])), sqf.geomKey);
+assert.strictEqual(key(hatch('h', [hlines(sq(0, 0, 10))])), sqf.geomKey);
+assert.notStrictEqual(key(lwp('a', sq(0, 0, 10), false)), sqf.geomKey);
+assert.strictEqual(key(lwp('a', [[0, 0, 0.5], [2, 0]], false)), key(lwp('b', [[2, 0, -0.5], [0, 0]], false)));
+assert.notStrictEqual(key(lwp('a', [[0, 0, 0.5], [2, 0]], false)), key(lwp('b', [[0, 0, -0.5], [2, 0]], false)));
+
+// rulings: 3D / mesh / polyface POLYLINE excluded with a warning
+for (const f of [8, 16, 64]) {
+  const d = parseDxf(dxf(ents([[0, 'POLYLINE'], [5, 'P3'], [8, '0'], [70, f], ...v(0, 0), ...v(1, 1), [0, 'SEQEND'], ...line('ok', '0', 0, 0, 1, 0)])));
+  assert.deepStrictEqual(flatten(d).map(e => e.handle), ['ok']);
+  assert.ok(d.warnings.some(w => w.code === 'unsupported_polyline' && w.detail === 'P3'), 'flag ' + f);
+}
+// incomplete LWPOLYLINE pair, bad numbers name the entity
+assert.throws(() => fl(ents([[0, 'LWPOLYLINE'], [5, 'LZ'], [70, 0], [10, 0], [20, 0], [10, 4]])), /LZ/);
+assert.throws(() => fl(ents([[0, 'LWPOLYLINE'], [5, 'LY'], [70, 0], [10, 0], [10, 4], [20, 0]])), /LY/);
+assert.throws(() => fl(ents(line('LX', '0', 0, 0, 'abc', 1))), /LINE LX/);
+assert.throws(() => fl(ents([[0, 'LINE'], [5, 'LW'], [10, 0], [20, 0], [11, 1]])), /LINE LW/);
+assert.throws(() => fl(ents([[0, 'CIRCLE'], [5, 'CR'], [10, 0], [20, 0], [40, '']])), /CIRCLE CR/);
+// missing block: counted, no geometry, warned once
+const mb = parseDxf(dxf(ents([...insert('X1', 'NOPE', 'L'), ...insert('X2', 'NOPE', 'L')])));
+const mbf = flatten(mb);
+assert.deepStrictEqual(mbf.map(f => [f.kind, f.count, f.block]), [['insert', 1, 'NOPE'], ['insert', 1, 'NOPE']]);
+assert.deepStrictEqual(mb.warnings.filter(w => w.code === 'missing_block'), [{ code: 'missing_block', detail: 'NOPE' }]);
+flatten(mb); assert.strictEqual(mb.warnings.filter(w => w.code === 'missing_block').length, 1);
+// recursion and depth cap
+assert.throws(() => fl([...sec('BLOCKS', [...block('R1', insert('a', 'R2', '0')), ...block('R2', insert('b', 'R1', '0'))]), ...ents(insert('top', 'R1', '0'))]), /recursive block R1/);
+const chain = []; for (let i = 0; i < 40; i++) chain.push(...block('C' + i, i < 39 ? insert('c' + i, 'C' + (i + 1), '0') : line('end', '0', 0, 0, 1, 0)));
+assert.throws(() => fl([...sec('BLOCKS', chain), ...ents(insert('top', 'C0', '0'))]), /32/);
+const chainOk = []; for (let i = 0; i < 32; i++) chainOk.push(...block('C' + i, i < 31 ? insert('c' + i, 'C' + (i + 1), '0') : line('end', '0', 0, 0, 1, 0)));
+assert.strictEqual(fl([...sec('BLOCKS', chainOk), ...ents(insert('top', 'C0', '0'))]).find(f => f.type === 'LINE').depth, 32);
+// extrusion (0,0,-1): mirrored OCS, length unchanged, bbox mirrored
+const ma = fl(ents([[0, 'ARC'], [5, 'MA'], [8, '0'], [10, 5], [20, 0], [40, 1], [50, 0], [51, 90], [210, 0], [220, 0], [230, -1]]))[0];
+near(ma.length, Math.PI / 2); near(ma.bbox[0], -6); near(ma.bbox[1], 0); near(ma.bbox[2], -5); near(ma.bbox[3], 1);
+const mlw = fl(ents([...lwp('ML', sq(1, 0, 2), true), [210, 0], [220, 0], [230, -1]]))[0];
+near(mlw.area, 4); assert.deepStrictEqual(mlw.bbox, [-3, 0, -1, 2]);
+const mline = fl(ents(line('MLN', '0', 1, 0, 2, 0, [[210, 0], [220, 0], [230, -1]])))[0]; // LINE is in WCS: not mirrored
+assert.deepStrictEqual(mline.bbox, [1, 0, 2, 0]);
+const mins = fl([...sec('BLOCKS', B1), ...ents(insert('MI', 'B1', 'K', [[10, 5], [210, 0], [220, 0], [230, -1]]))]).find(f => f.type === 'LINE');
+assert.deepStrictEqual(mins.bbox, [-6, 0, -5, 0]);
+const npDoc = parseDxf(dxf(ents([[0, 'CIRCLE'], [5, 'NP'], [8, '0'], [10, 0], [20, 0], [40, 1], [210, 1], [220, 0], [230, 0]])));
+assert.deepStrictEqual(flatten(npDoc), []);
+assert.ok(npDoc.warnings.some(w => w.code === 'nonplanar' && w.detail === 'NP'));
+
+// ELLIPSE is in WCS: extrusion (0,0,-1) reverses the minor axis, the centre is not mirrored
+const me = fl(ents([[0, 'ELLIPSE'], [5, 'ME'], [8, '0'], [10, 0], [20, 0], [11, 2], [21, 0], [40, 0.5], [41, 0], [42, Math.PI / 2], [210, 0], [220, 0], [230, -1]]))[0];
+near(me.length, 9.688448220547676 / 4, 1e-8); near(me.bbox[0], 0); near(me.bbox[1], -1); near(me.bbox[2], 2); near(me.bbox[3], 0);
+// hatch spline edges are not measured: excluded with a warning
+const hsDoc = parseDxf(dxf(ents(hatch('HS', [[[92, 1], [93, 1], [72, 4], [94, 3], [73, 0], [74, 0], [95, 8], [96, 4], [97, 0]]]))));
+assert.deepStrictEqual(flatten(hsDoc), []);
+assert.ok(hsDoc.warnings.some(w => w.code === 'unsupported_hatch_edge' && w.detail === 'HS'));
+
 console.log('ok test-dxf');
