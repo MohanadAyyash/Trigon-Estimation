@@ -10,6 +10,7 @@ const { Worker } = require('worker_threads');
 const { UNIT_TO_M, normUom } = require('../lib/units');
 const { PARSER_VERSION } = require('../lib/dxf/summary.js');
 const { imageSize } = require('../lib/takeoff/imagesize.js');
+const calib = require('../lib/takeoff/calib.js');
 
 const MAX_QTY = 1e12;                          // the same cap as an imported or edited row qty (tenders.js MAX)
 const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit (DXF and PDF)
@@ -23,6 +24,7 @@ const NAME_EXT = { pdf: 'pdf', png: 'png', jpg: 'jpg', jpeg: 'jpg', dxf: 'dxf' }
 const EXT_LABEL = { pdf: 'a PDF', png: 'a PNG image', jpg: 'a JPEG image', dxf: 'a DXF drawing' };
 const MIME = { dxf: 'application/dxf', pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg' };
 const MAX_PAGES = 2000, MAX_PAGE_PT = 14400;   // pages in one PDF; a page side in points (200 in)
+const MAX_NAME = 200;                          // a drawing name (also a generated page-row name)
 const BINARY = Buffer.from('AutoCAD Binary DXF', 'latin1');
 const BINARY_MSG = 'binary DXF is not supported — save as ASCII DXF';
 const PARSE_TIMEOUT_MS = 10 * 60e3;
@@ -36,8 +38,8 @@ const MAX_HANDLES = 200000;                    // entities in one selection
 module.exports = ctx => {
   const { db, send, bad, need, audit, DATA_DIR } = ctx;
   db.exec(`
-CREATE TABLE IF NOT EXISTS drawings(id INTEGER PRIMARY KEY AUTOINCREMENT, tender_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'dxf', name TEXT, sha256 TEXT, bytes INTEGER,
-  units TEXT, suggested_units TEXT, status TEXT /* parsing|ready|failed */, error TEXT, rev INTEGER DEFAULT 1, replaced_by INTEGER, created TEXT, created_by TEXT);
+CREATE TABLE IF NOT EXISTS drawings(id INTEGER PRIMARY KEY AUTOINCREMENT, tender_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'dxf' /* dxf|pdf|image */, name TEXT, sha256 TEXT, bytes INTEGER,
+  units TEXT, suggested_units TEXT, status TEXT /* parsing|ready|failed (dxf); pages (a pdf whose pages are not registered yet) */, error TEXT, rev INTEGER DEFAULT 1, replaced_by INTEGER, created TEXT, created_by TEXT);
 CREATE INDEX IF NOT EXISTS drawings_tender ON drawings(tender_id);
 CREATE INDEX IF NOT EXISTS drawings_sha ON drawings(sha256);
 CREATE TABLE IF NOT EXISTS measurements(id INTEGER PRIMARY KEY AUTOINCREMENT, drawing_id INTEGER NOT NULL, tender_id INTEGER NOT NULL, row_id INTEGER /* NULL = unlinked */,
@@ -69,6 +71,14 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'selection_summary')) db.exec('ALTER TABLE measurements ADD COLUMN selection_summary TEXT');
   // 1 = a selection count over more than one block name, saved with confirm_mixed_blocks
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'mixed')) db.exec('ALTER TABLE measurements ADD COLUMN mixed INTEGER NOT NULL DEFAULT 0');
+  // calibration of a PDF page or an image (one drawing row each): region NULL = the page (at most one), or JSON
+  // [minx,miny,maxx,maxy] in page units (regions never overlap); scale = metres per page unit (lib/takeoff/calib.js)
+  db.exec(`CREATE TABLE IF NOT EXISTS calibrations(id INTEGER PRIMARY KEY AUTOINCREMENT, drawing_id INTEGER NOT NULL, region TEXT, p1x REAL NOT NULL, p1y REAL NOT NULL,
+  p2x REAL NOT NULL, p2y REAL NOT NULL, real REAL NOT NULL, unit TEXT NOT NULL, scale REAL NOT NULL, verify_pct REAL, created TEXT, created_by TEXT);
+CREATE INDEX IF NOT EXISTS calibrations_drawing ON calibrations(drawing_id);
+CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) WHERE region IS NULL;`);
+  // the calibration a manual measurement on a PDF page or an image was computed with (written by Task 4's manual tool)
+  if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'calibration_id')) db.exec('ALTER TABLE measurements ADD COLUMN calibration_id INTEGER');
   // dxf_selection: the handles of the entities that made its qty (written, copied and deleted with the measurement)
   db.exec('CREATE TABLE IF NOT EXISTS measurement_handles(measurement_id INTEGER NOT NULL, handle TEXT NOT NULL, PRIMARY KEY(measurement_id, handle))');
   // the entity's geomKey: an exact copy measured by another selection on the same row needs confirm_duplicate
@@ -157,6 +167,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   const deleteForTender = tid => ({
     handles: Number(db.prepare('DELETE FROM measurement_handles WHERE measurement_id IN (SELECT id FROM measurements WHERE tender_id=?)').run(tid).changes),
     measurements: Number(db.prepare('DELETE FROM measurements WHERE tender_id=?').run(tid).changes),
+    calibrations: Number(db.prepare('DELETE FROM calibrations WHERE drawing_id IN (SELECT id FROM drawings WHERE tender_id=?)').run(tid).changes),
     drawings: Number(db.prepare('DELETE FROM drawings WHERE tender_id=?').run(tid).changes),
   });
   const workers = { alive: 0, peak: 0, started: 0 };   // test hook: parse workers alive now / at most / ever started
@@ -367,10 +378,12 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     need(me, 'admin', 'qs'); mustDraft(t);
     const name = String(url.searchParams.get('name') || '').trim();
     if (!name) bad('name is required');
-    if (name.length > 200) bad('name must be at most 200 characters');
+    if (name.length > MAX_NAME) bad(`name must be at most ${MAX_NAME} characters`);
     if (Number(req.headers['content-length']) > MAX_BYTES) bad('the drawing is larger than 100 MB', 413);
+    const named = NAME_EXT[(/\.([a-z]+)$/i.exec(name) || [])[1]?.toLowerCase()] || null;
+    if ((named === 'png' || named === 'jpg') && Number(req.headers['content-length']) > MAX_IMAGE_BYTES) bad('the image is larger than 50 MB', 413);
     // a DXF, a PDF (status 'pages' until the browser registers them) or a PNG/JPEG image (one page, ready), by magic bytes
-    const got = await receive(req, NAME_EXT[(/\.([a-z]+)$/i.exec(name) || [])[1]?.toLowerCase()] || null);
+    const got = await receive(req, named);
     let used = false;
     try {
       // the tender can be deleted or change status while the body arrives
@@ -425,11 +438,140 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       const ins = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,page_w,page_h,rotation,parent_id,rev,created,created_by) VALUES(?,'pdf',?,?,?,'ready',?,?,?,?,?,?,?,?)");
       const out = [cur.id];
       for (const p of pages.slice(1))
-        out.push(Number(ins.run(cur.tender_id, `${cur.name} — p${p.page}`, cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, cur.id, cur.rev, now, me.username).lastInsertRowid));
+        out.push(Number(ins.run(cur.tender_id, pageName(cur.name, p.page), cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, cur.id, cur.rev, now, me.username).lastInsertRowid));
       audit(me, 'pages', 'drawings', cur.id, { pages: n });
       return out;
     });
     return reply(res, 200, { drawings: ids.map(drawingRow) });
+  }
+
+  // "<name> — p<n>" within MAX_NAME characters: the name is cut (never inside a surrogate pair), the suffix kept
+  function pageName(name, n) {
+    const suffix = ` — p${n}`;
+    let base = name.slice(0, Math.max(0, MAX_NAME - suffix.length));
+    if (base.length < name.length && /[\uD800-\uDBFF]$/.test(base)) base = base.slice(0, -1);
+    return base + suffix;
+  }
+
+  // ---- calibration (PDF pages and images): page and regions, verify -------------------------------------------
+  const calView = c => ({ id: c.id, drawing_id: c.drawing_id, region: c.region === null ? null : JSON.parse(c.region), p1: [c.p1x, c.p1y], p2: [c.p2x, c.p2y],
+    real: c.real, unit: c.unit, scale: c.scale, verify_pct: c.verify_pct, created: c.created, created_by: c.created_by });
+  // the page calibration first, then the regions by id
+  const calibrationsOf = drawingId => db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY region IS NOT NULL, id').all(drawingId).map(calView);
+  // how many measurements were computed with this calibration (they stop its deletion)
+  const calibrationUsers = calId => db.prepare('SELECT COUNT(*) n FROM measurements WHERE calibration_id=?').get(calId).n;
+  // HOOK for Task 4 (manual measurements). The measurements whose qty changes when `next` ({ region, scale }: the
+  // calibration about to be stored) replaces `replaced` (the stored calibration row, or null when `next` is new), each
+  // with the qty and base it would get: [{ measurement_id, row_id, old_qty, new_qty, base }]. Runs inside the tx.
+  // Today it lists the measurements saved with the replaced calibration (calibration_id). No tool writes calibration_id
+  // before Task 4, so the list is empty and a re-calibration is a plain replace. Task 4 fills in manualRescale and also
+  // lists, for a new region, the measurements of this page whose first point falls in it (they move from the page
+  // calibration to the region's).
+  function calibrationChanges(d, replaced, next) {
+    if (!replaced) return [];
+    return db.prepare('SELECT * FROM measurements WHERE calibration_id=? ORDER BY id').all(replaced.id).map(m => {
+      const q = manualRescale(m, next);
+      return { measurement_id: m.id, row_id: m.row_id, old_qty: m.qty, new_qty: q.qty, base: q.base };
+    });
+  }
+  // HOOK for Task 4: { qty, base } of a manual measurement under the calibration `cal` (lib/takeoff/manual.js manualQty
+  // on its stored geometry). Until then nothing can be recomputed, so nothing is ever changed.
+  const manualRescale = m => bad(`measurement ${m.id} cannot be recomputed with another calibration`, 409);
+  const CAL_FIELDS = ['region', 'p1', 'p2', 'real', 'unit', 'apply'];
+  // the calibration routes apply to a PDF page or an image (a DXF has confirmed units instead)
+  const rasterOnly = d => { if (d.kind !== 'pdf' && d.kind !== 'image') bad('calibration applies to PDF and image drawings only'); };
+  const calibOf = (d, cidStr) => {
+    const cid = idOf(cidStr), c = cid === null ? null : db.prepare('SELECT * FROM calibrations WHERE id=? AND drawing_id=?').get(cid, d.id);
+    if (!c) bad('calibration not found', 404);
+    return c;
+  };
+  // a pure-function refusal (lib/takeoff/calib.js) is a 400 with its message
+  const calc = fn => { try { return fn(); } catch (e) { if (e.status) throw e; bad(e.message); } };
+
+  async function calibrationApi(req, res, parts, d, t, me) {
+    const method = req.method;
+    if (parts.length === 3 && method === 'GET') {
+      need(me, 'admin', 'qs', 'viewer'); rasterOnly(d);
+      return reply(res, 200, { calibrations: calibrationsOf(d.id) });
+    }
+    if (parts.length === 3 && method === 'POST') return calibrate(req, res, d, t, me);
+    if (parts.length === 5 && parts[4] === 'verify' && method === 'POST') {
+      need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d);
+      const c = calibOf(d, parts[3]), b = await ctx.readBody(req);
+      for (const k of Object.keys(b)) if (!['p1', 'p2', 'real', 'unit'].includes(k)) bad('unknown field: ' + k);
+      const pct = calc(() => calib.verifyPct(c, b.p1, b.p2, b.real, b.unit)), warning = Math.abs(pct) > 1;
+      tx(() => {
+        mustDraft(tenderRow(t.id));
+        if (!db.prepare('UPDATE calibrations SET verify_pct=? WHERE id=? AND scale=?').run(pct, c.id, c.scale).changes) bad('the calibration changed: verify again', 409);
+        audit(me, 'calibration_verify', 'calibrations', c.id, { drawing_id: d.id, calibration_id: c.id, pct, warning });
+      });
+      return reply(res, 200, { pct, warning });
+    }
+    if (parts.length === 4 && method === 'DELETE') {
+      need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d);
+      const c = calibOf(d, parts[3]);
+      tx(() => {
+        mustDraft(tenderRow(t.id));
+        const cur = db.prepare('SELECT * FROM calibrations WHERE id=?').get(c.id);
+        if (!cur) bad('calibration not found', 404);
+        const n = calibrationUsers(cur.id);
+        if (n) bad(`measurements use this calibration (${n}): delete them first`, 409);
+        db.prepare('DELETE FROM calibrations WHERE id=?').run(cur.id);
+        audit(me, 'calibration_delete', 'calibrations', cur.id, { drawing_id: d.id, region: cur.region !== null, scale: cur.scale, real: cur.real, unit: cur.unit });
+      });
+      return reply(res, 200, { ok: 1 });
+    }
+    return false;
+  }
+
+  // POST /drawings/:id/calibrations { region?, p1, p2, real, unit, apply? }: the page calibration (created or replaced)
+  // or a region's (the same rectangle again replaces it; another rectangle must not overlap any region). Measurements
+  // whose qty would change: 409 with the before/after list, applied only with apply: true (one tx, rows recomputed).
+  async function calibrate(req, res, d, t, me) {
+    need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d);
+    if (d.status !== 'ready') bad('register the pages of this PDF first', 409);
+    const b = await ctx.readBody(req);
+    for (const k of Object.keys(b)) if (!CAL_FIELDS.includes(k)) bad('unknown field: ' + k);
+    const apply = optBool(b, 'apply');
+    const region = b.region === undefined || b.region === null ? null : calc(() => calib.normRect(b.region));
+    const scale = calc(() => calib.scaleOf(b.p1, b.p2, b.real, b.unit));
+    if (!(scale > 0) || !Number.isFinite(scale)) bad('the calibration gives no usable scale');
+    const regionText = region === null ? null : JSON.stringify(region);
+    const out = tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = drawingRow(d.id);
+      if (!cur || cur.status !== 'ready') bad('the drawing changed: try again', 409);
+      let replaced;
+      if (region === null) replaced = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? AND region IS NULL').get(d.id) || null;
+      else {
+        replaced = null;
+        for (const c of db.prepare('SELECT * FROM calibrations WHERE drawing_id=? AND region IS NOT NULL ORDER BY id').all(d.id)) {
+          const r = calib.normRect(JSON.parse(c.region));
+          if (r.every((v, i) => v === region[i])) replaced = c;
+          else if (calib.rectsOverlap(r, region)) bad('the region overlaps another calibrated region', 409);
+        }
+      }
+      const changes = calibrationChanges(d, replaced, { region, scale });
+      if (changes.length && !apply) conflictBody({ error: 'calibration changes measured quantities', changes: changes.map(({ measurement_id, row_id, old_qty, new_qty }) => ({ measurement_id, row_id, old_qty, new_qty })) });
+      const now = new Date().toISOString(), [p1x, p1y] = b.p1, [p2x, p2y] = b.p2;
+      let id;
+      if (replaced) {
+        db.prepare('UPDATE calibrations SET p1x=?, p1y=?, p2x=?, p2y=?, real=?, unit=?, scale=?, verify_pct=NULL, created=?, created_by=? WHERE id=?')
+          .run(p1x, p1y, p2x, p2y, b.real, b.unit, scale, now, me.username, replaced.id);
+        id = replaced.id;
+      } else {
+        id = Number(db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+          .run(d.id, regionText, p1x, p1y, p2x, p2y, b.real, b.unit, scale, now, me.username).lastInsertRowid);
+      }
+      const upd = db.prepare('UPDATE measurements SET qty=?, base=?, calibration_id=? WHERE id=?');
+      for (const c of changes) upd.run(c.new_qty, c.base, id, c.measurement_id);
+      const rows = [...new Set(changes.map(c => c.row_id).filter(r => r !== null))];
+      for (const r of rows) recompute(r);
+      audit(me, 'calibrate', 'calibrations', id, { drawing_id: d.id, region: region !== null, scale, real: b.real, unit: b.unit, replaced: !!replaced, changed: changes.length, rows: rows.length });
+      return { calibration: calView(db.prepare('SELECT * FROM calibrations WHERE id=?').get(id)), replaced: !!replaced,
+        changes: changes.map(({ measurement_id, row_id, old_qty, new_qty }) => ({ measurement_id, row_id, old_qty, new_qty })) };
+    });
+    return reply(res, 200, out);
   }
 
   // GET /drawings/:id/file: the uploaded bytes as they are (a page row: the shared file). Any reader. no-cache + ETag (the
@@ -477,7 +619,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (sub === undefined && parts.length === 2 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer');
       const c = d.kind === 'dxf' && d.status === 'ready' ? await readSummary(d.sha256) : null;
-      return reply(res, 200, { ...d, header: c && c.header, ignored: c && c.ignored, warnings: c && c.warnings });
+      return reply(res, 200, { ...d, header: c && c.header, ignored: c && c.ignored, warnings: c && c.warnings, calibrations: d.kind === 'dxf' ? null : calibrationsOf(d.id) });
     }
     if (sub === 'layers' && parts.length === 3 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer'); dxfOnly();
@@ -488,6 +630,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (sub === 'render' && parts.length === 3 && method === 'GET') { need(me, 'admin', 'qs', 'viewer'); dxfOnly(); return serveRender(req, res, d, me); }
     if (sub === 'file' && parts.length === 3 && method === 'GET') return serveFile(req, res, d, me);
     if (sub === 'pages' && parts.length === 3 && method === 'POST') return registerPages(req, res, d, t, me);
+    if (sub === 'calibrations' && parts.length >= 3 && parts.length <= 5) return calibrationApi(req, res, parts, d, t, me);
     if (sub === 'units' && parts.length === 3 && method === 'PUT') {
       need(me, 'admin', 'qs'); mustDraft(t); dxfOnly();
       const b = await ctx.readBody(req);

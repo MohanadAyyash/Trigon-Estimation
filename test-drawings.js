@@ -1414,6 +1414,198 @@ server.listen(0, async () => {
       }
     }
 
+    // ---- batch 3 Task 3: calibration of a PDF page or an image (page and regions), verify; carry-overs ------------
+    {
+      const { makePdf, PDF_PAGES, makePng } = require('./test/fixtures/make-takeoff.js');
+      const T = (await call('POST', 'tenders', { title: 'Test Calibration', kind: 'rta' }, qs)).j.id;
+      const pdfUp = await upload(T, 'Sheets', makePdf(), qs);
+      assert.strictEqual(pdfUp.s, 202);
+      const cpath = id => `drawings/${id}/calibrations`;
+      // a PDF whose pages are not registered yet has no page to calibrate
+      const pre = await call('POST', cpath(pdfUp.j.id), { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs);
+      assert.strictEqual(pre.s, 409, JSON.stringify(pre.j)); assert.match(pre.j.error, /pages/);
+      const pg = await call('POST', `drawings/${pdfUp.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs);
+      assert.strictEqual(pg.s, 200);
+      const [P1, P2] = pg.j.drawings.map(x => x.id);
+      const calRows = id => db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(id);
+      const lastAudit = action => { const a = db.prepare('SELECT * FROM audit_log WHERE action=? ORDER BY id DESC LIMIT 1').get(action); return a && { ...a, detail: JSON.parse(a.detail) }; };
+
+      let g = await call('GET', cpath(P1), null, viewer);
+      assert.strictEqual(g.s, 200); assert.deepStrictEqual(g.j, { calibrations: [] });
+      assert.deepStrictEqual((await call('GET', `drawings/${P1}`, null, viewer)).j.calibrations, []);
+      assert.strictEqual((await call('GET', cpath(P1), null, '')).s, 401);
+      assert.strictEqual((await call('GET', cpath(999999), null, qs)).s, 404);
+
+      // roles and validation: nothing stored on a refusal
+      const good = { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' };
+      assert.strictEqual((await call('POST', cpath(P1), good, viewer)).s, 403, 'viewer → 403');
+      for (const [b, re] of [
+        [{ ...good, p1: undefined }, /p1/], [{ ...good, p2: [5, 0] }, /at least 10/], [{ ...good, p2: [100, '0'] }, /p2/], [{ ...good, real: 0 }, /real length/],
+        [{ ...good, real: '5' }, /real length/], [{ ...good, unit: 'yd' }, /unit/], [{ ...good, scale: 2 }, /unknown field/], [{ ...good, apply: 'yes' }, /apply/],
+        [{ ...good, region: [0, 0, 10] }, /region/], [{ ...good, region: [0, 0, 0, 10] }, /size/], [{ ...good, region: 'all' }, /region/]]) {
+        const r = await call('POST', cpath(P1), b, qs);
+        assert.strictEqual(r.s, 400, JSON.stringify(b)); assert.match(r.j.error, re, JSON.stringify(b));
+      }
+      assert.strictEqual(calRows(P1).length, 0);
+
+      // page calibration: 100 units = 5 m → 0.05 m/unit; shown by GET (calibrations and the drawing detail)
+      let r = await call('POST', cpath(P1), good, qs);
+      assert.strictEqual(r.s, 200, JSON.stringify(r.j));
+      const pageId = r.j.calibration.id;
+      assert.deepStrictEqual({ ...r.j.calibration, created: null }, { id: pageId, drawing_id: P1, region: null, p1: [0, 0], p2: [100, 0], real: 5, unit: 'm', scale: 0.05, verify_pct: null, created: null, created_by: 'qs1' });
+      assert.strictEqual(r.j.replaced, false); assert.deepStrictEqual(r.j.changes, []);
+      g = await call('GET', cpath(P1), null, viewer);
+      assert.deepStrictEqual(g.j.calibrations, [r.j.calibration]);
+      assert.deepStrictEqual((await call('GET', `drawings/${P1}`, null, viewer)).j.calibrations, [r.j.calibration]);
+      let a = lastAudit('calibrate');
+      assert.strictEqual(a.entity, 'calibrations'); assert.strictEqual(a.entity_id, String(pageId));
+      assert.deepStrictEqual(a.detail, { drawing_id: P1, region: false, scale: 0.05, real: 5, unit: 'm', replaced: false, changed: 0, rows: 0 }, 'summary only, no coordinates');
+
+      // a second page calibration replaces the first (same id, verify cleared); at most one per drawing
+      r = await call('POST', cpath(P1), { p1: [0, 0], p2: [0, 200], real: 20000, unit: 'mm' }, qs);
+      assert.strictEqual(r.s, 200); assert.strictEqual(r.j.calibration.id, pageId); assert.strictEqual(r.j.replaced, true);
+      assert.strictEqual(r.j.calibration.scale, 0.1);
+      assert.strictEqual(calRows(P1).filter(c => c.region === null).length, 1);
+      assert.throws(() => db.prepare("INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale) VALUES(?,NULL,0,0,100,0,1,'m',0.01)").run(P1), /UNIQUE/, 'the database refuses a second page calibration');
+      assert.deepStrictEqual(lastAudit('calibrate').detail, { drawing_id: P1, region: false, scale: 0.1, real: 20000, unit: 'mm', replaced: true, changed: 0, rows: 0 });
+
+      // regions: normalised to [minx, miny, maxx, maxy]; an overlap is refused, touching at an edge is not an overlap
+      r = await call('POST', cpath(P1), { region: [300, 300, 100, 100], p1: [100, 100], p2: [100, 300], real: 2, unit: 'm' }, qs);
+      assert.strictEqual(r.s, 200, JSON.stringify(r.j));
+      const regA = r.j.calibration;
+      assert.deepStrictEqual(regA.region, [100, 100, 300, 300]); assert.strictEqual(regA.scale, 0.01);
+      assert.strictEqual(calRows(P1).find(c => c.id === regA.id).region, '[100,100,300,300]');
+      const n0 = calRows(P1).length;
+      for (const rg of [[250, 250, 400, 400], [150, 150, 200, 200], [0, 0, 500, 500], [299, 0, 400, 101]]) {
+        const o = await call('POST', cpath(P1), { region: rg, p1: [0, 0], p2: [50, 0], real: 1, unit: 'm' }, qs);
+        assert.strictEqual(o.s, 409, JSON.stringify(rg)); assert.match(o.j.error, /overlap/);
+      }
+      assert.strictEqual(calRows(P1).length, n0, 'nothing stored');
+      r = await call('POST', cpath(P1), { region: [300, 100, 400, 300], p1: [300, 100], p2: [400, 100], real: 1, unit: 'm' }, qs);
+      assert.strictEqual(r.s, 200, 'sharing an edge is fine');
+      const regB = r.j.calibration;
+      assert.strictEqual((await call('POST', cpath(P1), { region: [400, 300, 500, 400], p1: [0, 0], p2: [50, 0], real: 1, unit: 'm' }, qs)).s, 200, 'sharing a corner is fine');
+      // the same rectangle again (corners in another order) replaces that region's calibration
+      r = await call('POST', cpath(P1), { region: [100, 300, 300, 100], p1: [100, 100], p2: [300, 100], real: 4, unit: 'm' }, qs);
+      assert.strictEqual(r.s, 200); assert.strictEqual(r.j.calibration.id, regA.id); assert.strictEqual(r.j.replaced, true); assert.strictEqual(r.j.calibration.scale, 0.02);
+      assert.strictEqual(calRows(P1).length, 4);
+      assert.deepStrictEqual(lastAudit('calibrate').detail, { drawing_id: P1, region: true, scale: 0.02, real: 4, unit: 'm', replaced: true, changed: 0, rows: 0 });
+      // the list: page first, then the regions by id
+      g = await call('GET', cpath(P1), null, viewer);
+      assert.deepStrictEqual(g.j.calibrations.map(c => c.id), [pageId, regA.id, regB.id, regB.id + 1]);
+      // page 2 is calibrated on its own (its regions may overlap those of page 1)
+      assert.strictEqual((await call('POST', cpath(P2), { region: [0, 0, 500, 500], p1: [0, 0], p2: [0, 100], real: 1, unit: 'm' }, qs)).s, 200);
+      assert.strictEqual((await call('POST', cpath(P2), good, qs)).s, 200);
+      assert.strictEqual(calRows(P2).length, 2); assert.strictEqual(calRows(P1).length, 4);
+
+      // verify: a second known line → (measured − real) / real × 100, stored; a warning above 1 %
+      assert.strictEqual((await call('POST', cpath(P1), good, qs)).s, 200);   // back to 0.05 m/unit
+      const vpath = cid => `${cpath(P1)}/${cid}/verify`;
+      assert.strictEqual((await call('POST', vpath(pageId), { p1: [0, 0], p2: [200, 0], real: 10.2, unit: 'm' }, viewer)).s, 403);
+      let v = await call('POST', vpath(pageId), { p1: [0, 0], p2: [200, 0], real: 10.2, unit: 'm' }, qs);
+      assert.strictEqual(v.s, 200, JSON.stringify(v.j));
+      assert.ok(Math.abs(v.j.pct - (10 - 10.2) / 10.2 * 100) < 1e-9 && Math.abs(v.j.pct + 1.96) < 0.005, String(v.j.pct)); assert.strictEqual(v.j.warning, true);
+      assert.strictEqual(calRows(P1).find(c => c.id === pageId).verify_pct, v.j.pct);
+      assert.deepStrictEqual(lastAudit('calibration_verify').detail, { drawing_id: P1, calibration_id: pageId, pct: v.j.pct, warning: true });
+      v = await call('POST', vpath(pageId), { p1: [0, 0], p2: [0, 200], real: 10050, unit: 'mm' }, qs);
+      assert.strictEqual(v.s, 200); assert.ok(Math.abs(v.j.pct) < 1); assert.strictEqual(v.j.warning, false);
+      assert.strictEqual((await call('GET', cpath(P1), null, viewer)).j.calibrations[0].verify_pct, v.j.pct);
+      for (const [b, re] of [[{ p1: [0, 0], p2: [5, 0], real: 1, unit: 'm' }, /at least 10/], [{ p1: [0, 0], p2: [50, 0], real: -1, unit: 'm' }, /real length/],
+        [{ p1: [0, 0], p2: [50, 0], real: 1, unit: 'm', apply: true }, /unknown field/]]) {
+        const x = await call('POST', vpath(pageId), b, qs);
+        assert.strictEqual(x.s, 400); assert.match(x.j.error, re);
+      }
+      const p2cal = calRows(P2)[0].id;
+      assert.strictEqual((await call('POST', vpath(p2cal), { p1: [0, 0], p2: [200, 0], real: 10, unit: 'm' }, qs)).s, 404, 'a calibration of another drawing');
+      assert.strictEqual((await call('POST', vpath(999999), { p1: [0, 0], p2: [200, 0], real: 10, unit: 'm' }, qs)).s, 404);
+
+      // delete: refused while a measurement uses the calibration; otherwise removed with an audit entry
+      assert.strictEqual((await call('DELETE', `${cpath(P1)}/${regB.id}`, null, viewer)).s, 403);
+      const fakeM = Number(db.prepare("INSERT INTO measurements(drawing_id,tender_id,tool,qty,qty_unit,calibration_id,created) VALUES(?,?,'manual',1,'m',?,'x')").run(P1, T, regB.id).lastInsertRowid);
+      let x = await call('DELETE', `${cpath(P1)}/${regB.id}`, null, qs);
+      assert.strictEqual(x.s, 409); assert.match(x.j.error, /measurements use/);
+      assert.ok(calRows(P1).some(c => c.id === regB.id));
+      db.prepare('DELETE FROM measurements WHERE id=?').run(fakeM);
+      x = await call('DELETE', `${cpath(P1)}/${regB.id}`, null, qs);
+      assert.strictEqual(x.s, 200, JSON.stringify(x.j));
+      assert.ok(!calRows(P1).some(c => c.id === regB.id));
+      assert.deepStrictEqual(lastAudit('calibration_delete').detail, { drawing_id: P1, region: true, scale: 0.01, real: 1, unit: 'm' });
+      assert.strictEqual((await call('DELETE', `${cpath(P1)}/${regB.id}`, null, qs)).s, 404);
+      assert.strictEqual((await call('DELETE', `${cpath(P1)}/${p2cal}`, null, qs)).s, 404, 'a calibration of another drawing');
+
+      // an image is calibrated the same way; a DXF → 400
+      const img = await upload(T, 'Photo', makePng(640, 480), qs);
+      assert.strictEqual((await call('POST', cpath(img.j.id), good, qs)).s, 200);
+      const dxfUp = await upload(T, 'Site', FIXTURE, qs);
+      assert.strictEqual(dxfUp.s, 202);
+      for (const [m, u, b] of [['POST', cpath(dxfUp.j.id), good], ['GET', cpath(dxfUp.j.id), null]]) {
+        const y = await call(m, u, b, qs);
+        assert.strictEqual(y.s, 400, m); assert.match(y.j.error, /PDF/);
+      }
+      assert.strictEqual((await waitDone(dxfUp.j.id, qs)).calibrations, null, 'a DXF detail has no calibrations');
+
+      // an approved tender: every change → 409, reads allowed
+      db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
+      const before = db.prepare('SELECT * FROM calibrations ORDER BY id').all();
+      for (const [m, u, b] of [['POST', cpath(P1), good], ['POST', cpath(P1), { ...good, region: [600, 600, 700, 700] }], ['POST', vpath(pageId), good], ['DELETE', `${cpath(P1)}/${regA.id}`, null]]) {
+        const y = await call(m, u, b, qs);
+        assert.strictEqual(y.s, 409, m + ' ' + u); assert.match(y.j.error, /approved/);
+      }
+      assert.deepStrictEqual(db.prepare('SELECT * FROM calibrations ORDER BY id').all(), before, 'nothing changed');
+      assert.strictEqual((await call('GET', cpath(P1), null, viewer)).s, 200);
+
+      // a deleted draft tender takes its calibrations along
+      {
+        const T2 = (await call('POST', 'tenders', { title: 'Test Calibration Delete', kind: 'rta' }, qs)).j.id;
+        const im = await upload(T2, 'Photo', makePng(64, 48), qs);
+        assert.strictEqual((await call('POST', cpath(im.j.id), good, qs)).s, 200);
+        assert.strictEqual((await call('DELETE', `tenders/${T2}`, null, qs)).s, 200);
+        assert.strictEqual(calRows(im.j.id).length, 0);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM calibrations WHERE drawing_id NOT IN (SELECT id FROM drawings)').get().n, 0, 'no orphan calibrations');
+      }
+
+      // carry-over (a): a name that says PNG/JPEG with a Content-Length over 50 MB → 413 before the body is read
+      {
+        const port = server.address().port;
+        const rawPost = (u, headers) => new Promise((ok, no) => {
+          const q = http.request({ port, method: 'POST', path: '/api/' + u, headers: { cookie: qs, 'Content-Type': 'application/octet-stream', ...headers } }, res => {
+            let b = ''; res.on('data', c => b += c); res.on('end', () => ok({ s: res.statusCode, conn: res.headers.connection, b }));
+          });
+          q.on('error', no);
+          q.setTimeout(5000, () => { q.destroy(); no(new Error('no answer within 5 s to ' + u)); });
+          q.write('\x89PNG');   // the rest is never sent: the answer must come anyway
+        });
+        const T4 = (await call('POST', 'tenders', { title: 'Test Early Refusal', kind: 'rta' }, qs)).j.id;
+        for (const name of ['big.png', 'big.JPG', 'big.jpeg']) {
+          const y = await rawPost(`tenders/${T4}/drawings?name=${name}`, { 'Content-Length': 50 * 1024 * 1024 + 1 });
+          assert.strictEqual(y.s, 413, name); assert.match(JSON.parse(y.b).error, /50 MB/); assert.strictEqual(y.conn, 'close');
+        }
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE tender_id=?').get(T4).n, 0);
+        assert.ok(!dirFiles().some(f => f.startsWith('tmp-')), 'no temp file');
+      }
+      // carry-over (c): page-row names stay within 200 characters, the page suffix kept
+      {
+        const T5 = (await call('POST', 'tenders', { title: 'Test Long Names', kind: 'rta' }, qs)).j.id;
+        const long = 'N'.repeat(200), u5 = await upload(T5, long, makePdf(), qs);
+        assert.strictEqual(u5.s, 202);
+        const pages = Array.from({ length: 12 }, (_, i) => ({ page: i + 1, width: 595, height: 842, rotation: 0 }));
+        const y = await call('POST', `drawings/${u5.j.id}/pages`, { pages }, qs);
+        assert.strictEqual(y.s, 200);
+        const names = y.j.drawings.map(z => z.name);
+        assert.strictEqual(names[0], long);
+        assert.strictEqual(names[1], 'N'.repeat(200 - ' — p2'.length) + ' — p2');
+        assert.strictEqual(names[11], 'N'.repeat(200 - ' — p12'.length) + ' — p12');
+        assert.ok(names.every(z => z.length <= 200));
+        // a short name is not cut; a surrogate pair is never split
+        const u6 = await upload(T5, 'x'.repeat(194) + '😀😀😀', makePdf(), qs);
+        assert.strictEqual(u6.s, 202);
+        const y6 = await call('POST', `drawings/${u6.j.id}/pages`, { pages: pages.slice(0, 2) }, qs);
+        assert.strictEqual(y6.j.drawings[1].name, 'x'.repeat(194) + ' — p2', 'the cut never leaves half a character');
+        const u7 = await upload(T5, 'Short', makePdf(), qs);
+        assert.strictEqual((await call('POST', `drawings/${u7.j.id}/pages`, { pages: pages.slice(0, 2) }, qs)).j.drawings[1].name, 'Short — p2');
+      }
+    }
+
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------
     {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-restart-'));
