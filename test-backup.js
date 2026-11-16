@@ -144,5 +144,45 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
     b.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+  // R9: PDF and image originals uploaded through the app are mirrored too (<sha>.pdf / .png / .jpg), byte for byte
+  {
+    const { makePdf, makePng, jpegHeader } = require('./test/fixtures/make-takeoff.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-backup-pdf-'));
+    const port = await freePort();
+    const child = spawn(process.execPath, ['--no-warnings', path.join(__dirname, 'server.js')],
+      { env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', ERP_SYNC_DISABLED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', c => { out += c; }); child.stderr.on('data', c => { out += c; });
+    const exited = new Promise(ok => child.on('exit', ok));
+    try {
+      for (const t0 = Date.now(); !out.includes('Trigon Estimation on');) {
+        if (Date.now() - t0 > 10000) throw new Error('server did not start: ' + out);
+        await new Promise(f => setTimeout(f, 20));
+      }
+      const api = `http://127.0.0.1:${port}/api/`;
+      const s = await fetch(api + 'setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'admin', password: 'secret12' }) });
+      assert.strictEqual(s.status, 200);
+      const cookie = s.headers.get('set-cookie').split(';')[0];
+      const t = await fetch(api + 'tenders', { method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ title: 'Test Backup Plans', kind: 'rta' }) });
+      assert.strictEqual(t.status, 200);
+      const tid = (await t.json()).id;
+      const files = [[makePdf(), '.pdf'], [makePng(32, 24), '.png'], [jpegHeader(640, 480), '.jpg']];
+      for (const [body, ext] of files) {
+        const u = await fetch(api + `tenders/${tid}/drawings?name=plan${ext}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie }, body });
+        assert.strictEqual(u.status, 202, ext + ' upload: ' + await u.text());
+      }
+      child.kill('SIGTERM');
+      await exited;
+      const r = run(dir);
+      assert.strictEqual(r.status, 0, r.stderr);
+      const sha = b => require('crypto').createHash('sha256').update(b).digest('hex');
+      const bd = path.join(dir, 'backups', 'drawings');
+      assert.deepStrictEqual(fs.readdirSync(bd).sort(), files.map(([b, ext]) => sha(b) + ext).sort(), 'each original mirrored under its content-addressed name');
+      for (const [b, ext] of files) assert.ok(fs.readFileSync(path.join(bd, sha(b) + ext)).equals(b), ext + ': same bytes');
+    } finally {
+      if (child.exitCode === null) { child.kill('SIGKILL'); await exited; }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
   console.log('backup ok');
 })().catch(e => { console.error(e); process.exit(1); });

@@ -2,7 +2,7 @@
 // each time the app starts (at most one copy per day). The copy is written to a .tmp file and renamed, so a failed run
 // never leaves a half-written backup under the real name. A failure is appended to data/backups/backup-errors.log
 // and the script exits non-zero.
-// The drawings (data/drawings/<sha>.dxf, content-addressed and immutable) are mirrored into data/backups/drawings: only files
+// The drawings (the uploaded originals data/drawings/<sha>.dxf / .pdf / .png / .jpg, content-addressed and immutable) are mirrored into data/backups/drawings: only files
 // that are missing there are copied (via .tmp + rename) and nothing in the mirror is ever deleted. Caches are not copied; they are rebuilt.
 // A failure in one part does not stop the other.
 const fs = require('fs'), path = require('path');
@@ -31,7 +31,7 @@ try {
   const from = path.join(dir, 'drawings'), to = path.join(out, 'drawings');
   if (fs.existsSync(from)) {
     fs.mkdirSync(to, { recursive: true });
-    for (const f of fs.readdirSync(from).filter(f => /^[0-9a-f]{64}\.dxf$/.test(f))) {
+    for (const f of fs.readdirSync(from).filter(f => /^[0-9a-f]{64}\.(dxf|pdf|png|jpg)$/.test(f))) {
       try {   // one bad file must not stop the rest
         const dest = path.join(to, f);
         // content-addressed: a copy of a different size is damaged and is replaced (via .tmp, never deleted first)
