@@ -8,12 +8,13 @@
 //   screen = (local x · scale + tx, −local y · scale + ty), CSS pixels.
 // toWorld/toScreen and every rect, point and tolerance passed in or returned use true world coordinates.
 // A NaN,NaN point pair is a path break: no segment touching it is ever drawn, hit, snapped or box-tested. Kind 4
-// (dropped) has no points and is never visible, hit or selected; kinds 2 (insert marker) and 3 (text anchor) are points.
+// (dropped) has no points and is never visible, hit or selected; kinds 2 (insert marker), 5 (nested insert marker: an
+// INSERT inside a block) and 3 (text anchor) are points, and kind 5 is drawn, hit and selected exactly like kind 2.
 // Display data is approximate (Float32, arcs as chords): previewTotal is for display only, never a saved quantity.
 'use strict';
 (function () {
 const VERSION = 2;
-const KIND_OPEN = 0, KIND_CLOSED = 1, KIND_INSERT = 2, KIND_DROPPED = 4;
+const KIND_OPEN = 0, KIND_CLOSED = 1, KIND_INSERT = 2, KIND_DROPPED = 4, KIND_NESTED = 5;
 const LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
 // ---- display file ----
@@ -273,15 +274,17 @@ function snap(G, R, wx, wy, tol, layerOn) {
 
 // display-only live total of a selection (drawing units × unitFactor, area × unitFactor²); used = entities counted.
 // Mirrors lib/dxf/select.js through the display file's len: a HATCH's len is NaN (no perimeter), an insert marker's len
-// is its count (rows × cols for an MINSERT).
+// is its count (rows × cols for an MINSERT). A count takes the top-level markers (kind 2) only; with opts.nested also the
+// nested ones (kind 5), as the server does with nested: true.
 const METRICS = { open_length: 1, closed_perimeter: 1, area: 1, count: 1 };
-function previewTotal(R, indices, metric, unitFactor) {
+function previewTotal(R, indices, metric, unitFactor, opts) {
+  const nested = !!(opts && opts.nested);
   if (!METRICS[metric]) throw new Error('previewTotal: unknown metric ' + metric);
   if (typeof unitFactor !== 'number' || !Number.isFinite(unitFactor) || unitFactor <= 0) throw new Error('previewTotal: unit factor must be a number > 0');
   let sum = 0, used = 0;
   for (let k = 0; k < indices.length; k++) {
     const i = indices[k], kind = R.kind[i];
-    if (metric === 'count' ? kind !== KIND_INSERT : metric === 'open_length' ? kind !== KIND_OPEN : kind !== KIND_CLOSED) continue;
+    if (metric === 'count' ? kind !== KIND_INSERT && !(nested && kind === KIND_NESTED) : metric === 'open_length' ? kind !== KIND_OPEN : kind !== KIND_CLOSED) continue;
     const v = metric === 'area' ? R.area[i] : R.len[i];
     if (v !== v) continue;
     sum += v; used++;
@@ -290,6 +293,22 @@ function previewTotal(R, indices, metric, unitFactor) {
   return { value, used };
 }
 
-const TV = { decodeRender, makeView, zoomAt, pan, toWorld, toScreen, buildGrid, visible, hitTest, boxSelect, snap, previewTotal };
+// the selection's block inserts by block name, in name order: [{ block, top, nested }] = Σ count of its top-level (kind 2)
+// and nested (kind 5) markers. Display only, like previewTotal.
+function previewBlocks(R, indices) {
+  const by = new Map();
+  for (let k = 0; k < indices.length; k++) {
+    const i = indices[k], kind = R.kind[i];
+    if (kind !== KIND_INSERT && kind !== KIND_NESTED) continue;
+    const name = R.block[i] < R.blocks.length ? R.blocks[R.block[i]] : '?', v = R.len[i];
+    let b = by.get(name);
+    if (!b) { b = { block: name, top: 0, nested: 0 }; by.set(name, b); }
+    if (v !== v) continue;
+    if (kind === KIND_NESTED) b.nested += v; else b.top += v;
+  }
+  return [...by.values()].sort((a, b) => (a.block < b.block ? -1 : a.block > b.block ? 1 : 0));
+}
+
+const TV = { decodeRender, makeView, zoomAt, pan, toWorld, toScreen, buildGrid, visible, hitTest, boxSelect, snap, previewTotal, previewBlocks };
 if (typeof module !== 'undefined' && module.exports) module.exports = TV; else window.TV = TV;
 })();

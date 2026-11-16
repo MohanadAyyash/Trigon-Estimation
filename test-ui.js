@@ -536,6 +536,105 @@ server.listen(0, async () => {
     assert.strictEqual(await page.evaluate(() => window.__tvViewer), null, 'viewer detached on route change');
     await page.click('#tab-drawings'); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
 
+    // ---- final review: block counts by name (items 1), no quantity before units (8), "n of m found" (5), repeated handles (6) ----
+    {
+      const insD = (hd, layer, name, x, y) => [[0, 'INSERT'], [5, hd], [8, layer], [2, name], [10, x], [20, y]];
+      const lineD = (hd, layer, x0, y0, x1, y1) => [[0, 'LINE'], [5, hd], [8, layer], [10, x0], [20, y0], [11, x1], [21, y1]];
+      const doors = [];
+      for (let i = 0; i < 10; i++) doors.push(...insD('D' + i, 'DR', 'DOOR', i * 1000, 0));
+      // no $INSUNITS: the units are chosen by the user. 10 DOOR inserts each holding 2 HINGE inserts; a WINDOW; two lines that
+      // share the handle DUP (a malformed file)
+      const FIXD = dxf([...dsec('BLOCKS', [[0, 'BLOCK'], [2, 'HINGE'], [70, 0], [10, 0], [20, 0], ...lineD('HL', '0', 500, 0, 600, 0), [0, 'ENDBLK'],
+        [0, 'BLOCK'], [2, 'DOOR'], [70, 0], [10, 0], [20, 0], ...lineD('DL', '0', 0, 0, 900, 0), ...insD('H1', '0', 'HINGE', 0, 0), ...insD('H2', '0', 'HINGE', 0, 2000), [0, 'ENDBLK'],
+        [0, 'BLOCK'], [2, 'WINDOW'], [70, 0], [10, 0], [20, 0], ...lineD('WL', '0', 0, 0, 1200, 0), [0, 'ENDBLK']]),
+      ...dsec('ENTITIES', [...doors, ...insD('W1', 'DR', 'WINDOW', 0, 50000), ...lineD('DUP', 'LN', 100000, 0, 101000, 0), ...lineD('DUP', 'LN', 100000, 10, 101000, 10)])]);
+      const doorRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '6', description: 'Test doors', unit: 'nr' }, admin), 'door row')).id;
+      const dupRow = (await ok(call('POST', `tenders/${dwg}/rows`, { no: '7', description: 'Test lines', unit: 'm' }, admin), 'dup row')).id;
+      const up = await fetch(`${base}tenders/${dwg}/drawings?name=doors`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(FIXD) });
+      assert.strictEqual(up.status, 202);
+      const did = (await up.json()).id;
+      for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(did).status === 'parsing';) {
+        if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
+      }
+      assert.strictEqual(db.prepare('SELECT status, units FROM drawings WHERE id=?').get(did).units, null);
+      await page.goto(`${origin}/#/tender/${dwg}/drawings/${did}`);
+      await page.waitForSelector(D + ' #dw-confirm-units');
+      const v = sel => page.textContent(`#tv-preview [data-metric="${sel}"] .v`).then(x => x.trim());
+      // item 8: units not confirmed: the viewer selects, but shows no number and offers no Link
+      await openViewer();
+      await page.click('#tv-mode-window');
+      await band([-1000, -1000], [10000, 2500]);
+      assert.ok(await nSel() > 0, 'selection works before the units are confirmed');
+      for (const mt of ['open_length', 'closed_perimeter', 'area', 'count']) assert.strictEqual(await v(mt), '—', 'no preview before units: ' + mt);
+      assert.strictEqual((await page.textContent('#tv-blocks')).trim(), '', 'no block counts before units');
+      assert.strictEqual(await page.$(D + ' #tv-link'), null, 'no Link before the units are confirmed');
+      await page.click('#tv-close');
+      await page.selectOption('#dw-unit-select', 'mm');
+      await page.click('#dw-confirm-units');
+      await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+      // item 1: a window over the doors: 10 DOOR counted; the 20 nested HINGE shown apart, not counted
+      await openViewer();
+      await page.click('#tv-mode-window');
+      await band([-500, -500], [10000, 2500]);
+      assert.strictEqual(await v('count'), '10 nr', 'count preview: top-level inserts only');
+      assert.strictEqual((await page.textContent('#tv-blocks')).trim(), 'Blocks: DOOR 10 · HINGE 20 nested (not counted)');
+      assert.ok((await page.textContent('#tv-sel-blocks')).includes('DOOR 10 · HINGE 20 nested (not counted)'), 'status bar breakdown');
+      await page.click('#tv-link');
+      await page.waitForSelector(D + ' #lk-form #lk-metric');
+      assert.strictEqual(await page.isVisible('#lk-nested'), false, 'nested only for a count');
+      await page.selectOption('#lk-metric', 'count');
+      await page.selectOption('#lk-row', String(doorRow));
+      await page.check('#lk-nested');
+      assert.strictEqual(await v('count'), '30 nr', 'with nested: the preview counts the hinges too');
+      assert.strictEqual((await page.textContent('#tv-blocks')).trim(), 'Blocks: DOOR 10 · HINGE 20 nested');
+      await page.click('#lk-save');
+      await page.waitForSelector(D + ' #lk-confirm-mixed-blocks');
+      assert.ok((await page.textContent(D + ' #lk-msg')).includes('more than one block'), 'mixed blocks in words: ' + await page.textContent(D + ' #lk-msg'));
+      assert.strictEqual((await page.textContent(D + ' #lk-blocks')).trim(), 'DOOR 10 · HINGE 20');
+      await page.uncheck('#lk-nested');
+      assert.strictEqual(await page.$(D + ' #lk-confirm-mixed-blocks'), null, 'changing nested drops the confirmation');
+      assert.strictEqual(await v('count'), '10 nr');
+      await page.check('#lk-nested');
+      await page.click('#lk-save');
+      await page.waitForSelector(D + ' #lk-confirm-mixed-blocks');
+      await page.check('#lk-confirm-mixed-blocks');
+      await page.click('#lk-save');
+      await page.waitForSelector(`${D} #dw-measurements tr[data-row="${doorRow}"] .m-sel`);
+      assert.ok((await page.textContent('#tv-saved')).includes('30.00 nr'), 'saved 30: ' + await page.textContent('#tv-saved'));
+      assert.strictEqual((await page.textContent(`${D} #dw-measurements tr[data-row="${doorRow}"] .m-blocks`)).trim(), 'DOOR 10 · HINGE 20 nested', 'stored breakdown listed');
+      assert.ok((await page.textContent(`${D} #dw-measurements tr[data-row="${doorRow}"]`)).includes('several blocks'), 'mixed flag listed');
+      assert.strictEqual(await v('count'), '—', 'nested box gone with the form; selection cleared');
+      for (let k = 0; k < 2; k++) { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'mixed refusal logged'); errors.splice(i, 1); }
+      // item 6: two lines with one handle: the selection sends it once and the server counts both (as the preview)
+      await band([99000, -500], [102000, 500]);
+      assert.strictEqual(await nSel(), 2);
+      assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.selectedHandles()), ['DUP'], 'repeated handle sent once');
+      assert.strictEqual(await v('open_length'), '2.00 m');
+      await page.click('#tv-link');
+      await page.waitForSelector(D + ' #lk-form #lk-metric');
+      await page.selectOption('#lk-metric', 'open_length');
+      await page.selectOption('#lk-row', String(dupRow));
+      await page.click('#lk-save');
+      await page.waitForSelector(`${D} #dw-measurements tr[data-row="${dupRow}"] .m-sel`);
+      assert.ok((await page.textContent('#tv-saved')).includes('2.00 m'), 'saved 2 m: ' + await page.textContent('#tv-saved'));
+      // item 5: Show finds all of a selection's entities, or says how many of them it found
+      await page.click(`${D} #dw-measurements tr[data-row="${dupRow}"] .m-show`);
+      await page.waitForFunction(() => /entities: 2\b/.test((document.querySelector('#tv-highlight') || {}).textContent || ''));
+      const mid = Number(await page.getAttribute(`${D} #dw-measurements tr[data-row="${doorRow}"]`, 'data-measurement'));
+      db.prepare("INSERT INTO measurement_handles(measurement_id, handle, geom_key) VALUES(?, 'GONE', NULL)").run(mid);
+      db.prepare('UPDATE measurements SET handles_count=handles_count+1 WHERE id=?').run(mid);
+      await page.reload();
+      await page.waitForSelector(`${D} #dw-measurements tr[data-row="${doorRow}"] .m-show`);
+      await page.click(`${D} #dw-measurements tr[data-row="${doorRow}"] .m-show`);
+      await page.waitForFunction(() => ((document.querySelector('#tv-highlight') || {}).textContent || '').includes('found'));
+      assert.ok((await page.textContent('#tv-highlight')).includes('30 of 31 entities found'), 'partial Show: ' + await page.textContent('#tv-highlight'));
+      await page.click('#tv-close');
+      // leave the tender as the checks below expect it (the site plan is the drawing shown)
+      for (const r of [doorRow, dupRow]) await ok(call('DELETE', 'measurements/' + db.prepare('SELECT id FROM measurements WHERE row_id=?').get(r).id, null, admin), 'tidy');
+      db.prepare('DELETE FROM drawings WHERE id=?').run(did);
+      await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    }
+
     // a submitted tender: read-only (no upload, link, delete or units controls), numbers still shown
     await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');

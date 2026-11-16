@@ -188,6 +188,33 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   for (const bad of [0, -1, NaN, Infinity, '1', null, undefined]) assert.throws(() => TV.previewTotal(R, all, 'area', bad), /unit factor/);
 }
 
+// ---- final review item 1: nested inserts (kind 5) are counted only with the nested toggle; preview = saved either way ----
+{
+  const { selectionTotals } = require('./lib/dxf/select.js');
+  const doors = [];
+  for (let i = 0; i < 10; i++) doors.push(...insert('D' + i, 'DOOR', 'DR', i * 10, 0));
+  const d = parseDxf(dxf([...sec('BLOCKS', [...block('HINGE', line('HL', '0', 0.5, 0, 0.6, 0)), ...block('DOOR', [...line('DL', '0', 0, 0, 1, 0), ...insert('H1', 'HINGE', '0', 0, 0), ...insert('H2', 'HINGE', '0', 0, 2)]),
+    ...block('WINDOW', line('WL', '0', 0, 0, 2, 0))]), ...ents([...doors, ...insert('W1', 'WINDOW', 'WN', 0, 50)])]));
+  const flat = flatten(d, { withSegs: true }), buf = buildRender(d, flat), R = TV.decodeRender(buf.buffer, buf.byteOffset);
+  assert.strictEqual(ids(R.kind).filter(k => k === 5).length, 20, 'nested markers are kind 5');
+  const G = TV.buildGrid(R), on = allOn(R);
+  // a window around the doors takes the doors, their contents and the nested markers (kind 5 is hit and boxed like kind 2)
+  const win = ids(TV.boxSelect(G, R, [-1, -1, 100, 3], 'window', on));
+  assert.strictEqual(win.filter(i => R.kind[i] === 5).length, 20); assert.strictEqual(win.filter(i => R.kind[i] === 2).length, 10);
+  const h5 = R.handles.indexOf('D3/H2');
+  assert.strictEqual(R.kind[h5], 5); assert.strictEqual(TV.hitTest(G, R, 30, 2, 0.01, on), h5, 'a nested marker is hit');
+  const doorsOnly = win, all = Array.from({ length: R.n }, (_, i) => i);
+  for (const [sel, nested, want] of [[doorsOnly, false, 10], [doorsOnly, true, 30], [all, false, 11], [all, true, 31]]) {
+    const p = TV.previewTotal(R, sel, 'count', 1, { nested }), s = selectionTotals(flat, sel.map(i => R.handles[i]), 'count', { nested });
+    assert.strictEqual(p.value, want, 'preview count nested=' + nested); assert.strictEqual(p.value, s.base, 'preview = saved'); assert.strictEqual(p.used, s.used);
+  }
+  assert.strictEqual(TV.previewTotal(R, doorsOnly, 'count', 1).value, 10, 'default: top level only');
+  // per-block breakdown (by name), top and nested apart, in name order
+  assert.deepStrictEqual(TV.previewBlocks(R, doorsOnly), [{ block: 'DOOR', top: 10, nested: 0 }, { block: 'HINGE', top: 0, nested: 20 }]);
+  assert.deepStrictEqual(TV.previewBlocks(R, all).map(b => b.block), ['DOOR', 'HINGE', 'WINDOW']);
+  assert.deepStrictEqual(TV.previewBlocks(R, []), []);
+}
+
 // ---- hit ties: two exact copies → the topmost (drawn last, highest index) ----
 {
   const R = load(ents([...line('C1', '0', 0, 0, 10, 0), ...line('C2', '0', 0, 0, 10, 0), ...line('X', '0', 0, 5, 10, 5)]));

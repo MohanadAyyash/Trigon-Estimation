@@ -42,9 +42,13 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // the layer metric or block count the qty was computed from (before width/depth/factor), for the formula shown with it;
   // NULL on measurements saved before this column (the UI then derives it from qty and the factors)
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'base')) db.exec('ALTER TABLE measurements ADD COLUMN base REAL');
-  // dxf_selection: JSON { metric, by_layer: { layer: entities used }, blocks?: [{ layer, block, count }] } for display and the
-  // overlap check of later layer/block measurements; NULL for the other tools
+  // dxf_selection: JSON { metric, by_layer: { layer: entities used }, skipped, nested?, blocks?: [{ layer, block, top, nested, count }] }
+  // for display and the overlap check of later layer/block measurements (a count: top / nested = the selected inserts at the
+  // top level / inside blocks, count = what the qty took; summaries saved before this have { layer, block, count }); NULL
+  // for the other tools. measurements.nested = 1: a selection count that included nested inserts.
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'selection_summary')) db.exec('ALTER TABLE measurements ADD COLUMN selection_summary TEXT');
+  // 1 = a selection count over more than one block name, saved with confirm_mixed_blocks
+  if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'mixed')) db.exec('ALTER TABLE measurements ADD COLUMN mixed INTEGER NOT NULL DEFAULT 0');
   // dxf_selection: the handles of the entities that made its qty (written, copied and deleted with the measurement)
   db.exec('CREATE TABLE IF NOT EXISTS measurement_handles(measurement_id INTEGER NOT NULL, handle TEXT NOT NULL, PRIMARY KEY(measurement_id, handle))');
   // the entity's geomKey: an exact copy measured by another selection on the same row needs confirm_duplicate
@@ -102,8 +106,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
-    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,base,selection_summary,created,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) SELECT ?, handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
     let n = 0;
     for (const m of db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(oldTid)) {
@@ -111,7 +115,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (!dmap.has(m.drawing_id)) bad(`measurement ${m.id}: its drawing is not in this tender`, 409);
       if (m.row_id !== null && !rowIdMap.has(m.row_id)) bad(`measurement ${m.id}: its row is not in this tender`, 409);
       const nid = Number(insM.run(dmap.get(m.drawing_id), newTid, m.row_id === null ? null : rowIdMap.get(m.row_id), m.tool, m.layer, m.block, m.metric, m.nested, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.base, m.selection_summary, m.created, m.created_by).lastInsertRowid);
+        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.mixed, m.base, m.selection_summary, m.created, m.created_by).lastInsertRowid);
       if (m.tool === 'dxf_selection') insH.run(nid, m.id);
       n++;
     }
@@ -213,7 +217,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     m => m.ok === false && /^(the stored drawing file is missing|could not read the stored)/.test(String(m.error)) ? { ...m, transient: true } : m,
     { timeout: 'parse timed out', bad: 'bad parser reply', oom: TOO_LARGE, stopped: 'the parser stopped unexpectedly' });
   // a selection total: never changes a drawing's status (any failure is reported to the caller only)
-  const runSelect = (sha, handles, metric) => spawnWorker(SELECT_WORKER, { file: cacheFile(sha), handles, metric }, m => m,
+  const runSelect = (sha, handles, metric, nested) => spawnWorker(SELECT_WORKER, { file: cacheFile(sha), handles, metric, nested: !!nested }, m => m,
     { timeout: 'the selection total timed out', bad: 'bad reply from the selection total', oom: 'the selection is too large to total', stopped: 'the selection total stopped unexpectedly' });
   async function writeGz(bytes, dest) {
     const tmp = tmpName('.json.gz');
@@ -401,7 +405,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   const SELECTION_METRICS = ['open_length', 'closed_perimeter', 'area', 'count'];
   // metrics that can count the same geometry twice on one row: lengths with each other, areas, counts
   const FAMILY = { open_length: ['open_length', 'closed_perimeter'], closed_perimeter: ['open_length', 'closed_perimeter'], area: ['area'], count: ['count'] };
-  const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'handles', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap', 'confirm_incomplete', 'confirm_duplicate'];
+  const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'handles', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap', 'confirm_incomplete', 'confirm_duplicate', 'confirm_mixed_blocks'];
   const finNum = v => typeof v === 'number' && Number.isFinite(v);
   const optBool = (b, k) => { if (b[k] !== undefined && typeof b[k] !== 'boolean') bad(k + ' must be true or false'); return b[k] === true; };
   const optText = (b, k, max) => {
@@ -423,13 +427,14 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const m = { row_id: rowIdOf(b.row_id), tool: b.tool, metric: b.metric };
     if (!['dxf_layer', 'dxf_blocks', 'dxf_selection'].includes(m.tool)) bad('tool must be dxf_layer, dxf_blocks or dxf_selection');
     if (m.tool === 'dxf_selection') {
-      if (b.layer !== undefined || b.block !== undefined || b.nested !== undefined) bad('layer, block and nested do not apply to a selection');
+      if (b.layer !== undefined || b.block !== undefined) bad('layer and block do not apply to a selection');
       if (!SELECTION_METRICS.includes(m.metric)) bad('metric must be one of ' + SELECTION_METRICS.join(', '));
+      if (b.nested !== undefined && m.metric !== 'count') bad('nested applies to a count only');
       const h = b.handles;
       if (!Array.isArray(h) || h.length < 1 || h.length > MAX_HANDLES) bad(`handles must be a list of 1 to ${MAX_HANDLES} entity handles`);
       for (const x of h) if (typeof x !== 'string' || !x || x.length > 1000) bad('handles must be entity handles (text)');
       if (new Set(h).size !== h.length) bad('duplicate handle in selection');
-      m.handles = h; m.layer = null; m.block = null; m.nested = false;
+      m.handles = h; m.layer = null; m.block = null; m.nested = optBool(b, 'nested');   // count: include inserts nested in blocks
     } else {
       if (b.handles !== undefined) bad('handles belong to dxf_selection');
       if (typeof b.layer !== 'string' || !b.layer || b.layer.length > 255) bad('layer is required');
@@ -453,12 +458,12 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     m.qty_unit = m.metric === 'count' ? 'nr' : ['m', 'm2', 'm3'][(m.metric === 'area' ? 1 : 0) + (m.width !== null) + (m.depth !== null)];
     m.label = optText(b, 'label', 200); m.color = optText(b, 'color', 32);
     m.confirm_uom = optBool(b, 'confirm_uom'); m.confirm_overlap = optBool(b, 'confirm_overlap'); m.confirm_incomplete = optBool(b, 'confirm_incomplete');
-    m.confirm_duplicate = optBool(b, 'confirm_duplicate');
+    m.confirm_duplicate = optBool(b, 'confirm_duplicate'); m.confirm_mixed_blocks = optBool(b, 'confirm_mixed_blocks');
     return m;
   }
   // a selection's audit summary: counts only, never its handles
   const summaryOf = m => m.tool === 'dxf_selection'
-    ? { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, metric: m.metric, used: m.handles_count, qty: m.qty, qty_unit: m.qty_unit }
+    ? { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, metric: m.metric, ...(m.metric === 'count' ? { nested: !!m.nested } : {}), used: m.handles_count, qty: m.qty, qty_unit: m.qty_unit }
     : { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, layer: m.layer, ...(m.tool === 'dxf_blocks' ? { block: m.block, nested: !!m.nested } : {}), metric: m.metric, qty: m.qty, qty_unit: m.qty_unit };
   const parseSummary = s => { try { return s ? JSON.parse(s) : null; } catch (e) { return null; } };
   // how many measurements already on the row count some of the same geometry (same file). Runs inside the tx.
@@ -483,7 +488,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
         const s = parseSummary(o.selection_summary);
         if (!s) { n++; continue; }   // unreadable summary: never assume no overlap
         if (m.tool === 'dxf_layer' && Object.hasOwn(s.by_layer || {}, m.layer)) n++;
-        if (m.tool === 'dxf_blocks' && (s.blocks || []).some(x => x.layer === m.layer && x.block === m.block)) n++;
+        if (m.tool === 'dxf_blocks' && (s.blocks || []).some(x => x.layer === m.layer && x.block === m.block && x.count > 0)) n++;
       } else if (o.tool === m.tool && o.metric === m.metric && o.layer === m.layer && o.block === m.block) n++;
     }
     return n;
@@ -505,7 +510,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const s = parseSummary(cur.selection_summary);
     const hs = db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=?').all(cur.id);
     return { handles: new Set(hs.map(x => x.handle)), keys: new Set(hs.map(x => x.geom_key).filter(k => k !== null)), unreadable: !s,
-      layers: new Set(Object.keys((s && s.by_layer) || {})), pairs: new Set(((s && s.blocks) || []).map(x => x.layer + '\0' + x.block)) };
+      layers: new Set(Object.keys((s && s.by_layer) || {})), pairs: new Set(((s && s.blocks) || []).filter(x => x.count > 0).map(x => x.layer + '\0' + x.block)) };
   };
   // the row checks shared by create and relink. Runs inside the tx.
   // Units: a known row unit must equal qty_unit (no override: m is never added into m2). Only a row whose unit text
@@ -586,9 +591,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   }
 
   // ---- selections: totals from the full parse cache, in a worker through the parse queue (never on this thread) ----
-  async function totalSelection(sha, handles, metric) {
+  async function totalSelection(sha, handles, metric, nested) {
     for (let attempt = 0; ; attempt++) {
-      const r = await enqueueJob(() => runSelect(sha, handles, metric));
+      const r = await enqueueJob(() => runSelect(sha, handles, metric, nested));
       if (r.ok) return r;
       // the cache is missing, unreadable or of another parser version: parse the stored .dxf again, once
       if (r.stale && attempt === 0) {
@@ -601,14 +606,19 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   }
   // qty = base × (width ?? 1) × (depth ?? 1) × factor with base = Σ in drawing units × f (lengths), × f² (areas), counts as they are
   async function createSelection(res, d, t, me, m) {
-    const sel = await totalSelection(d.sha256, m.handles, m.metric);
+    const sel = await totalSelection(d.sha256, m.handles, m.metric, m.nested);
     if (sel.unknown) bad('selection contains entities not in this drawing');
     if (!sel.used) bad('nothing in the selection can be measured as ' + m.metric);
     const f = UNIT_TO_M[d.units];
     const base = m.metric === 'count' ? sel.base : m.metric === 'area' ? sel.base * f * f : sel.base * f;
     m.handles_count = sel.used; m.drawing_id = d.id;
-    m.sel = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(sel.blocks.map(x => x.layer + '\0' + x.block)) };
-    const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, skipped: sel.skipped, ...(m.metric === 'count' ? { blocks: sel.blocks } : {}) });
+    const counted = sel.blocks.filter(x => x.count > 0);
+    m.sel = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(counted.map(x => x.layer + '\0' + x.block)) };
+    // spec 6.4: a count is by block name; a count over several names (DOOR + WINDOW, or DOOR + its nested HINGE) is confirmed
+    const byName = new Map();
+    for (const x of counted) byName.set(x.block, (byName.get(x.block) || 0) + x.count);
+    const mixed = byName.size > 1 ? Object.fromEntries([...byName].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) : null;
+    const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, skipped: sel.skipped, ...(m.metric === 'count' ? { nested: m.nested, blocks: sel.blocks } : {}) });
     const out = tx(() => {
       mustDraft(tenderRow(t.id));
       // the totals must still describe this drawing (units could change before the first measurement)
@@ -622,13 +632,14 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       const incomplete = sel.dropped > 0 || sel.area_null > 0 || sel.approx > 0;
       if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', area_excluded: sel.area_null, approx: sel.approx, dropped: sel.dropped, ...counts });
       if (duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', ...counts });
+      if (mixed && !m.confirm_mixed_blocks) conflictBody({ error: 'selection contains several blocks', blocks: mixed });
       if (!finNum(base) || !(base > 0)) bad('nothing in the selection can be measured as ' + m.metric);
       m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
       if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap, counts, overlapping);
-      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,base,selection_summary,created,created_by)
-        VALUES(?,?,?,?,NULL,NULL,?,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.metric, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, sel.used, ch.uomConfirmed, incomplete ? 1 : 0, duplicates ? 1 : 0, base, summary, new Date().toISOString(), me.username).lastInsertRowid);
+      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,created,created_by)
+        VALUES(?,?,?,?,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.metric, m.nested ? 1 : 0, m.width, m.depth, m.factor, m.label, m.color,
+        m.qty, m.qty_unit, sel.used, ch.uomConfirmed, incomplete ? 1 : 0, duplicates ? 1 : 0, mixed ? 1 : 0, base, summary, new Date().toISOString(), me.username).lastInsertRowid);
       const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) VALUES(?,?,?)');
       for (let i = 0; i < sel.used_handles.length; i++) insH.run(id, sel.used_handles[i], sel.used_keys[i]);
       const sum = summaryOf(m), short = { drawing_id: d.id, row_id: m.row_id, tool: m.tool, metric: m.metric };
@@ -637,7 +648,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', id, { ...sum, overlaps: ch.overlaps });
       if (duplicates) audit(me, 'measure_duplicate_confirmed', 'measurements', id, { ...short, duplicates });
       if (incomplete) audit(me, 'measure_incomplete_confirmed', 'measurements', id, { ...short, dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx });
-      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete, duplicate: !!duplicates, handles_count: sel.used, skipped: sel.skipped };
+      if (mixed) audit(me, 'measure_mixed_blocks_confirmed', 'measurements', id, { ...short, blocks: mixed });
+      return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete, duplicate: !!duplicates, handles_count: sel.used, skipped: sel.skipped,
+        ...(m.metric === 'count' ? { nested: m.nested, mixed: !!mixed, blocks: sel.blocks } : {}) };
     });
     return reply(res, 200, out);
   }

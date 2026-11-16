@@ -12,7 +12,7 @@
 'use strict';
 (function () {
 const BG = '#1e1e1e', LIGHT = '#e0e0e0', SEL = '#ffa726', HI = '#26c6da', HOVER = 'rgba(255,255,255,0.45)', SNAP = '#00e676';
-const KIND_CLOSED = 1, KIND_INSERT = 2, KIND_TEXT = 3;
+const KIND_CLOSED = 1, KIND_INSERT = 2, KIND_TEXT = 3, KIND_NESTED = 5;
 const CLICK_PX = 5, SNAP_PX = 10, DRAG_PX = 3;
 
 // relative luminance (WCAG) of #rrggbb
@@ -43,7 +43,7 @@ function create(canvas, R, opts) {
   let baseDirty = true, raf = 0, dead = false;
   const base = document.createElement('canvas'), ctx = canvas.getContext('2d'), bctx = base.getContext('2d');
 
-  const isPoint = i => R.kind[i] === KIND_INSERT || R.kind[i] === KIND_TEXT || R.count[i] === 1;
+  const isPoint = i => R.kind[i] === KIND_INSERT || R.kind[i] === KIND_NESTED || R.kind[i] === KIND_TEXT || R.count[i] === 1;
   const pos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
   // a drag released outside the canvas: the band stops at its edge (nothing off screen is selected)
   const clampPos = e => { const [x, y] = pos(e); return [Math.min(W, Math.max(0, x)), Math.min(H, Math.max(0, y))]; };
@@ -166,7 +166,11 @@ function create(canvas, R, opts) {
     changed();
   }
   const indices = flags => { const out = []; for (let i = 0; i < n; i++) if (flags[i]) out.push(i); return Uint32Array.from(out); };
-  const byHandle = () => { if (!handleIdx) { handleIdx = new Map(); R.handles.forEach((hd, i) => handleIdx.set(hd, i)); } return handleIdx; };
+  // handle -> every index that has it (a malformed file can repeat a handle; the server selects all of them too)
+  const byHandle = () => {
+    if (!handleIdx) { handleIdx = new Map(); R.handles.forEach((hd, i) => { const l = handleIdx.get(hd); if (l) l.push(i); else handleIdx.set(hd, [i]); }); }
+    return handleIdx;
+  };
 
   // ---- input ----
   function onWheel(e) {
@@ -258,18 +262,18 @@ function create(canvas, R, opts) {
       moved = true; changed();
     },
     selection: () => indices(sel),
-    selectedHandles: () => Array.from(indices(sel), i => R.handles[i]),
+    // each handle once: entities that share a handle (a malformed file) are one handle to the server, which takes them all
+    selectedHandles: () => [...new Set(Array.from(indices(sel), i => R.handles[i]))],
     clear() { sel.fill(0); hi.fill(0); nSel = nHi = 0; changed(); },
     // a saved selection's entities, read only (another colour, not part of the selection); the view fits them and their
-    // hidden layers are turned on -> { n, layersOn: indices of the layers turned on }
+    // hidden layers are turned on -> { n: entities found, layersOn: indices of the layers turned on }
     highlight(handles) {
       hi.fill(0); nHi = 0;
       const m = byHandle(), bb = G.bb;
       let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
       const layersOn = [];
-      for (const hd of handles) {
-        const i = m.get(hd);
-        if (i === undefined || hi[i]) continue;
+      for (const hd of handles) for (const i of m.get(hd) || []) {
+        if (hi[i]) continue;
         hi[i] = 1; nHi++;
         if (!layerOn[R.layer[i]]) { layerOn[R.layer[i]] = 1; layersOn.push(R.layer[i]); }
         if (bb[4 * i] === bb[4 * i]) { a = Math.min(a, bb[4 * i]); b = Math.min(b, bb[4 * i + 1]); c = Math.max(c, bb[4 * i + 2]); d = Math.max(d, bb[4 * i + 3]); }

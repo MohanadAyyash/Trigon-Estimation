@@ -634,7 +634,13 @@
   // ---- drawing viewer (public/viewer/*.js): the drawing on a canvas, a selection and its preview ----
   // Display only: the preview is approximate and labelled so; a linked selection's qty comes from the server.
   const UNIT_TO_M = { mm: 0.001, cm: 0.01, m: 1, km: 1000, ft: 0.3048, in: 0.0254 };   // as lib/units.js
-  const kindName = k => ({ 0: t('tv_k_open'), 1: t('tv_k_closed'), 2: t('tv_k_insert'), 3: t('tv_k_text'), 4: t('tv_k_dropped') })[k] || String(k);
+  const kindName = k => ({ 0: t('tv_k_open'), 1: t('tv_k_closed'), 2: t('tv_k_insert'), 3: t('tv_k_text'), 4: t('tv_k_dropped'), 5: t('tv_k_nested') })[k] || String(k);
+  // a count's per-block breakdown, "DOOR 10 · HINGE 20 nested" (spec 6.4: top-level inserts by name, nested ones apart).
+  // list: [{ block, top, nested }]; nestedOn false: the nested numbers are marked as not counted
+  const blockBreakdown = (list, nestedOn) => list.flatMap(b => [
+    ...(b.top || !b.nested ? [[h('span', { dir: 'auto' }, b.block), ' ' + fmtQ(b.top)]] : []),
+    ...(b.nested ? [[h('span', { dir: 'auto' }, b.block), ' ' + t('tv_blk_nested', { n: fmtQ(b.nested) }) + (nestedOn ? '' : ' (' + t('tv_blk_not_counted') + ')')]] : []),
+  ]).map((x, k) => [k ? ' · ' : '', ...x]);
   let activeViewer = null;          // { drawingId, highlight(handles, m), close() }
   let viewerOpeners = new Map();    // drawing id -> open(), for "Show" in the measurement list
   function closeViewer() { const v = activeViewer; activeViewer = null; if (v) v.close(); }
@@ -688,10 +694,12 @@
       const layersBox = h('div', { class: 'tv-layer-list' });
       const cursor = h('span', { id: 'tv-cursor' }), selected = h('span', { id: 'tv-selected', 'data-n': '0' }), hover = h('span', { id: 'tv-hover' });
       const highlightTxt = h('span', { id: 'tv-highlight' }), notes = h('span', { id: 'tv-sel-notes' }), saved = h('div', { id: 'tv-saved' });
+      const selBlocks = h('span', { id: 'tv-sel-blocks' }), previewBlocks = h('span', { id: 'tv-blocks', class: 'small' });
+      let nestedOn = false;   // the link form's "include nested" box: the count preview then takes nested inserts too
       const METRICS = [['open_length', 'm'], ['closed_perimeter', 'm'], ['area', 'm2'], ['count', 'nr']];
       const vals = {};
       const preview = h('div', { id: 'tv-preview' }, h('strong', null, t('tv_preview') + ':'), METRICS.map(([mt]) =>
-        h('span', { class: 'tv-metric', 'data-metric': mt }, metricLabel(mt) + ' ', vals[mt] = h('span', { class: 'v num' }, '—'))));
+        h('span', { class: 'tv-metric', 'data-metric': mt }, metricLabel(mt) + ' ', vals[mt] = h('span', { class: 'v num' }, '—'))), previewBlocks);
       const host = h('div', { id: 'tv-link-host' }), selListeners = new Set();
       const modeBtns = {};
       const modeBtn = (m, label) => modeBtns[m] = h('button', { id: 'tv-mode-' + m, class: 'small secondary' + (m === 'select' ? ' active' : ''), 'aria-pressed': m === 'select' ? 'true' : 'false', onclick: () => {
@@ -702,15 +710,17 @@
       const linkBtn = canLink ? h('button', { id: 'tv-link', class: 'small', onclick: () => {
         selListeners.clear();
         const form = linkForm({ drawing_id: d.id, tool: 'dxf_selection', metric: 'open_length', handles: () => eng.selectedHandles(), count: () => Number(selected.getAttribute('data-n')),
-          onSelectionChange: fn => selListeners.add(fn),
+          onSelectionChange: fn => selListeners.add(fn), setNested: on => { nestedOn = on; showSel(); },
           // changed: the selection (or form) changed while the save was on its way: keep the new selection
           onSaved: async (res, changed) => {
-            selListeners.clear(); host.replaceChildren();
+            selListeners.clear(); host.replaceChildren(); nestedOn = false;
             if (!changed) { eng.clear(); highlightTxt.textContent = ''; }
             saved.replaceChildren(h('p', { class: 'small' }, h('span', { class: 'tag good' }, t('tv_saved', { qty: fmt2(res.qty), unit: res.qty_unit || '', n: res.handles_count })),
-              res.skipped > 0 ? h('span', { class: 'tag warn-tag' }, t('tv_skipped', { n: res.skipped })) : null));
+              res.skipped > 0 ? h('span', { class: 'tag warn-tag' }, t('tv_skipped', { n: res.skipped })) : null,
+              res.blocks && res.blocks.length ? [' ', h('span', { id: 'tv-saved-blocks' }, blockBreakdown(res.blocks, res.nested))] : null));
+            showSel();
             try { await refreshList(); } catch (e) { fail(e); }
-          } }, rows, () => { selListeners.clear(); host.replaceChildren(); });
+          } }, rows, () => { selListeners.clear(); host.replaceChildren(); nestedOn = false; showSel(); });
         host.replaceChildren(form);
       } }, t('tv_link')) : null;
       sec.replaceChildren(title(),
@@ -725,7 +735,7 @@
             h('button', { id: 'tv-all', class: 'small secondary', onclick: () => setAll(true) }, t('all')),
             h('button', { id: 'tv-none', class: 'small secondary', onclick: () => setAll(false) }, t('tv_none'))), layersBox),
           h('div', { class: 'tv-canvas-wrap' }, canvas)),
-        h('div', { id: 'tv-status', class: 'tv-status small' }, cursor, selected, notes, highlightTxt, hover),
+        h('div', { id: 'tv-status', class: 'tv-status small' }, cursor, selected, selBlocks, notes, highlightTxt, hover),
         preview, saved, host);
 
       const units = d.units || '';
@@ -739,9 +749,13 @@
         selected.setAttribute('data-n', String(idx.length));
         selected.textContent = t('tv_selected', { n: idx.length });
         for (const [mt, unit] of METRICS) {
-          const p = f && idx.length ? TV.previewTotal(R, idx, mt, f) : null;   // no number before the units are confirmed
+          const p = f && idx.length ? TV.previewTotal(R, idx, mt, f, { nested: nestedOn }) : null;   // no number before the units are confirmed
           vals[mt].textContent = p && p.used ? (mt === 'count' ? fmtQ(p.value) : fmt2(p.value)) + ' ' + unit : '—';
         }
+        // the count by block name (top level, nested apart), in the preview and the status bar
+        const bl = f && idx.length ? TV.previewBlocks(R, idx) : [];
+        previewBlocks.replaceChildren(...(bl.length ? [t('tv_blocks') + ': ', ...blockBreakdown(bl, nestedOn).flat()] : []));
+        selBlocks.replaceChildren(...(bl.length ? [' · ', ...blockBreakdown(bl, nestedOn).flat()] : []));
         // from the display file: shapes the server will leave out
         let dropped = 0, noArea = 0;
         for (const i of idx) { if (R.kind[i] === 4) dropped++; else if (R.kind[i] === 1 && R.area[i] !== R.area[i]) noArea++; }
@@ -763,7 +777,9 @@
         highlight: (handles, m) => {
           const r = eng.highlight(handles);
           for (const i of r.layersOn) boxes[i].checked = true;
-          highlightTxt.replaceChildren(h('span', null, t('tv_highlighted', { n: r.n, label: m.label || '#' + m.id }),
+          // fewer found than the measurement holds (the drawing no longer has some of them): say how many
+          const label = m.label || '#' + m.id, partial = fin(m.handles_count) && r.n < m.handles_count;
+          highlightTxt.replaceChildren(h('span', null, partial ? t('tv_highlighted_partial', { n: r.n, total: m.handles_count, label }) : t('tv_highlighted', { n: r.n, label }),
             r.layersOn.length ? [' · ' + t('tv_layers_turned_on') + ': ', r.layersOn.map((i, k) => [k ? ', ' : '', h('span', { dir: 'auto' }, R.layers[i].name)])] : null));
           sec.scrollIntoView({ block: 'nearest' });
         },
@@ -789,14 +805,17 @@
   function linkRefusal(e, msg, addConfirm, isSel) {
     const j = e.body || {};
     const selText = isSel && e.status === 409 ? ({ 'already measured on this row': t('tv_r_overlap'), 'layer quantity is incomplete': t('tv_r_incomplete'),
-      'possible duplicates on this layer': t('tv_r_duplicates'), 'unit mismatch': t('tv_r_uom') })[j.error] : null;
+      'possible duplicates on this layer': t('tv_r_duplicates'), 'unit mismatch': t('tv_r_uom'), 'selection contains several blocks': t('tv_r_mixed') })[j.error] : null;
     msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + (selText || e.message)));
-    if (selText) msg.append(h('p', { id: 'lk-counts', class: 'small muted' }, t('tv_server_counts', { dropped: j.dropped || 0, area_null: j.area_null || 0,
+    const mixed = e.status === 409 && j.error === 'selection contains several blocks' && j.blocks && typeof j.blocks === 'object';
+    if (mixed) msg.append(h('p', { id: 'lk-blocks', class: 'small muted' }, Object.entries(j.blocks).map(([b, n], k) => [k ? ' · ' : '', h('span', { dir: 'auto' }, b), ' ' + fmtQ(n)])));
+    else if (selText) msg.append(h('p', { id: 'lk-counts', class: 'small muted' }, t('tv_server_counts', { dropped: j.dropped || 0, area_null: j.area_null || 0,
       approx: j.approx || 0, duplicates: j.duplicates || 0, overlapping: j.overlapping || 0 })));
     let box = false;
     if (e.status === 409 && j.error === 'unit mismatch') box = addConfirm('confirm_uom', t('lk_confirm_uom', { row: j.row_unit || '', qty: j.qty_unit || '' }));
     else if (e.status === 409 && j.error === 'already measured on this row') box = addConfirm('confirm_overlap', isSel ? t('tv_confirm_overlap', { n: j.overlapping || 0 }) : t('lk_confirm_overlap'));
     else if (e.status === 409 && j.error === 'possible duplicates on this layer') box = addConfirm('confirm_duplicate', isSel ? t('tv_confirm_duplicate', { n: j.duplicates || 0 }) : t('lk_confirm_duplicate', { n: j.duplicates || 0 }));
+    else if (mixed) box = addConfirm('confirm_mixed_blocks', t('tv_confirm_mixed', { n: Object.keys(j.blocks).length }));
     else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0, c: j.dropped || 0 }));
     else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
     if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
@@ -811,7 +830,7 @@
   function confirmBoxes(prefix) {
     const boxes = {}, el = h('div');
     const add = (key, text) => {
-      if (!boxes[key]) { boxes[key] = h('input', { type: 'checkbox', id: prefix + key.replace('_', '-') }); el.append(h('label', { class: 'field check' }, h('span', null, text), boxes[key])); }
+      if (!boxes[key]) { boxes[key] = h('input', { type: 'checkbox', id: prefix + key.replace(/_/g, '-') }); el.append(h('label', { class: 'field check' }, h('span', null, text), boxes[key])); }
       return true;
     };
     const flags = () => Object.fromEntries(Object.entries(boxes).filter(([, cb]) => cb.checked).map(([k]) => [k, true]));
@@ -832,10 +851,12 @@
     const rowSel = sel('lk-row', '', rowOpts(rows));
     const w = isSel || isLen() ? inp('lk-width', '', { class: 'w-num', inputmode: 'decimal' }) : null, dp = !isSel && count ? null : inp('lk-depth', '', { class: 'w-num', inputmode: 'decimal' });
     const fac = inp('lk-factor', '', { class: 'w-num', inputmode: 'decimal', placeholder: '1' }), label = inp('lk-label', '', { maxlength: 200 });
-    const nested = count && target.has_nested ? h('input', { type: 'checkbox', id: 'lk-nested' }) : null;
+    // a block count: include the inserts nested in blocks (dxf_blocks when the block has nested ones; a selection's count)
+    const nested = isSel || (count && target.has_nested) ? h('input', { type: 'checkbox', id: 'lk-nested' }) : null;
+    const nestedF = nested ? field(t('lk_nested'), nested, 'check') : null;
     const wF = w ? field(t('width'), w) : null, dpF = dp ? field(t('depth'), dp) : null, dimsNote = h('p', { class: 'muted small' }, t('lk_dims_note'));
     const shown = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };   // .field sets display, so not [hidden]
-    const showDims = () => { shown(wF, isLen()); shown(dpF, metric !== 'count'); shown(dimsNote, isLen() || metric === 'area'); };
+    const showDims = () => { shown(wF, isLen()); shown(dpF, metric !== 'count'); shown(dimsNote, isLen() || metric === 'area'); shown(nestedF, metric === 'count'); };
     showDims();
     const msg = h('div', { id: 'lk-msg' }), cb = confirmBoxes('lk-');
     // gen: bumped by every change (row, metric, numbers, selection); a reply to an older request is not acted on
@@ -845,7 +866,12 @@
     for (const x of [w, dp, fac]) if (x) x.addEventListener('input', clear);
     const selWhat = isSel ? h('span', { id: 'lk-sel-n' }, t('tv_selection_n', { n: target.count() })) : null;
     if (isSel) {
-      metricSel.addEventListener('change', () => { metric = metricSel.value; showDims(); clear(); });
+      metricSel.addEventListener('change', () => {
+        metric = metricSel.value; showDims(); clear();
+        if (metric !== 'count' && nested.checked) { nested.checked = false; target.setNested(false); }   // nested belongs to a count
+      });
+      // a changed choice is another quantity: the confirmations go (clear), and the preview follows the box
+      nested.addEventListener('change', () => { clear(); target.setNested(nested.checked); });
       target.onSelectionChange(() => { clear(); selWhat.textContent = t('tv_selection_n', { n: target.count() }); });
     }
     const what = isSel ? selWhat : target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
@@ -854,6 +880,7 @@
       const b = { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, metric, ...cb.flags() };
       if (isSel) {
         b.handles = target.handles();
+        if (metric === 'count' && nested.checked) b.nested = true;
         if (!b.handles.length) { msg.replaceChildren(h('p', { class: 'err' }, t('tv_nothing_selected'))); return; }
       } else b.layer = target.layer;
       if (target.tool === 'dxf_blocks') { b.block = target.block; if (nested) b.nested = nested.checked; }
@@ -879,14 +906,26 @@
     } }, t('lk_save'));
     return h('div', { id: 'lk-form', class: 'lk-form' }, h('h3', null, t('lk_title')), h('p', null, t('lk_what') + ': ', what),
       h('div', { class: 'form-grid' }, metricSel ? field(t('m_metric'), metricSel) : null, field(t('lk_row'), rowSel, 'wide'), wF, dpF, field(t('lk_factor'), fac),
-        field(t('lk_label'), label), nested ? field(t('lk_nested'), nested, 'check') : null),
+        field(t('lk_label'), label), nestedF),
       dimsNote, msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'lk-cancel', class: 'secondary', onclick: close }, t('cancel'))));
   }
 
   // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink
   function measurementList(ms, rows, editable) {
+    // a selection count: its stored per-block breakdown (summaries saved before it have { block, count } only)
+    const selBlocks = m => {
+      const bl = m.metric === 'count' && m.selection_summary && Array.isArray(m.selection_summary.blocks) ? m.selection_summary.blocks : [];
+      if (!bl.length) return null;
+      const by = new Map();
+      for (const x of bl) {
+        const b = by.get(x.block) || { block: x.block, top: 0, nested: 0 };
+        if (fin(x.top)) { b.top += x.top; b.nested += fin(x.nested) ? x.nested : 0; } else b.top += fin(x.count) ? x.count : 0;
+        by.set(x.block, b);
+      }
+      return h('div', { class: 'small muted m-blocks' }, blockBreakdown([...by.values()], !!m.nested));
+    };
     const src = m => m.tool === 'dxf_selection' ? [h('span', { class: 'm-sel' }, t('m_selection', { n: m.handles_count || 0 })), ' ',
-      h('button', { class: 'small secondary m-show', onclick: () => showSelection(m) }, t('m_show'))]
+      h('button', { class: 'small secondary m-show', onclick: () => showSelection(m) }, t('m_show')), selBlocks(m)]
       : [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
     // spec 5.6: the formula with its inputs, "<metric> <base> <unit> × width w × depth d × factor f = qty unit" (width/depth
     // only when given, factor only when not 1). A measurement saved before `base` was stored derives it from qty when every
@@ -901,7 +940,8 @@
       return metricLabel(m.metric) + ' ' + (m.metric === 'count' ? fmtQ(base) : fmt2(base)) + ' ' + unit + (fin(m.width) ? ' × ' + t('f_width') + ' ' + fmtQ(m.width) : '')
         + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '') + (fin(f) && f !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(f) : '') + tail;
     };
-    const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null];
+    const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null,
+      m.mixed ? h('span', { class: 'tag' }, t('m_mixed')) : null];
     const del = m => editable ? h('button', { class: 'small danger m-delete', onclick: async ev => {
       if (!confirm(t('m_delete_confirm'))) return;
       ev.target.disabled = true;

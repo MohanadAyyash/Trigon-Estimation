@@ -1002,12 +1002,72 @@ server.listen(0, async () => {
         const sc = await ok(sel({ row_id: rN2, handles: ['M1', 'M2', 'K2'], metric: 'count' }), 'count');
         assert.strictEqual(sc.qty, 2); assert.strictEqual(sc.qty_unit, 'nr');
         assert.deepStrictEqual(JSON.parse(db.prepare('SELECT selection_summary s FROM measurements WHERE id=?').get(sc.id).s),
-          { metric: 'count', by_layer: { MH: 2 }, skipped: 1, blocks: [{ layer: 'MH', block: 'MH1', count: 2 }] });
+          { metric: 'count', by_layer: { MH: 2 }, skipped: 1, nested: false, blocks: [{ layer: 'MH', block: 'MH1', top: 2, nested: 0, count: 2 }] });
         assert.strictEqual(sc.skipped, 1, 'the KERB line is not a count');
         assert.deepStrictEqual(handlesOf(sc.id), ['M1', 'M2'], 'only the entities that contributed are stored');
         r = await lay({ row_id: rN2, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' });
         assert.strictEqual(r.s, 409, 'blocks onto a row whose selection has that block'); assert.strictEqual(r.j.error, 'already measured on this row');
         await ok(call('DELETE', `measurements/${mb.id}`, null, qs), 'tidy');
+
+        // final review item 1 (spec 6.4): a count is the top-level INSERTs by name; nested inserts only with nested: true,
+        // reported apart per block; more than one block name in the count needs confirm_mixed_blocks. Preview = saved.
+        // The probe: 10 DOOR inserts, each DOOR block holding 2 HINGE inserts; one WINDOW elsewhere.
+        {
+          const TV = require('./public/viewer/core.js');
+          const doors = [];
+          for (let i = 0; i < 10; i++) doors.push([0, 'INSERT'], [5, 'D' + i], [8, 'DR'], [2, 'DOOR'], [10, i * 1000], [20, 0]);
+          const FIXD = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...sec('BLOCKS', [
+            [0, 'BLOCK'], [2, 'HINGE'], [70, 0], [10, 0], [20, 0], ...line('HL', '0', 500, 0, 600, 0), [0, 'ENDBLK'],
+            [0, 'BLOCK'], [2, 'DOOR'], [70, 0], [10, 0], [20, 0], ...line('DL', '0', 0, 0, 900, 0),
+            [0, 'INSERT'], [5, 'H1'], [8, '0'], [2, 'HINGE'], [10, 0], [20, 0], [0, 'INSERT'], [5, 'H2'], [8, '0'], [2, 'HINGE'], [10, 0], [20, 2000], [0, 'ENDBLK'],
+            [0, 'BLOCK'], [2, 'WINDOW'], [70, 0], [10, 0], [20, 0], ...line('WL', '0', 0, 0, 1200, 0), [0, 'ENDBLK']]),
+          ...sec('ENTITIES', [...doors, [0, 'INSERT'], [5, 'W1'], [8, 'DR'], [2, 'WINDOW'], [10, 0], [20, 50000]])]);
+          const ud = await upload(TS, 'Doors plan', Buffer.from(FIXD), qs);
+          assert.strictEqual(ud.s, 202);
+          const DD = ud.j.id, dd = await waitDone(DD, qs);
+          assert.strictEqual(dd.status, 'ready', dd.error);
+          await ok(call('PUT', `drawings/${DD}/units`, { units: 'mm' }, qs), 'units doors');
+          const flatD = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.join(DDIR, dd.sha256 + '.json.gz')))).flat;
+          const allD = flatD.map(f => f.handle), doorHs = allD.filter(h => h !== 'W1' && !h.startsWith('W1/'));
+          // the preview the viewer shows for the same handles (display file, decoded as the browser does)
+          const rr = await fetch(base + `drawings/${DD}/render`, { headers: { cookie: qs } });
+          assert.strictEqual(rr.status, 200);
+          const RD = TV.decodeRender(await rr.arrayBuffer()), idxOf = new Map(RD.handles.map((h, i) => [h, i]));
+          const preview = (hs, nested) => TV.previewTotal(RD, hs.map(h => idxOf.get(h)), 'count', 0.001, { nested }).value;
+          const flagsOf = id => db.prepare('SELECT nested, mixed FROM measurements WHERE id=?').get(id);
+          const DOOR = { layer: 'DR', block: 'DOOR', top: 10, nested: 0, count: 10 };
+
+          // default: the 10 DOORs; the 20 nested HINGEs are reported, not counted
+          const rDoor = await rowS('Doors', 'nr');
+          const d1 = await ok(sel({ row_id: rDoor, handles: doorHs, metric: 'count' }, qs, DD), 'doors');
+          assert.strictEqual(d1.qty, 10, 'top-level DOOR inserts only'); assert.strictEqual(preview(doorHs, false), d1.qty, 'preview = saved (default)');
+          assert.deepStrictEqual(d1.blocks, [DOOR, { layer: 'DR', block: 'HINGE', top: 0, nested: 20, count: 0 }]); assert.strictEqual(d1.nested, false);
+          assert.strictEqual(d1.skipped, 50, 'door lines, hinge lines and nested hinges');
+          assert.deepStrictEqual({ ...flagsOf(d1.id) }, { nested: 0, mixed: 0 });
+          assert.deepStrictEqual(handlesOf(d1.id), doorHs.filter(h => /^D\d$/.test(h)));
+          assert.deepStrictEqual(JSON.parse(db.prepare('SELECT selection_summary s FROM measurements WHERE id=?').get(d1.id).s).blocks, d1.blocks, 'breakdown stored');
+          // nested: true → DOOR and HINGE are two block names: 409 with the per-name counts, then saved with the confirmation
+          const rDoorN = await rowS('Doors and hinges', 'nr');
+          r = await sel({ row_id: rDoorN, handles: doorHs, metric: 'count', nested: true }, qs, DD);
+          assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'selection contains several blocks', blocks: { DOOR: 10, HINGE: 20 } });
+          const mx0 = audits('measure_mixed_blocks_confirmed').length;
+          const d2 = await ok(sel({ row_id: rDoorN, handles: doorHs, metric: 'count', nested: true, confirm_mixed_blocks: true }, qs, DD), 'doors + hinges');
+          assert.strictEqual(d2.qty, 30, 'with nested: 10 DOOR + 20 HINGE'); assert.strictEqual(preview(doorHs, true), d2.qty, 'preview = saved (nested)');
+          assert.deepStrictEqual(d2.blocks, [DOOR, { layer: 'DR', block: 'HINGE', top: 0, nested: 20, count: 20 }]); assert.strictEqual(d2.nested, true);
+          assert.deepStrictEqual({ ...flagsOf(d2.id) }, { nested: 1, mixed: 1 });
+          assert.deepStrictEqual(audits('measure_mixed_blocks_confirmed').slice(mx0), [{ drawing_id: DD, row_id: rDoorN, tool: 'dxf_selection', metric: 'count', blocks: { DOOR: 10, HINGE: 20 } }], 'audit: counts only');
+          assert.strictEqual(audits('measure').at(-1).nested, true);
+          // DOOR + WINDOW at the top level → 409 mixed; preview of the same handles = 11
+          const rDW = await rowS('Doors and windows', 'nr');
+          r = await sel({ row_id: rDW, handles: allD, metric: 'count' }, qs, DD);
+          assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j, { error: 'selection contains several blocks', blocks: { DOOR: 10, WINDOW: 1 } });
+          const d3 = await ok(sel({ row_id: rDW, handles: allD, metric: 'count', confirm_mixed_blocks: true }, qs, DD), 'doors + window');
+          assert.strictEqual(d3.qty, 11); assert.strictEqual(preview(allD, false), d3.qty, 'preview = saved (mixed)');
+          // nested belongs to a count; one block name needs no confirmation
+          r = await sel({ row_id: rDoor, handles: ['D0/DL'], metric: 'open_length', nested: true }, qs, DD);
+          assert.strictEqual(r.s, 400); assert.match(r.j.error, /nested/);
+          for (const id of [d1.id, d2.id, d3.id]) await ok(call('DELETE', `measurements/${id}`, null, qs), 'tidy');
+        }
 
         // incomplete: a bowtie (no area), a spline (approx), a dropped shape → 409 with counts, then saved with confirm, flag stored
         const rA = await rowS('Paving (selection)', 'm2'), rC = await rowS('Edge (selection)', 'm');

@@ -738,10 +738,10 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   assert.strictEqual(s.approx, 1); assert.strictEqual(s.used, 1); near(s.base, 5, 1e-6);
   // count over the INSERT handle → 1; an MINSERT counts rows × cols; lines are skipped; blocks per layer for the summary
   const c1 = st(['M1'], 'count');
-  assert.strictEqual(c1.base, 1); assert.strictEqual(c1.used, 1); assert.deepStrictEqual(c1.blocks, [{ layer: 'MH', block: 'MH1', count: 1 }]);
+  assert.strictEqual(c1.base, 1); assert.strictEqual(c1.used, 1); assert.deepStrictEqual(c1.blocks, [{ layer: 'MH', block: 'MH1', top: 1, nested: 0, count: 1 }]);
   const c2 = st(['M1', 'M2', 'M3', 'K1'], 'count');
   assert.strictEqual(c2.base, 1 + 6 + 1); assert.strictEqual(c2.skipped, 1); assert.deepStrictEqual(c2.by_layer, { MH: 2, MH2: 1 });
-  assert.deepStrictEqual(c2.blocks, [{ layer: 'MH', block: 'MH1', count: 7 }, { layer: 'MH2', block: 'MH1', count: 1 }]);
+  assert.deepStrictEqual(c2.blocks, [{ layer: 'MH', block: 'MH1', top: 7, nested: 0, count: 7 }, { layer: 'MH2', block: 'MH1', top: 1, nested: 0, count: 1 }]);
   // an insert is not a length
   assert.strictEqual(st(['M1'], 'open_length').used, 0);
   // an unknown handle → unknown 1
@@ -760,6 +760,36 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     const wd = parseDxf(dxf(ents(L))), wf = flatten(wd);
     const hs = wf.map(f => f.handle).reverse();
     assert.strictEqual(selectionTotals(wf, hs, 'open_length').base, layerTable(wf, wd.layers, 'm').layers.find(l => l.layer === 'W').open_length);
+  }
+  // final review item 1 (spec 6.4): a count is the top-level INSERTs by name; nested inserts only when asked, reported apart.
+  // The DOOR/HINGE probe: 10 DOOR inserts, each block holding 2 HINGE inserts; one WINDOW.
+  {
+    const { buildRender } = require('./lib/dxf/render.js');
+    const doors = [];
+    for (let i = 0; i < 10; i++) doors.push(...insert('D' + i, 'DOOR', 'DR', [[10, i * 10], [20, 0]]));
+    const dd = parseDxf(dxf([...sec('BLOCKS', [...block('HINGE', line('HL', '0', 0, 0, 0, 0.1)), ...block('DOOR', [...line('DL', '0', 0, 0, 1, 0), ...insert('H1', 'HINGE', '0'), ...insert('H2', 'HINGE', '0', [[10, 0], [20, 2]])]),
+      ...block('WINDOW', line('WL', '0', 0, 0, 2, 0))]), ...ents([...doors, ...insert('W1', 'WINDOW', 'DR', [[10, 0], [20, 50]])])]));
+    const df = flatten(dd, { withSegs: true }), all = df.map(e => e.handle);
+    assert.strictEqual(df.filter(e => e.kind === 'insert' && e.depth > 0).length, 20, '20 nested HINGE inserts in the flat list');
+    const doorHs = all.filter(h => /^D\d$/.test(h) || /^D\d\//.test(h));
+    const top = selectionTotals(df, doorHs, 'count');
+    assert.strictEqual(top.base, 10, 'default: top-level inserts only'); assert.strictEqual(top.used, 10);
+    assert.strictEqual(top.skipped, 10 + 20 + 20, 'the door and hinge lines and the nested hinges are not counted');
+    assert.deepStrictEqual(top.blocks, [{ layer: 'DR', block: 'DOOR', top: 10, nested: 0, count: 10 }, { layer: 'DR', block: 'HINGE', top: 0, nested: 20, count: 0 }]);
+    assert.ok(top.used_handles.every(h => /^D\d$/.test(h)), 'only the DOOR inserts are stored');
+    const nest = selectionTotals(df, doorHs, 'count', { nested: true });
+    assert.strictEqual(nest.base, 30, 'nested: 10 DOOR + 20 HINGE'); assert.strictEqual(nest.used, 30);
+    assert.deepStrictEqual(nest.blocks, [{ layer: 'DR', block: 'DOOR', top: 10, nested: 0, count: 10 }, { layer: 'DR', block: 'HINGE', top: 0, nested: 20, count: 20 }]);
+    const mixed = selectionTotals(df, all, 'count');
+    assert.strictEqual(mixed.base, 11);
+    assert.deepStrictEqual(mixed.blocks.filter(b => b.count > 0).map(b => b.block), ['DOOR', 'WINDOW'], 'two block names counted');
+    // the nested flag never changes a length or an area
+    assert.deepStrictEqual(selectionTotals(df, all, 'open_length', { nested: true }), selectionTotals(df, all, 'open_length'));
+    // display file: a nested insert marker is kind 5 (len = its count), a top-level one kind 2
+    const dec = buildRender(dd, df), hl = dec.readUInt32LE(0), n = JSON.parse(dec.subarray(4, 4 + hl).toString('utf8')).handles.length;
+    const kinds = Array.from(dec.subarray(Math.ceil((4 + hl) / 4) * 4 + 12 * n, Math.ceil((4 + hl) / 4) * 4 + 13 * n));
+    df.forEach((e, i) => assert.strictEqual(kinds[i], e.kind === 'insert' ? (e.depth > 0 ? 5 : 2) : kinds[i], e.handle));
+    assert.strictEqual(kinds.filter(k => k === 5).length, 20); assert.strictEqual(kinds.filter(k => k === 2).length, 11);
   }
 }
 
