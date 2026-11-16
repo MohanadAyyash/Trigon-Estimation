@@ -30,6 +30,7 @@ function layerColor(aci) {
 
 function create(canvas, R, opts) {
   const TV = window.TV, o = opts || {}, n = R.n;
+  window.__tvCreated = (window.__tvCreated || 0) + 1;   // test hook: engines created
   const G = TV.buildGrid(R);
   const layerOn = new Uint8Array(R.layers.length);
   R.layers.forEach((l, i) => { layerOn[i] = l.off || l.frozen ? 0 : 1; });
@@ -44,6 +45,8 @@ function create(canvas, R, opts) {
 
   const isPoint = i => R.kind[i] === KIND_INSERT || R.kind[i] === KIND_TEXT || R.count[i] === 1;
   const pos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  // a drag released outside the canvas: the band stops at its edge (nothing off screen is selected)
+  const clampPos = e => { const [x, y] = pos(e); return [Math.min(W, Math.max(0, x)), Math.min(H, Math.max(0, y))]; };
   const tol = px => px / V.scale;
 
   // one entity's paths into the current path, in CSS pixels; a NaN pair starts a new subpath
@@ -185,8 +188,10 @@ function create(canvas, R, opts) {
     window.addEventListener('mouseup', onUp);
   }
   function onDragMove(e) {
-    const [x, y] = pos(e);
+    let [x, y] = pos(e);
     if (drag.pan) { V = TV.pan(V, x - drag.x, y - drag.y); drag.x = x; drag.y = y; schedule(true); return; }
+    if (Math.abs(x - drag.x0) > DRAG_PX || Math.abs(y - drag.y0) > DRAG_PX) drag.moved = true;
+    [x, y] = clampPos(e);
     if (mode !== 'select' && (band || Math.abs(x - drag.x0) > DRAG_PX || Math.abs(y - drag.y0) > DRAG_PX)) { band = [drag.x0, drag.y0, x, y]; schedule(); }
   }
   function onUp(e) {
@@ -195,14 +200,15 @@ function create(canvas, R, opts) {
     const d = drag;
     drag = null;
     if (!d || d.pan) return;
-    const [x, y] = pos(e);
+    if (band) [band[2], band[3]] = clampPos(e);
     if (band) {
       const a = TV.toWorld(V, band[0], band[1]), b = TV.toWorld(V, band[2], band[3]);
       band = null;
       setSel(TV.boxSelect(G, R, [a[0], a[1], b[0], b[1]], mode, layerOn), d.shift ? 'add' : 'replace');
       return;
     }
-    const w = TV.toWorld(V, x, y), i = TV.hitTest(G, R, w[0], w[1], tol(CLICK_PX), layerOn);
+    if (d.moved) return;   // a drag in Select mode is not a click
+    const w = TV.toWorld(V, d.x0, d.y0), i = TV.hitTest(G, R, w[0], w[1], tol(CLICK_PX), layerOn);
     if (d.shift) { if (i >= 0) setSel([i], 'toggle'); } else setSel(i >= 0 ? [i] : [], 'replace');
   }
   function onMove(e) {
@@ -254,23 +260,26 @@ function create(canvas, R, opts) {
     selection: () => indices(sel),
     selectedHandles: () => Array.from(indices(sel), i => R.handles[i]),
     clear() { sel.fill(0); hi.fill(0); nSel = nHi = 0; changed(); },
-    // a saved selection's entities, read only (another colour, not part of the selection); the view fits them
+    // a saved selection's entities, read only (another colour, not part of the selection); the view fits them and their
+    // hidden layers are turned on -> { n, layersOn: indices of the layers turned on }
     highlight(handles) {
       hi.fill(0); nHi = 0;
       const m = byHandle(), bb = G.bb;
       let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
+      const layersOn = [];
       for (const hd of handles) {
         const i = m.get(hd);
         if (i === undefined || hi[i]) continue;
         hi[i] = 1; nHi++;
+        if (!layerOn[R.layer[i]]) { layerOn[R.layer[i]] = 1; layersOn.push(R.layer[i]); }
         if (bb[4 * i] === bb[4 * i]) { a = Math.min(a, bb[4 * i]); b = Math.min(b, bb[4 * i + 1]); c = Math.max(c, bb[4 * i + 2]); d = Math.max(d, bb[4 * i + 3]); }
       }
       if (a !== Infinity) {
         const pad = Math.max(c - a, d - b, 1 / fitScale * 50) * 0.5;
         V = TV.makeView([a + G.ox - pad, b + G.oy - pad, c + G.ox + pad, d + G.oy + pad], W || 1, H || 1, R.origin);
       }
-      schedule(true);
-      return nHi;
+      moved = true; schedule(true);
+      return { n: nHi, layersOn };
     },
     highlightedHandles: () => Array.from(indices(hi), i => R.handles[i]),
     destroy,

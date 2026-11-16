@@ -460,7 +460,19 @@ server.listen(0, async () => {
     await page.selectOption('#lk-metric', 'count');
     assert.strictEqual(await page.$(D + ' #lk-confirm-overlap'), null, 'a metric change clears the confirmation');
     assert.strictEqual(await page.isVisible('#lk-width'), false, 'no width for a count');
-    for (let k = 0; k < 2; k++) { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'selection refusal logged'); errors.splice(i, 1); }
+    // the selection changes while the save is on its way: its 409 belongs to the old selection, so no box, "save again"
+    await page.selectOption('#lk-metric', 'open_length');
+    await page.route('**/api/drawings/*/measurements', async r => { await new Promise(f => setTimeout(f, 800)); await r.continue(); });
+    const posted = page.waitForRequest(r => r.url().includes('/measurements') && r.method() === 'POST');
+    await page.click('#lk-save');
+    await posted;
+    await clickAt(1500, 2000, 'Shift');
+    await page.waitForSelector(D + ' #lk-changed');
+    assert.strictEqual(await page.$(D + ' #lk-confirm-overlap'), null, 'no confirm box for a reply to an older selection');
+    assert.ok((await page.textContent(D + ' #lk-msg')).includes('changed while saving'), 'save-again message');
+    await page.unroute('**/api/drawings/*/measurements');
+    await clickAt(1500, 2000);
+    for (let k = 0; k < 3; k++) { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'selection refusal logged'); errors.splice(i, 1); }
     await page.click('#lk-cancel');
     // the KERB layer off: the same spot selects nothing (and a hidden layer leaves the selection)
     await page.uncheck('#tv-layers [data-layer="KERB"] input');
@@ -487,10 +499,37 @@ server.listen(0, async () => {
     await page.click('#tv-clear');
     assert.strictEqual(await nSel(), 0, 'Clear');
     // "Show" on the selection measurement highlights its entities (read only: nothing selected)
+    // Open, then Show while the display file is still loading: one load, one engine
+    await page.click('#tv-close');
+    const created = await page.evaluate(() => window.__tvCreated);
+    await page.route('**/api/drawings/*/render', async r => { await new Promise(f => setTimeout(f, 500)); await r.continue(); });
+    await page.click(D + ' #tv-open');
     await page.click(`${D} #dw-measurements tr[data-row="${kerbRow}"] .m-show`);
-    await page.waitForFunction(() => /\b1\b/.test((document.querySelector('#tv-highlight') || {}).textContent || ''));
+    await page.waitForFunction(() => /entities: 1\b/.test((document.querySelector('#tv-highlight') || {}).textContent || ''));
+    await page.unroute('**/api/drawings/*/render');
+    assert.strictEqual(await page.evaluate(() => window.__tvCreated), created + 1, 'a second open while loading makes no second engine');
     assert.deepStrictEqual(await page.evaluate(() => Array.from(window.__tvViewer.highlightedHandles())), ['K1'], 'highlighted K1');
     assert.strictEqual(await nSel(), 0, 'a highlight is not a selection');
+    // Show turns on a hidden layer of the highlighted entities, and says so
+    await page.uncheck('#tv-layers [data-layer="KERB"] input');
+    await page.click(`${D} #dw-measurements tr[data-row="${kerbRow}"] .m-show`);
+    await page.waitForFunction(() => ((document.querySelector('#tv-highlight') || {}).textContent || '').includes('layers turned on'));
+    assert.ok(await page.isChecked('#tv-layers [data-layer="KERB"] input'), 'KERB turned on by Show');
+    assert.ok((await page.textContent('#tv-highlight')).includes('KERB'), 'the layer is named');
+    // a window released outside the canvas stops at its edge: BOW's square, just off the left edge, is not taken
+    await page.click('#tv-fit'); await frame();
+    await page.click('#tv-mode-window');
+    {
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      const rect = await page.locator('#tv-canvas').boundingBox(), [bx] = await at(22000, 0), cy = rect.y + rect.height / 2;
+      await page.mouse.move(rect.x + rect.width / 2, cy); await page.mouse.down({ button: 'middle' });
+      await page.mouse.move(rect.x + rect.width / 2 - (bx - rect.x + 30), cy, { steps: 3 }); await page.mouse.up({ button: 'middle' }); await frame();
+      const [, y0] = await at(0, -600), [, y1] = await at(0, 2600);
+      await page.mouse.move(rect.x + 40, y0); await page.mouse.down();
+      await page.mouse.move(rect.x - 60, y1, { steps: 3 }); await page.mouse.move(rect.x - 180, y1); await page.mouse.up(); await frame();
+      assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.selectedHandles()), [], 'nothing off screen selected by a band released outside');
+    }
+    await page.click('#tv-mode-select');
     if (process.env.VIEWER_SCREENSHOT) { await page.locator('#tv-panel').scrollIntoViewIfNeeded(); await page.screenshot({ path: process.env.VIEWER_SCREENSHOT }); }
     // leaving the tab detaches the viewer
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
@@ -533,15 +572,22 @@ server.listen(0, async () => {
       await frame();
       const box = await page.locator('#tv-canvas').boundingBox();
       await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-      const times = [];
-      for (let k = 0; k < 5; k++) {
+      // the frame after an action: settle two frames first, so an earlier frame is not read
+      const timed = async act => {
+        await frame();
         await page.evaluate(() => { window.__tvLastFrameMs = undefined; });
-        await page.mouse.wheel(0, -120);
+        await act();
         await page.waitForFunction(() => typeof window.__tvLastFrameMs === 'number');
-        times.push(await page.evaluate(() => window.__tvLastFrameMs));
-      }
-      console.log('viewer: 100k zoom frames (ms): ' + times.map(Math.round).join(', ') + ' (cap ' + FRAME_MS + ')');
-      for (const ms of times) assert.ok(ms < FRAME_MS, '100k zoom frame took ' + Math.round(ms) + ' ms (cap ' + FRAME_MS + ' ms)');
+        return page.evaluate(() => window.__tvLastFrameMs);
+      };
+      const cx = box.x + box.width / 2, cy = box.y + box.height / 2, times = [];
+      for (let k = 0; k < 5; k++) times.push(['zoom in', await timed(() => page.mouse.wheel(0, -120))]);
+      times.push(['fit (all 100k)', await timed(() => page.click('#tv-fit'))]);
+      await page.mouse.move(cx, cy);
+      times.push(['zoom out at fit', await timed(() => page.mouse.wheel(0, 120))]);
+      times.push(['pan', await timed(async () => { await page.mouse.down({ button: 'middle' }); await page.mouse.move(cx - 150, cy - 40, { steps: 3 }); await page.mouse.up({ button: 'middle' }); })]);
+      console.log('viewer: 100k frames (ms): ' + times.map(([k, ms]) => k + ' ' + Math.round(ms)).join(', ') + ' (cap ' + FRAME_MS + ')');
+      for (const [k, ms] of times) assert.ok(ms < FRAME_MS, '100k ' + k + ' frame took ' + Math.round(ms) + ' ms (cap ' + FRAME_MS + ' ms)');
       assert.ok(await page.evaluate(() => window.__tvViewer.view().scale > 0), 'zoomed');
     }
 

@@ -661,7 +661,13 @@
     viewerOpeners.set(d.id, openViewer);
     const f = lt.units_confirmed ? UNIT_TO_M[lt.units] : null;
 
-    async function openViewer() {
+    // one open at a time per card: a second Open or Show while loading waits for the same one
+    let opening = null;
+    function openViewer() {
+      if (!opening) opening = loadViewer().finally(() => { opening = null; });
+      return opening;
+    }
+    async function loadViewer() {
       closeViewer();
       const tok = routeTok;
       openBtn.disabled = true;
@@ -697,8 +703,10 @@
         selListeners.clear();
         const form = linkForm({ drawing_id: d.id, tool: 'dxf_selection', metric: 'open_length', handles: () => eng.selectedHandles(), count: () => Number(selected.getAttribute('data-n')),
           onSelectionChange: fn => selListeners.add(fn),
-          onSaved: async res => {
-            selListeners.clear(); host.replaceChildren(); eng.clear();
+          // changed: the selection (or form) changed while the save was on its way: keep the new selection
+          onSaved: async (res, changed) => {
+            selListeners.clear(); host.replaceChildren();
+            if (!changed) { eng.clear(); highlightTxt.textContent = ''; }
             saved.replaceChildren(h('p', { class: 'small' }, h('span', { class: 'tag good' }, t('tv_saved', { qty: fmt2(res.qty), unit: res.qty_unit || '', n: res.handles_count })),
               res.skipped > 0 ? h('span', { class: 'tag warn-tag' }, t('tv_skipped', { n: res.skipped })) : null));
             try { await refreshList(); } catch (e) { fail(e); }
@@ -751,7 +759,14 @@
       window.__tvViewer = eng;   // test hook
       activeViewer = {
         drawingId: d.id,
-        highlight: (handles, m) => { const n = eng.highlight(handles); highlightTxt.textContent = t('tv_highlighted', { n, label: m.label || '#' + m.id }); sec.scrollIntoView({ block: 'nearest' }); },
+        // hidden layers holding highlighted entities are turned on, and named
+        highlight: (handles, m) => {
+          const r = eng.highlight(handles);
+          for (const i of r.layersOn) boxes[i].checked = true;
+          highlightTxt.replaceChildren(h('span', null, t('tv_highlighted', { n: r.n, label: m.label || '#' + m.id }),
+            r.layersOn.length ? [' · ' + t('tv_layers_turned_on') + ': ', r.layersOn.map((i, k) => [k ? ', ' : '', h('span', { dir: 'auto' }, R.layers[i].name)])] : null));
+          sec.scrollIntoView({ block: 'nearest' });
+        },
         close: () => { eng.destroy(); window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); },
       };
     }
@@ -823,7 +838,9 @@
     const showDims = () => { shown(wF, isLen()); shown(dpF, metric !== 'count'); shown(dimsNote, isLen() || metric === 'area'); };
     showDims();
     const msg = h('div', { id: 'lk-msg' }), cb = confirmBoxes('lk-');
-    const clear = () => { cb.reset(); msg.replaceChildren(); };
+    // gen: bumped by every change (row, metric, numbers, selection); a reply to an older request is not acted on
+    let gen = 0;
+    const clear = () => { gen++; cb.reset(); msg.replaceChildren(); };
     rowSel.addEventListener('change', clear);
     for (const x of [w, dp, fac]) if (x) x.addEventListener('input', clear);
     const selWhat = isSel ? h('span', { id: 'lk-sel-n' }, t('tv_selection_n', { n: target.count() })) : null;
@@ -847,11 +864,18 @@
       } catch (e) { msg.replaceChildren(h('p', { class: 'err' }, e.message)); return; }
       if (!blank(label.value)) b.label = label.value.trim();
       save.disabled = true;
+      const g = gen;
       let res;
       try { res = await api('POST', `drawings/${target.drawing_id}/measurements`, b); }
-      catch (e) { save.disabled = false; linkRefusal(e, msg, cb.add, isSel); return; }
+      catch (e) {
+        save.disabled = false;
+        // a refusal of what was sent before a change: no confirm box (it would go out with the new choice)
+        if (g !== gen) msg.replaceChildren(h('p', { class: 'warn', id: 'lk-changed' }, t('lk_changed_save_again')));
+        else linkRefusal(e, msg, cb.add, isSel);
+        return;
+      }
       flash(t('saved'), 'ok');
-      if (target.onSaved) target.onSaved(res); else rerender();
+      if (target.onSaved) target.onSaved(res, g !== gen); else rerender();
     } }, t('lk_save'));
     return h('div', { id: 'lk-form', class: 'lk-form' }, h('h3', null, t('lk_title')), h('p', null, t('lk_what') + ': ', what),
       h('div', { class: 'form-grid' }, metricSel ? field(t('m_metric'), metricSel) : null, field(t('lk_row'), rowSel, 'wide'), wF, dpF, field(t('lk_factor'), fac),
