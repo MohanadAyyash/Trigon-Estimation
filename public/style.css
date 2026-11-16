@@ -145,3 +145,18 @@ dl.kv dd { margin: 0; }
   .three, .lib, .link-card .editor { grid-template-columns: 1fr; }
 }
 @media print { .sidebar, .topbar, #sync-banner, .tabs, button { display: none; } }
+
+/* drawing viewer */
+.tv-toolbar { gap: 6px; align-items: center; }
+.tv-toolbar button.active { background: var(--accent); color: var(--accent-ink); }
+.tv-check { display: inline-flex; align-items: center; gap: 4px; }
+.tv-body { display: grid; grid-template-columns: 220px 1fr; gap: 10px; }
+.tv-layers { max-height: 560px; overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; padding: 6px; }
+.tv-layer { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 13px; }
+.tv-swatch { display: inline-block; width: 12px; height: 12px; border: 1px solid #555; flex: none; }
+.tv-lname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-canvas-wrap { position: relative; height: 560px; min-width: 0; }
+#tv-canvas { display: block; width: 100%; height: 100%; background: #1e1e1e; cursor: crosshair; border-radius: 4px; }
+.tv-status, #tv-preview { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 6px; }
+#tv-selected { font-weight: 600; }
+@media (max-width: 800px) { .tv-body { grid-template-columns: 1fr; } .tv-layers { max-height: 200px; } }

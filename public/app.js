@@ -161,6 +161,7 @@
   async function route(navigated) {
     if (!me) return;
     const tok = ++routeTok;
+    closeViewer();   // leaving the page or redrawing it detaches the drawing viewer's listeners
     const p = location.hash.replace(/^#\/?/, '').split('?')[0].split('/').filter(Boolean);
     for (const a of document.querySelectorAll('nav.sidebar a')) a.classList.toggle('active', a.getAttribute('data-nav') === '#/' + (p[0] === 'tender' ? '' : (p[0] || '')));
     const main = $('#main'), out = h('div');
@@ -553,6 +554,12 @@
   async function tabDrawings(body, { T, id, editable, focusId }) {
     const [list, ms, rows] = await Promise.all([api('GET', `tenders/${id}/drawings`), api('GET', `tenders/${id}/measurements`), api('GET', `tenders/${id}/rows`)]);
     const box = h('div', { id: 'drawings', 'data-tender': String(id) });
+    viewerOpeners = new Map();
+    // after a selection is linked: the list again, in place (the viewer stays open)
+    const refreshList = async () => {
+      const fresh = await api('GET', `tenders/${id}/measurements`), old = box.querySelector('#dw-measurements');
+      if (old) old.replaceWith(measurementList(fresh, rows, editable));
+    };
     if (!editable) box.append(h('p', { class: 'muted' }, canWrite() && T.status !== 'draft' ? t('dw_read_only_note') : t('read_only')));
     if (editable) box.append(uploadPanel(id));
     const cur = list.find(d => d.id === focusId) || [...list].reverse().find(d => d.status === 'ready') || list[list.length - 1] || null;
@@ -564,7 +571,7 @@
     for (const d of list.filter(x => x.status === 'parsing')) watchParse(d.id, () => rerender());
     if (cur && cur.status === 'ready') {
       // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
-      try { await drawingPanel(box, cur, ms, rows, editable); }
+      try { await drawingPanel(box, cur, ms, rows, editable, refreshList); }
       catch (e) { box.append(h('div', { id: 'dw-panel-error', class: 'banner banner-red' }, h('strong', null, t('dw_panel_failed')), ': ', e.message)); }
     }
     else if (cur && cur.status === 'failed') box.append(h('div', { class: 'banner banner-red' }, h('strong', null, t('dw_parse_failed')), ': ', cur.error || ''));
@@ -573,9 +580,10 @@
     body.append(box);
   }
 
-  async function drawingPanel(box, cur, ms, rows, editable) {
+  async function drawingPanel(box, cur, ms, rows, editable, refreshList) {
     const [d, lt] = await Promise.all([api('GET', 'drawings/' + cur.id), api('GET', `drawings/${cur.id}/layers`)]);
     const confirmed = lt.units_confirmed, measured = [...ms.measurements, ...ms.unlinked].some(m => m.drawing_id === d.id);
+    box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList));
     // units: the suggestion is pre-selected, nothing is computed until Confirm
     const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable || measured });
     const ignored = Object.entries(d.ignored || {});
@@ -623,6 +631,133 @@
     box.append(card(t('dw_layers'), h('div', { class: 'scroll' }, table(heads, trs, { class: 'grid layers', id: 'dw-layers', 'data-units': confirmed ? lt.units : null }))));
   }
 
+  // ---- drawing viewer (public/viewer/*.js): the drawing on a canvas, a selection and its preview ----
+  // Display only: the preview is approximate and labelled so; a linked selection's qty comes from the server.
+  const UNIT_TO_M = { mm: 0.001, cm: 0.01, m: 1, km: 1000, ft: 0.3048, in: 0.0254 };   // as lib/units.js
+  const kindName = k => ({ 0: t('tv_k_open'), 1: t('tv_k_closed'), 2: t('tv_k_insert'), 3: t('tv_k_text'), 4: t('tv_k_dropped') })[k] || String(k);
+  let activeViewer = null;          // { drawingId, highlight(handles, m), close() }
+  let viewerOpeners = new Map();    // drawing id -> open(), for "Show" in the measurement list
+  function closeViewer() { const v = activeViewer; activeViewer = null; if (v) v.close(); }
+  async function showSelection(m) {
+    try {
+      if (!activeViewer || activeViewer.drawingId !== m.drawing_id) {
+        const open = viewerOpeners.get(m.drawing_id);
+        if (!open) return flash(t('tv_show_open_drawing'), 'warn');
+        await open();
+      }
+      const v = activeViewer;
+      if (!v || v.drawingId !== m.drawing_id) return;
+      const j = await api('GET', `measurements/${m.id}/handles`);
+      if (activeViewer === v) v.highlight(j.handles, m);
+    } catch (e) { fail(e); }
+  }
+
+  function viewerCard(d, lt, rows, canLink, refreshList) {
+    const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id) });
+    const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
+    const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
+    const idle = (...extra) => { openBtn.disabled = false; sec.replaceChildren(title(), ...extra, openBtn); };
+    idle();
+    viewerOpeners.set(d.id, openViewer);
+    const f = lt.units_confirmed ? UNIT_TO_M[lt.units] : null;
+
+    async function openViewer() {
+      closeViewer();
+      const tok = routeTok;
+      openBtn.disabled = true;
+      sec.replaceChildren(title(), h('p', { class: 'muted', id: 'tv-loading' }, t('loading')));
+      let R;
+      try {
+        const r = await fetch(`/api/drawings/${d.id}/render`);   // gzip: the browser decodes it
+        if (r.status === 401) { me = null; renderLogin(); return; }
+        if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { j = null; } throw new Error((j && j.error) || r.statusText || String(r.status)); }
+        const ab = await r.arrayBuffer();
+        if (tok !== routeTok) return;
+        R = TV.decodeRender(ab);
+      } catch (e) {
+        if (tok !== routeTok) return;
+        return idle(h('div', { id: 'tv-error', class: 'banner banner-red' }, h('strong', null, t('tv_unavailable')), ': ', e.message));
+      }
+      const canvas = h('canvas', { id: 'tv-canvas' });
+      const layersBox = h('div', { class: 'tv-layer-list' });
+      const cursor = h('span', { id: 'tv-cursor' }), selected = h('span', { id: 'tv-selected', 'data-n': '0' }), hover = h('span', { id: 'tv-hover' });
+      const highlightTxt = h('span', { id: 'tv-highlight' }), notes = h('span', { id: 'tv-sel-notes' }), saved = h('div', { id: 'tv-saved' });
+      const METRICS = [['open_length', 'm'], ['closed_perimeter', 'm'], ['area', 'm2'], ['count', 'nr']];
+      const vals = {};
+      const preview = h('div', { id: 'tv-preview' }, h('strong', null, t('tv_preview') + ':'), METRICS.map(([mt]) =>
+        h('span', { class: 'tv-metric', 'data-metric': mt }, metricLabel(mt) + ' ', vals[mt] = h('span', { class: 'v num' }, '—'))));
+      const host = h('div', { id: 'tv-link-host' }), selListeners = new Set();
+      const modeBtns = {};
+      const modeBtn = (m, label) => modeBtns[m] = h('button', { id: 'tv-mode-' + m, class: 'small secondary' + (m === 'select' ? ' active' : ''), 'aria-pressed': m === 'select' ? 'true' : 'false', onclick: () => {
+        eng.setMode(m);
+        for (const [k, b] of Object.entries(modeBtns)) { b.classList.toggle('active', k === m); b.setAttribute('aria-pressed', k === m ? 'true' : 'false'); }
+      } }, label);
+      const snapCb = h('input', { type: 'checkbox', id: 'tv-snap', onchange: () => eng.setSnap(snapCb.checked) });
+      const linkBtn = canLink ? h('button', { id: 'tv-link', class: 'small', onclick: () => {
+        selListeners.clear();
+        const form = linkForm({ drawing_id: d.id, tool: 'dxf_selection', metric: 'open_length', handles: () => eng.selectedHandles(), count: () => Number(selected.getAttribute('data-n')),
+          onSelectionChange: fn => selListeners.add(fn),
+          onSaved: async res => {
+            selListeners.clear(); host.replaceChildren(); eng.clear();
+            saved.replaceChildren(h('p', { class: 'small' }, h('span', { class: 'tag good' }, t('tv_saved', { qty: fmt2(res.qty), unit: res.qty_unit || '', n: res.handles_count })),
+              res.skipped > 0 ? h('span', { class: 'tag warn-tag' }, t('tv_skipped', { n: res.skipped })) : null));
+            try { await refreshList(); } catch (e) { fail(e); }
+          } }, rows, () => { selListeners.clear(); host.replaceChildren(); });
+        host.replaceChildren(form);
+      } }, t('tv_link')) : null;
+      sec.replaceChildren(title(),
+        h('div', { class: 'row wrap tv-toolbar' }, modeBtn('select', t('tv_select')), modeBtn('window', t('tv_window')), modeBtn('crossing', t('tv_crossing')),
+          h('button', { id: 'tv-clear', class: 'small secondary', onclick: () => { eng.clear(); highlightTxt.textContent = ''; } }, t('tv_clear')),
+          h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
+          h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn,
+          h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
+        h('p', { class: 'muted small' }, t('tv_help')),
+        h('div', { class: 'tv-body' },
+          h('aside', { id: 'tv-layers', class: 'tv-layers' }, h('div', { class: 'row' },
+            h('button', { id: 'tv-all', class: 'small secondary', onclick: () => setAll(true) }, t('all')),
+            h('button', { id: 'tv-none', class: 'small secondary', onclick: () => setAll(false) }, t('tv_none'))), layersBox),
+          h('div', { class: 'tv-canvas-wrap' }, canvas)),
+        h('div', { id: 'tv-status', class: 'tv-status small' }, cursor, selected, notes, highlightTxt, hover),
+        preview, saved, host);
+
+      const units = d.units || '';
+      const showCursor = w => { cursor.textContent = iso('X ' + w[0].toFixed(3) + '  Y ' + w[1].toFixed(3) + (units ? ' ' + units : '')); };
+      const showHover = i => {
+        if (i < 0) return hover.replaceChildren();
+        hover.replaceChildren(t('dw_layer') + ': ', h('span', { dir: 'auto' }, R.layers[R.layer[i]].name), ' · ' + kindName(R.kind[i]) + ' · ' + t('tv_handle') + ' ', h('code', null, R.handles[i]));
+      };
+      const showSel = () => {
+        const idx = eng.selection();
+        selected.setAttribute('data-n', String(idx.length));
+        selected.textContent = t('tv_selected', { n: idx.length });
+        for (const [mt, unit] of METRICS) {
+          const p = f && idx.length ? TV.previewTotal(R, idx, mt, f) : null;   // no number before the units are confirmed
+          vals[mt].textContent = p && p.used ? (mt === 'count' ? fmtQ(p.value) : fmt2(p.value)) + ' ' + unit : '—';
+        }
+        // from the display file: shapes the server will leave out
+        let dropped = 0, noArea = 0;
+        for (const i of idx) { if (R.kind[i] === 4) dropped++; else if (R.kind[i] === 1 && R.area[i] !== R.area[i]) noArea++; }
+        notes.replaceChildren(...[dropped ? h('span', { class: 'tag warn-tag' }, t('dw_dropped', { n: dropped })) : null, noArea ? h('span', { class: 'tag warn-tag' }, t('dw_area_excluded', { n: noArea })) : null].filter(Boolean));
+        for (const fn of selListeners) fn();
+      };
+      const eng = TVCanvas.create(canvas, R, { alive: () => tok === routeTok, onSelect: showSel, onHover: showHover, onCursor: showCursor });
+      const boxes = R.layers.map((l, i) => h('input', { type: 'checkbox', checked: eng.layerOn(i), onchange: ev => eng.setLayers([i], ev.target.checked) }));
+      const setAll = on => { boxes.forEach(b => { b.checked = on; }); eng.setLayers(R.layers.map((l, i) => i), on); };
+      layersBox.append(...R.layers.map((l, i) => h('label', { class: 'tv-layer', 'data-layer': l.name }, boxes[i],
+        h('span', { class: 'tv-swatch', style: 'background:' + TVCanvas.layerColor(l.color) }), h('span', { class: 'tv-lname', dir: 'auto' }, l.name),
+        l.off ? h('span', { class: 'tag' }, t('dw_off')) : null, l.frozen ? h('span', { class: 'tag' }, t('dw_frozen')) : null)));
+      showSel();
+      canvas.setAttribute('data-ready', '1');
+      window.__tvViewer = eng;   // test hook
+      activeViewer = {
+        drawingId: d.id,
+        highlight: (handles, m) => { const n = eng.highlight(handles); highlightTxt.textContent = t('tv_highlighted', { n, label: m.label || '#' + m.id }); sec.scrollIntoView({ block: 'nearest' }); },
+        close: () => { eng.destroy(); window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); },
+      };
+    }
+    return sec;
+  }
+
   // drawing-level warnings, one line per code with how many and the first few entity handles
   function drawingWarnings(ws) {
     if (!ws.length) return null;
@@ -635,13 +770,18 @@
   }
 
   // the server's refusal of a link: its message, plus a confirm box only for the refusals a user may confirm
-  function linkRefusal(e, msg, addConfirm) {
+  // A selection (isSel) gets the same gates in selection words, with the server's counts.
+  function linkRefusal(e, msg, addConfirm, isSel) {
     const j = e.body || {};
-    msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message));
+    const selText = isSel && e.status === 409 ? ({ 'already measured on this row': t('tv_r_overlap'), 'layer quantity is incomplete': t('tv_r_incomplete'),
+      'possible duplicates on this layer': t('tv_r_duplicates'), 'unit mismatch': t('tv_r_uom') })[j.error] : null;
+    msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + (selText || e.message)));
+    if (selText) msg.append(h('p', { id: 'lk-counts', class: 'small muted' }, t('tv_server_counts', { dropped: j.dropped || 0, area_null: j.area_null || 0,
+      approx: j.approx || 0, duplicates: j.duplicates || 0, overlapping: j.overlapping || 0 })));
     let box = false;
     if (e.status === 409 && j.error === 'unit mismatch') box = addConfirm('confirm_uom', t('lk_confirm_uom', { row: j.row_unit || '', qty: j.qty_unit || '' }));
-    else if (e.status === 409 && j.error === 'already measured on this row') box = addConfirm('confirm_overlap', t('lk_confirm_overlap'));
-    else if (e.status === 409 && j.error === 'possible duplicates on this layer') box = addConfirm('confirm_duplicate', t('lk_confirm_duplicate', { n: j.duplicates || 0 }));
+    else if (e.status === 409 && j.error === 'already measured on this row') box = addConfirm('confirm_overlap', isSel ? t('tv_confirm_overlap', { n: j.overlapping || 0 }) : t('lk_confirm_overlap'));
+    else if (e.status === 409 && j.error === 'possible duplicates on this layer') box = addConfirm('confirm_duplicate', isSel ? t('tv_confirm_duplicate', { n: j.duplicates || 0 }) : t('lk_confirm_duplicate', { n: j.duplicates || 0 }));
     else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0, c: j.dropped || 0 }));
     else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
     if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
@@ -665,41 +805,65 @@
     return { el, add, flags, reset };
   }
 
+  // target: a layer metric or block count ({ tool, layer, metric, block? }) or a viewer selection
+  // ({ tool: 'dxf_selection', metric, handles(), count(), onSelectionChange(fn), onSaved(result) }: a metric picker;
+  // a change of the selection drops the confirmations like a change of row, metric or numbers)
   function linkForm(target, rows, close) {
-    const len = target.metric === 'open_length' || target.metric === 'closed_perimeter', count = target.metric === 'count';
+    const isSel = target.tool === 'dxf_selection';
+    let metric = target.metric;
+    const isLen = () => metric === 'open_length' || metric === 'closed_perimeter';
+    const count = metric === 'count';
+    const metricSel = isSel ? sel('lk-metric', metric, ['open_length', 'closed_perimeter', 'area', 'count'].map(x => [x, metricLabel(x)])) : null;
     const rowSel = sel('lk-row', '', rowOpts(rows));
-    const w = len ? inp('lk-width', '', { class: 'w-num', inputmode: 'decimal' }) : null, dp = count ? null : inp('lk-depth', '', { class: 'w-num', inputmode: 'decimal' });
+    const w = isSel || isLen() ? inp('lk-width', '', { class: 'w-num', inputmode: 'decimal' }) : null, dp = !isSel && count ? null : inp('lk-depth', '', { class: 'w-num', inputmode: 'decimal' });
     const fac = inp('lk-factor', '', { class: 'w-num', inputmode: 'decimal', placeholder: '1' }), label = inp('lk-label', '', { maxlength: 200 });
     const nested = count && target.has_nested ? h('input', { type: 'checkbox', id: 'lk-nested' }) : null;
+    const wF = w ? field(t('width'), w) : null, dpF = dp ? field(t('depth'), dp) : null, dimsNote = h('p', { class: 'muted small' }, t('lk_dims_note'));
+    const shown = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };   // .field sets display, so not [hidden]
+    const showDims = () => { shown(wF, isLen()); shown(dpF, metric !== 'count'); shown(dimsNote, isLen() || metric === 'area'); };
+    showDims();
     const msg = h('div', { id: 'lk-msg' }), cb = confirmBoxes('lk-');
     const clear = () => { cb.reset(); msg.replaceChildren(); };
     rowSel.addEventListener('change', clear);
     for (const x of [w, dp, fac]) if (x) x.addEventListener('input', clear);
-    const what = target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
+    const selWhat = isSel ? h('span', { id: 'lk-sel-n' }, t('tv_selection_n', { n: target.count() })) : null;
+    if (isSel) {
+      metricSel.addEventListener('change', () => { metric = metricSel.value; showDims(); clear(); });
+      target.onSelectionChange(() => { clear(); selWhat.textContent = t('tv_selection_n', { n: target.count() }); });
+    }
+    const what = isSel ? selWhat : target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
       : [h('span', { dir: 'auto' }, target.layer), ' — ' + metricLabel(target.metric)];
     const save = h('button', { id: 'lk-save', onclick: async () => {
-      const b = { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, layer: target.layer, metric: target.metric, ...cb.flags() };
+      const b = { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, metric, ...cb.flags() };
+      if (isSel) {
+        b.handles = target.handles();
+        if (!b.handles.length) { msg.replaceChildren(h('p', { class: 'err' }, t('tv_nothing_selected'))); return; }
+      } else b.layer = target.layer;
       if (target.tool === 'dxf_blocks') { b.block = target.block; if (nested) b.nested = nested.checked; }
       try {
-        if (w && !blank(w.value)) b.width = strictNum(w.value, t('width'));
-        if (dp && !blank(dp.value)) b.depth = strictNum(dp.value, t('depth'));
+        if (w && isLen() && !blank(w.value)) b.width = strictNum(w.value, t('width'));
+        if (dp && metric !== 'count' && !blank(dp.value)) b.depth = strictNum(dp.value, t('depth'));
         if (!blank(fac.value)) b.factor = strictNum(fac.value, t('lk_factor'));
       } catch (e) { msg.replaceChildren(h('p', { class: 'err' }, e.message)); return; }
       if (!blank(label.value)) b.label = label.value.trim();
       save.disabled = true;
-      try { await api('POST', `drawings/${target.drawing_id}/measurements`, b); flash(t('saved'), 'ok'); rerender(); }
-      catch (e) { save.disabled = false; linkRefusal(e, msg, cb.add); }
+      let res;
+      try { res = await api('POST', `drawings/${target.drawing_id}/measurements`, b); }
+      catch (e) { save.disabled = false; linkRefusal(e, msg, cb.add, isSel); return; }
+      flash(t('saved'), 'ok');
+      if (target.onSaved) target.onSaved(res); else rerender();
     } }, t('lk_save'));
     return h('div', { id: 'lk-form', class: 'lk-form' }, h('h3', null, t('lk_title')), h('p', null, t('lk_what') + ': ', what),
-      h('div', { class: 'form-grid' }, field(t('lk_row'), rowSel, 'wide'), w ? field(t('width'), w) : null, dp ? field(t('depth'), dp) : null, field(t('lk_factor'), fac),
+      h('div', { class: 'form-grid' }, metricSel ? field(t('m_metric'), metricSel) : null, field(t('lk_row'), rowSel, 'wide'), wF, dpF, field(t('lk_factor'), fac),
         field(t('lk_label'), label), nested ? field(t('lk_nested'), nested, 'check') : null),
-      len || target.metric === 'area' ? h('p', { class: 'muted small' }, t('lk_dims_note')) : null,
-      msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'lk-cancel', class: 'secondary', onclick: close }, t('cancel'))));
+      dimsNote, msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'lk-cancel', class: 'secondary', onclick: close }, t('cancel'))));
   }
 
   // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink
   function measurementList(ms, rows, editable) {
-    const src = m => [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
+    const src = m => m.tool === 'dxf_selection' ? [h('span', { class: 'm-sel' }, t('m_selection', { n: m.handles_count || 0 })), ' ',
+      h('button', { class: 'small secondary m-show', onclick: () => showSelection(m) }, t('m_show'))]
+      : [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
     // spec 5.6: the formula with its inputs, "<metric> <base> <unit> × width w × depth d × factor f = qty unit" (width/depth
     // only when given, factor only when not 1). A measurement saved before `base` was stored derives it from qty when every
     // factor is known; otherwise only the qty is shown.

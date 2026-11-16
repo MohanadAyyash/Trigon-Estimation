@@ -44,6 +44,12 @@ server.listen(0, async () => {
     const html = await idx.text();
     assert.ok(html.includes('<html') && html.includes('app.js') && html.includes('i18n.js') && html.includes('style.css'), 'index.html loads the app');
     for (const f of ['/app.js', '/i18n.js', '/style.css']) assert.strictEqual((await fetch(origin + f)).status, 200, f);
+    // the viewer scripts sit in a sub-folder of public/ and are served as JavaScript, loaded by index.html
+    for (const f of ['/viewer/core.js', '/viewer/aci.js', '/viewer/canvas.js']) {
+      const r = await fetch(origin + f);
+      assert.strictEqual(r.status, 200, f); assert.match(r.headers.get('content-type') || '', /^text\/javascript/, f + ' content type');
+      assert.ok(html.includes('src="' + f + '"'), 'index.html loads ' + f);
+    }
 
     let pw = null;
     try { pw = require('playwright'); } catch (e) { console.log('ui: playwright not installed, browser smoke skipped'); }
@@ -376,12 +382,168 @@ server.listen(0, async () => {
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
 
+    // ---- viewer: the drawing on a canvas; click/window selection, preview totals, link a selection ----------------
+    // screen point of a world point (drawing units), in page coordinates, from the page's own view transform
+    const at = (x, y) => page.evaluate(([x, y]) => {
+      const v = window.__tvViewer, [sx, sy] = TV.toScreen(v.view(), x, y), r = v.canvas.getBoundingClientRect();
+      return [r.left + sx, r.top + sy];
+    }, [x, y]);
+    const frame = () => page.evaluate(() => new Promise(f => requestAnimationFrame(() => requestAnimationFrame(f))));
+    const nSel = async () => Number(await page.getAttribute('#tv-selected', 'data-n'));
+    const clickAt = async (x, y, mods) => {
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();   // a click elsewhere (Link) may have scrolled the page
+      const [sx, sy] = await at(x, y);
+      if (mods) await page.keyboard.down(mods);
+      await page.mouse.click(sx, sy);
+      if (mods) await page.keyboard.up(mods);
+      await frame();
+    };
+    const openViewer = async () => {
+      await page.click(D + ' #tv-open');
+      await page.waitForSelector(D + ' #tv-canvas[data-ready="1"]');
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      await frame();
+    };
+    // a display file the server refuses (409): its reason in a banner, the rest of the tab keeps working
+    await page.route('**/api/drawings/*/render', r => r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'display not available for this drawing: test reason' }) }));
+    await page.click(D + ' #tv-open');
+    await page.waitForSelector(D + ' #tv-error');
+    assert.ok((await page.textContent(D + ' #tv-error')).includes('display not available for this drawing: test reason'), 'refusal shown');
+    assert.ok(await page.$(D + ' #dw-layers') && await page.isEnabled(D + ' #tv-open'), 'the tab keeps working; Open can be tried again');
+    await page.unroute('**/api/drawings/*/render');
+    { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'display refusal logged'); errors.splice(i, 1); }
+    await openViewer();
+    assert.strictEqual(await page.$(D + ' #tv-error'), null, 'banner gone once shown');
+    assert.ok(await page.evaluate(() => typeof window.__tvLastFrameMs === 'number'), 'a frame was drawn');
+    assert.strictEqual((await page.textContent('#tv-sel-notes')).trim(), '', 'no notes without a selection');
+    assert.strictEqual(await nSel(), 0, 'nothing selected at first');
+    assert.strictEqual((await page.textContent('#tv-preview [data-metric="open_length"] .v')).trim(), '—', 'no preview without a selection');
+    // KERB alone: the SPLINE on CURVE is the same line, and the asphalt square around it would take a click inside it
+    await page.click('#tv-none');
+    await page.check('#tv-layers [data-layer="KERB"] input');
+    await clickAt(1500, 2000);
+    assert.strictEqual(await nSel(), 1, '1 selected');
+    assert.strictEqual((await page.textContent('#tv-preview [data-metric="open_length"] .v')).trim(), '5.00 m', 'preview open length 5.00');
+    assert.match(await page.textContent('#tv-preview'), /preview/i, 'labelled preview');
+    assert.ok((await page.textContent('#tv-hover')).includes('K1'), 'hovered entity handle shown');
+    // link the selection to the take-off row (m): the server's qty, the selection cleared, the list refreshed (viewer stays open)
+    await page.click('#tv-link');
+    await page.waitForSelector(D + ' #lk-form #lk-metric');
+    await page.selectOption('#lk-metric', 'open_length');
+    await page.selectOption('#lk-row', String(kerbRow));
+    await page.click('#lk-save');
+    await page.waitForSelector(`${D} #dw-measurements tr[data-row="${kerbRow}"] .m-sel`);
+    assert.ok((await page.textContent('#tv-saved')).includes('5.00 m'), 'the server qty is shown: ' + await page.textContent('#tv-saved'));
+    assert.strictEqual(await nSel(), 0, 'selection cleared after the save');
+    assert.strictEqual(await page.$(D + ' #lk-form'), null, 'link form closed after the save');
+    assert.strictEqual((await call('GET', `tenders/${dwg}/rows`, null, admin)).j.find(r => r.id === kerbRow).qty, 5, 'row qty 5 from the selection');
+    assert.ok(await page.$(D + ' #tv-canvas'), 'viewer still open');
+    // the same line on the same row again: overlap 409 in selection words, with its checkbox; a new selection drops it
+    await clickAt(1500, 2000);
+    await page.click('#tv-link');
+    await page.waitForSelector(D + ' #lk-form #lk-metric');
+    await page.selectOption('#lk-metric', 'open_length');
+    await page.selectOption('#lk-row', String(kerbRow));
+    await page.click('#lk-save');
+    await page.waitForSelector(D + ' #lk-confirm-overlap');
+    assert.ok((await page.textContent(D + ' #lk-msg')).includes('already measured on this row'), 'selection overlap message: ' + await page.textContent(D + ' #lk-msg'));
+    assert.ok((await page.textContent(D + ' #lk-counts')).includes('already on this row: 1'), 'server counts shown');
+    assert.strictEqual(await page.$(D + ' #lk-confirm-incomplete'), null, 'only the confirmable refusal gets a box');
+    await clickAt(1500, 2000, 'Shift');   // Shift+click toggles it off: the selection changed
+    assert.strictEqual(await nSel(), 0, 'shift+click toggles');
+    assert.strictEqual(await page.$(D + ' #lk-confirm-overlap'), null, 'a selection change clears the confirmation');
+    assert.strictEqual((await page.textContent(D + ' #lk-msg')).trim(), '', 'and the message');
+    // metric change clears it too
+    await clickAt(1500, 2000);
+    await page.click('#lk-save');
+    await page.waitForSelector(D + ' #lk-confirm-overlap');
+    await page.selectOption('#lk-metric', 'count');
+    assert.strictEqual(await page.$(D + ' #lk-confirm-overlap'), null, 'a metric change clears the confirmation');
+    assert.strictEqual(await page.isVisible('#lk-width'), false, 'no width for a count');
+    for (let k = 0; k < 2; k++) { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'selection refusal logged'); errors.splice(i, 1); }
+    await page.click('#lk-cancel');
+    // the KERB layer off: the same spot selects nothing (and a hidden layer leaves the selection)
+    await page.uncheck('#tv-layers [data-layer="KERB"] input');
+    assert.strictEqual(await nSel(), 0, 'hidden layer leaves the selection');
+    await clickAt(1500, 2000);
+    assert.strictEqual(await nSel(), 0, 'a hidden layer is not selectable');
+    // window around the asphalt square selects it; crossing through its edge too; Clear empties
+    await page.click('#tv-all');
+    await page.uncheck('#tv-layers [data-layer="CURVE"] input');
+    await page.click('#tv-mode-window');
+    const band = async (a, b) => { await page.locator('#tv-canvas').scrollIntoViewIfNeeded(); const p0 = await at(...a), p1 = await at(...b); await page.mouse.move(p0[0], p0[1]); await page.mouse.down(); await page.mouse.move((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2); await page.mouse.move(p1[0], p1[1]); await page.mouse.up(); await frame(); };
+    await band([-500, -500], [10500, 10500]);
+    const winSel = await page.evaluate(() => Array.from(window.__tvViewer.selectedHandles()).sort());
+    assert.deepStrictEqual(winSel, ['A1', 'K1', 'M1', 'M2', 'M3'], 'window: entities fully inside');
+    assert.strictEqual((await page.textContent('#tv-preview [data-metric="area"] .v')).trim(), '100.00 m2', 'area preview');
+    assert.strictEqual((await page.textContent('#tv-preview [data-metric="count"] .v')).trim(), '3 nr', 'count preview');
+    await page.click('#tv-mode-crossing');
+    await band([9000, 9000], [11000, 11000]);
+    assert.deepStrictEqual(await page.evaluate(() => Array.from(window.__tvViewer.selectedHandles())), ['A1'], 'crossing: touching the edge');
+    // snapping: a marker at the nearest endpoint
+    await page.check('#tv-snap');
+    { const [sx, sy] = await at(10000, 10000); await page.mouse.move(sx + 3, sy + 2); await frame(); }
+    assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.snapPoint()), { x: 10000, y: 10000, kind: 'end' }, 'snap marker at the corner');
+    await page.click('#tv-clear');
+    assert.strictEqual(await nSel(), 0, 'Clear');
+    // "Show" on the selection measurement highlights its entities (read only: nothing selected)
+    await page.click(`${D} #dw-measurements tr[data-row="${kerbRow}"] .m-show`);
+    await page.waitForFunction(() => /\b1\b/.test((document.querySelector('#tv-highlight') || {}).textContent || ''));
+    assert.deepStrictEqual(await page.evaluate(() => Array.from(window.__tvViewer.highlightedHandles())), ['K1'], 'highlighted K1');
+    assert.strictEqual(await nSel(), 0, 'a highlight is not a selection');
+    if (process.env.VIEWER_SCREENSHOT) { await page.locator('#tv-panel').scrollIntoViewIfNeeded(); await page.screenshot({ path: process.env.VIEWER_SCREENSHOT }); }
+    // leaving the tab detaches the viewer
+    await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
+    assert.strictEqual(await page.evaluate(() => window.__tvViewer), null, 'viewer detached on route change');
+    await page.click('#tab-drawings'); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+
     // a submitted tender: read-only (no upload, link, delete or units controls), numbers still shown
     await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
     await page.click('#tab-drawings'); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     for (const s of ['#dw-upload', '#dw-confirm-units', '.lk-btn', '.m-delete']) assert.strictEqual(await page.$(D + ' ' + s), null, 'read-only: no ' + s);
     assert.ok((await page.textContent(D + ' tr[data-layer="KERB"] td.m-open_length')).includes('5.00'), 'read-only still shows the numbers');
+    await openViewer();
+    assert.strictEqual(await page.$(D + ' #tv-link'), null, 'read-only: no Link selection');
+    await page.click('#tv-none'); await page.check('#tv-layers [data-layer="KERB"] input');
+    await clickAt(1500, 2000);
+    assert.strictEqual(await nSel(), 1, 'read-only: selection still works');
+    assert.strictEqual((await page.textContent('#tv-preview [data-metric="open_length"] .v')).trim(), '5.00 m', 'read-only: preview still works');
+
+    // 100k entities: the viewer opens and each zoom frame stays under TEST_FRAME_MS
+    {
+      const FRAME_MS = Number(process.env.TEST_FRAME_MS) || 500;
+      const big = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI 100k' }, admin), '100k tender')).id;
+      const parts = ['0\nSECTION\n2\nENTITIES'];
+      for (let i = 0; i < 100000; i++) parts.push('0\nLINE\n5\nH' + i + '\n8\nL' + (i % 20) + '\n10\n' + i + '\n20\n0\n30\n0\n11\n' + (i + 3) + '\n21\n4\n31\n0');
+      parts.push('0\nENDSEC\n0\nEOF\n');
+      const up = await fetch(`${base}tenders/${big}/drawings?name=big`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(parts.join('\n')) });
+      assert.strictEqual(up.status, 202);
+      const bid = (await up.json()).id;
+      for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(bid).status === 'parsing';) {
+        if (Date.now() - t0 > 60000) throw new Error('100k still parsing'); await new Promise(f => setTimeout(f, 50));
+      }
+      await ok(call('PUT', `drawings/${bid}/units`, { units: 'm' }, admin), '100k units');
+      const DB = `#drawings[data-tender="${big}"]`;
+      await page.goto(`${origin}/#/tender/${big}/drawings/${bid}`);
+      await page.waitForSelector(DB + ' #tv-open');
+      await page.click(DB + ' #tv-open');
+      await page.waitForSelector(DB + ' #tv-canvas[data-ready="1"]', { timeout: 60000 });
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      await frame();
+      const box = await page.locator('#tv-canvas').boundingBox();
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      const times = [];
+      for (let k = 0; k < 5; k++) {
+        await page.evaluate(() => { window.__tvLastFrameMs = undefined; });
+        await page.mouse.wheel(0, -120);
+        await page.waitForFunction(() => typeof window.__tvLastFrameMs === 'number');
+        times.push(await page.evaluate(() => window.__tvLastFrameMs));
+      }
+      console.log('viewer: 100k zoom frames (ms): ' + times.map(Math.round).join(', ') + ' (cap ' + FRAME_MS + ')');
+      for (const ms of times) assert.ok(ms < FRAME_MS, '100k zoom frame took ' + Math.round(ms) + ' ms (cap ' + FRAME_MS + ' ms)');
+      assert.ok(await page.evaluate(() => window.__tvViewer.view().scale > 0), 'zoomed');
+    }
 
     // other screens
     for (const [hash, sel] of [['#/costs', '#page-costs'], ['#/library', '#page-library'], ['#/settings', '#page-settings'], ['#/', '#page-home']]) {
@@ -406,6 +568,11 @@ server.listen(0, async () => {
     await page.waitForSelector(`#drawings[data-tender="${dwg}"] #dw-layers[data-units="mm"]`);
     assert.strictEqual((await page.textContent('#tab-drawings')).trim(), 'المخططات', 'Arabic tab label');
     assert.strictEqual((await page.textContent(`#drawings tr[data-layer="أسفلت"] td.layer-name`)).trim(), 'أسفلت', 'Arabic layer name in the Arabic UI');
+    await openViewer();
+    const arName = page.locator('#tv-layers [data-layer="أسفلت"] .tv-lname');
+    assert.strictEqual((await arName.textContent()).trim(), 'أسفلت', 'Arabic layer name in the viewer panel unchanged');
+    assert.strictEqual(await arName.getAttribute('dir'), 'auto', 'layer name isolated (dir=auto)');
+    assert.ok((await page.textContent('#tv-preview')).includes('معاينة'), 'Arabic preview label');
 
     assert.deepStrictEqual(errors, [], 'no console errors');
     await browser.close();
