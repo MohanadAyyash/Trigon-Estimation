@@ -1252,6 +1252,168 @@ server.listen(0, async () => {
       }
     }
 
+    // ---- batch 3 Task 2: PDF and image drawings, pages registered by the browser, the file endpoint ---------------
+    {
+      const { makePdf, PDF_PAGES, makePng, jpegHeader, pngHeader } = require('./test/fixtures/make-takeoff.js');
+      const sha256 = b => require('crypto').createHash('sha256').update(b).digest('hex');
+      const T = (await call('POST', 'tenders', { title: 'Test Plans PDF', kind: 'rta' }, qs)).j.id;
+      const row = id => ({ ...db.prepare('SELECT * FROM drawings WHERE id=?').get(id) });
+      const getFile = async (id, ck, headers = {}) => { const r = await fetch(base + `drawings/${id}/file`, { headers: { cookie: ck, ...headers } }); return { s: r.status, h: r.headers, b: Buffer.from(await r.arrayBuffer()) }; };
+      const PDF = makePdf(), psha = sha256(PDF);
+
+      // a PDF: kind pdf, status pages, page NULL; stored as <sha>.pdf; no parse
+      const up = await upload(T, 'Plans', PDF, qs);
+      assert.strictEqual(up.s, 202, JSON.stringify(up.j));
+      let d = row(up.j.id);
+      assert.strictEqual(d.kind, 'pdf'); assert.strictEqual(d.status, 'pages'); assert.strictEqual(d.page, null); assert.strictEqual(d.sha256, psha);
+      assert.strictEqual(d.bytes, PDF.length); assert.strictEqual(d.parent_id, null);
+      assert.ok(fs.existsSync(path.join(DDIR, psha + '.pdf')), 'stored as <sha>.pdf'); assert.ok(!fs.existsSync(path.join(DDIR, psha + '.dxf')));
+      const ga = await call('GET', `drawings/${up.j.id}`, null, viewer);
+      assert.strictEqual(ga.s, 200); assert.strictEqual(ga.j.status, 'pages'); assert.strictEqual(ga.j.header, null);
+      // the DXF routes do not apply
+      assert.strictEqual((await call('GET', `drawings/${up.j.id}/layers`, null, qs)).s, 400, 'no layers for a PDF');
+      assert.strictEqual((await call('GET', `drawings/${up.j.id}/render`, null, qs)).s, 400, 'no display file for a PDF');
+      assert.strictEqual((await call('PUT', `drawings/${up.j.id}/units`, { units: 'm' }, qs)).s, 400, 'no units for a PDF');
+
+      // the file: the original bytes, application/pdf, private no-cache, ETag → 304; any reader, also before the pages
+      let f = await getFile(up.j.id, viewer);
+      assert.strictEqual(f.s, 200); assert.ok(f.b.equals(PDF), 'bytes equal');
+      assert.strictEqual(f.h.get('content-type'), 'application/pdf'); assert.strictEqual(f.h.get('cache-control'), 'private, no-cache');
+      assert.strictEqual(f.h.get('x-content-type-options'), 'nosniff');
+      const etag = f.h.get('etag'); assert.ok(etag && etag.includes(psha));
+      assert.strictEqual((await getFile(up.j.id, viewer, { 'If-None-Match': etag })).s, 304);
+      assert.strictEqual((await getFile(up.j.id, '')).s, 401);
+      assert.strictEqual((await getFile(999999, qs)).s, 404);
+
+      // POST pages: roles, draft, validation (nothing changes on a refusal)
+      const pages = PDF_PAGES.map(p => ({ ...p }));
+      assert.strictEqual((await call('POST', `drawings/${up.j.id}/pages`, { pages }, viewer)).s, 403, 'viewer POST pages → 403');
+      const badPages = [
+        [{}, /pages/], [{ pages: [] }, /1 to 2000/], [{ pages, extra: 1 }, /unknown field/],
+        [{ pages: [{ ...pages[0], width: 0 }, pages[1]] }, /width/], [{ pages: [{ ...pages[0], height: 14401 }, pages[1]] }, /height/],
+        [{ pages: [{ ...pages[0], width: '595' }, pages[1]] }, /width/], [{ pages: [{ ...pages[0], rotation: 45 }, pages[1]] }, /rotation/],
+        [{ pages: [pages[0], { ...pages[1], page: 1 }] }, /exactly once/], [{ pages: [pages[0], { ...pages[1], page: 3 }] }, /exactly once/],
+        [{ pages: [{ ...pages[0], page: 1.5 }] }, /page/], [{ pages: [{ ...pages[0], note: 'x' }] }, /unknown field/],
+        [{ pages: Array.from({ length: 2001 }, (_, i) => ({ page: i + 1, width: 10, height: 10, rotation: 0 })) }, /1 to 2000/],
+      ];
+      for (const [b, re] of badPages) { const r = await call('POST', `drawings/${up.j.id}/pages`, b, qs); assert.strictEqual(r.s, 400, JSON.stringify(b).slice(0, 80)); assert.match(r.j.error, re); }
+      assert.deepStrictEqual(row(up.j.id), d, 'refusals change nothing');
+      assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE parent_id=?').get(up.j.id).n, 0);
+
+      // 2 pages (595×842 rot 0, 842×595 rot 90), sent in any order → 2 rows, ready
+      const pr = await call('POST', `drawings/${up.j.id}/pages`, { pages: [pages[1], pages[0]] }, qs);
+      assert.strictEqual(pr.s, 200, JSON.stringify(pr.j));
+      const all = db.prepare('SELECT * FROM drawings WHERE id=? OR parent_id=? ORDER BY page').all(up.j.id, up.j.id);
+      assert.strictEqual(all.length, 2);
+      assert.deepStrictEqual(all.map(x => [x.id === up.j.id, x.kind, x.status, x.page, x.page_w, x.page_h, x.rotation, x.parent_id, x.sha256, x.name, x.tender_id]), [
+        [true, 'pdf', 'ready', 1, 595, 842, 0, null, psha, 'Plans', T],
+        [false, 'pdf', 'ready', 2, 842, 595, 90, up.j.id, psha, 'Plans — p2', T]]);
+      assert.deepStrictEqual(pr.j.drawings.map(x => x.id), all.map(x => x.id), 'the reply lists the page rows');
+      const pa = db.prepare("SELECT detail FROM audit_log WHERE action='pages' AND entity_id=?").get(String(up.j.id));
+      assert.deepStrictEqual(JSON.parse(pa.detail), { pages: 2 });
+      // a second pages call → 409 (also on a page row)
+      assert.strictEqual((await call('POST', `drawings/${up.j.id}/pages`, { pages }, qs)).s, 409, 'second pages call → 409');
+      assert.strictEqual((await call('POST', `drawings/${all[1].id}/pages`, { pages: [pages[0]] }, qs)).s, 409, 'a page row → 409');
+      // a child page serves the shared file
+      f = await getFile(all[1].id, viewer);
+      assert.strictEqual(f.s, 200); assert.ok(f.b.equals(PDF)); assert.strictEqual(f.h.get('content-type'), 'application/pdf');
+
+      // a one-page registration only updates the row
+      {
+        const one = await upload(T, 'Single', PDF, qs);
+        assert.strictEqual(one.s, 202);
+        assert.strictEqual((await call('POST', `drawings/${one.j.id}/pages`, { pages: [{ page: 1, width: 420.5, height: 297.25, rotation: 270 }] }, qs)).s, 200);
+        const o = row(one.j.id);
+        assert.deepStrictEqual([o.status, o.page, o.page_w, o.page_h, o.rotation], ['ready', 1, 420.5, 297.25, 270]);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE parent_id=?').get(one.j.id).n, 0);
+      }
+
+      // images: PNG and JPEG by magic → one ready row with the pixel size; stored as <sha>.png / <sha>.jpg
+      const PNG = makePng(64, 48), JPG = jpegHeader(1200, 900);
+      for (const [buf, ext, type, w, h] of [[PNG, 'png', 'image/png', 64, 48], [JPG, 'jpg', 'image/jpeg', 1200, 900]]) {
+        const u = await upload(T, 'Photo ' + ext, buf, qs);
+        assert.strictEqual(u.s, 202, JSON.stringify(u.j));
+        const x = row(u.j.id);
+        assert.deepStrictEqual([x.kind, x.status, x.page, x.page_w, x.page_h, x.rotation, x.bytes], ['image', 'ready', 1, w, h, 0, buf.length]);
+        assert.ok(fs.existsSync(path.join(DDIR, sha256(buf) + '.' + ext)));
+        const g = await getFile(u.j.id, viewer);
+        assert.strictEqual(g.s, 200); assert.ok(g.b.equals(buf)); assert.strictEqual(g.h.get('content-type'), type);
+        assert.strictEqual((await call('POST', `drawings/${u.j.id}/pages`, { pages: [pages[0]] }, qs)).s, 400, 'pages apply to a PDF');
+        assert.strictEqual((await call('GET', `drawings/${u.j.id}/layers`, null, qs)).s, 400, 'no layers for an image');
+      }
+      const upAudit = db.prepare("SELECT detail FROM audit_log WHERE action='upload' ORDER BY id DESC LIMIT 1").get();
+      assert.strictEqual(JSON.parse(upAudit.detail).kind, 'image');
+
+      // wrong magic → 400, nothing stored: a name that says PDF/PNG/JPEG/DXF over other content; an image whose header is
+      // unreadable or too large
+      {
+        const n0 = nDrawings(), before = dirFiles();
+        for (const [name, body, re] of [
+          ['plan.pdf', Buffer.from(FIXTURE), /not a PDF/], ['photo.png', PDF, /not a PNG/], ['photo.JPG', PNG, /not a JPEG/], ['photo.jpeg', Buffer.from(FIXTURE), /not a JPEG/],
+          ['plan.dxf', PDF, /not a DXF/], ['broken', pngHeader(640, 480).subarray(0, 20), /not a PNG or JPEG image/],
+          ['broken jpeg', jpegHeader(1200, 900).subarray(0, 30), /not a PNG or JPEG image/], ['huge', pngHeader(30000, 100), /image too large \(max 20000 px per side\)/]]) {
+          const r = await upload(T, name, body, qs);
+          assert.strictEqual(r.s, 400, name + ': ' + JSON.stringify(r.j)); assert.match(r.j.error, re, name);
+        }
+        assert.strictEqual(nDrawings(), n0, 'no row'); assert.deepStrictEqual(dirFiles(), before, 'no file left');
+        // the right names are fine
+        assert.strictEqual((await upload(T, 'plan.pdf', PDF, qs)).s, 202); assert.strictEqual((await upload(T, 'photo.jpeg', JPG, qs)).s, 202);
+      }
+      // an image over 50 MB → 413 while streaming (a PDF may be up to 100 MB)
+      {
+        const big = Buffer.concat([PNG, Buffer.alloc(50 * 1024 * 1024 + 1 - PNG.length)]);
+        const r = await upload(T, 'big', big, qs);
+        assert.strictEqual(r.s, 413); assert.match(r.j.error, /50 MB/);
+        assert.ok(!dirFiles().some(x => x.startsWith('tmp-')), 'no temp file');
+      }
+
+      // the file of a missing stored file → 409, never a server path
+      {
+        const c = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,created) VALUES(?,'image','gone',?,1,'ready',1,'x')").run(T, 'b'.repeat(64)).lastInsertRowid;
+        const r = await call('GET', `drawings/${c}/file`, null, qs);
+        assert.strictEqual(r.s, 409); assert.ok(!r.j.error.includes(DDIR));
+        db.prepare('DELETE FROM drawings WHERE id=?').run(c);
+      }
+
+      // Rev clone: the page rows go along with parent_id remapped; tender delete removes them (the file stays)
+      {
+        const n = db.prepare('SELECT COUNT(*) n FROM drawings WHERE tender_id=?').get(T).n;
+        db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
+        // pages and file reads on a non-draft tender: writes 409, reads allowed
+        const late = await upload(T, 'late', PDF, qs); assert.strictEqual(late.s, 409);
+        const pend = db.prepare("SELECT id FROM drawings WHERE tender_id=? AND status='pages' LIMIT 1").get(T).id;
+        assert.strictEqual((await call('POST', `drawings/${pend}/pages`, { pages }, qs)).s, 409, 'approved → pages 409');
+        assert.strictEqual((await getFile(up.j.id, viewer)).s, 200);
+        const rv = await call('POST', `tenders/${T}/revise`, null, qs);
+        assert.strictEqual(rv.s, 200, JSON.stringify(rv.j));
+        const nd = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(rv.j.id), od = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(T);
+        assert.strictEqual(nd.length, n);
+        nd.forEach((x, i) => {
+          for (const k of ['kind', 'name', 'sha256', 'bytes', 'status', 'page', 'page_w', 'page_h', 'rotation']) assert.strictEqual(x[k], od[i][k], k);
+          assert.strictEqual(x.parent_id, od[i].parent_id === null ? null : nd[od.findIndex(o => o.id === od[i].parent_id)].id, 'parent_id remapped');
+        });
+        const child = nd.find(x => x.parent_id !== null);
+        assert.ok(child && nd.find(x => x.id === child.parent_id).tender_id === rv.j.id);
+        // the copied 'pages' row can register its pages in the draft Rev
+        const cp = nd.find(x => x.status === 'pages');
+        assert.strictEqual((await call('POST', `drawings/${cp.id}/pages`, { pages }, qs)).s, 200);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE parent_id=?').get(cp.id).n, 1);
+        const del = await call('DELETE', `tenders/${rv.j.id}`, null, qs);
+        assert.strictEqual(del.s, 200, JSON.stringify(del.j));
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE tender_id=?').get(rv.j.id).n, 0, 'page rows deleted');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE parent_id IS NOT NULL AND parent_id NOT IN (SELECT id FROM drawings)').get().n, 0, 'no orphan page rows');
+        assert.ok(fs.existsSync(path.join(DDIR, psha + '.pdf')), 'the shared file stays');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE tender_id=?').get(T).n, n, 'original unchanged');
+      }
+
+      // the vendored pdf.js is served as text/javascript
+      for (const fn of ['pdf.min.mjs', 'pdf.worker.min.mjs']) {
+        const r = await fetch(`http://localhost:${server.address().port}/vendor/pdfjs/${fn}`);
+        assert.strictEqual(r.status, 200); assert.match(r.headers.get('content-type'), /^text\/javascript/);
+        assert.ok(Buffer.from(await r.arrayBuffer()).equals(fs.readFileSync(path.join(__dirname, 'public', 'vendor', 'pdfjs', fn))));
+      }
+    }
+
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------
     {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-restart-'));

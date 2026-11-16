@@ -1,5 +1,7 @@
 // Drawings: raw DXF upload into a sha256 file store, parse in a worker thread into a gzipped JSON cache,
 // units confirmation and the per-layer table. Spec 5.1-5.2; plan Task 4.
+// PDF and image drawings (batch 3): stored as <sha256>.pdf / .png / .jpg, never parsed on the server; the browser reads a
+// PDF's pages with pdf.js and registers them (POST /drawings/:id/pages).
 // Files live in DATA_DIR/drawings as <sha256>.dxf, <sha256>.json.gz (full cache, for later batches) and
 // <sha256>.summary.json.gz (what the GET routes read) and <sha256>.render.bin.gz (the viewer's display file, lib/dxf/render.js),
 // never in the database.
@@ -7,9 +9,20 @@ const fs = require('fs'), fsp = require('fs/promises'), path = require('path'), 
 const { Worker } = require('worker_threads');
 const { UNIT_TO_M, normUom } = require('../lib/units');
 const { PARSER_VERSION } = require('../lib/dxf/summary.js');
+const { imageSize } = require('../lib/takeoff/imagesize.js');
 
 const MAX_QTY = 1e12;                          // the same cap as an imported or edited row qty (tenders.js MAX)
-const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit
+const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit (DXF and PDF)
+const MAX_IMAGE_BYTES = 50 * 1024 * 1024;      // PNG / JPEG
+const IMAGE_HEAD = 1024 * 1024;                // bytes kept while streaming for the image size (the whole file is read when its header is longer)
+// stored file type by magic bytes; anything else is taken as an ASCII DXF (as before batch 3)
+const MAGIC = [['pdf', Buffer.from('%PDF-', 'latin1')], ['png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], ['jpg', Buffer.from([0xff, 0xd8, 0xff])]];
+const sniff = head => (MAGIC.find(([, m]) => head.length >= m.length && head.subarray(0, m.length).equals(m)) || ['dxf'])[0];
+// a name ending in one of these says what the file is; content that does not match is refused
+const NAME_EXT = { pdf: 'pdf', png: 'png', jpg: 'jpg', jpeg: 'jpg', dxf: 'dxf' };
+const EXT_LABEL = { pdf: 'a PDF', png: 'a PNG image', jpg: 'a JPEG image', dxf: 'a DXF drawing' };
+const MIME = { dxf: 'application/dxf', pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg' };
+const MAX_PAGES = 2000, MAX_PAGE_PT = 14400;   // pages in one PDF; a page side in points (200 in)
 const BINARY = Buffer.from('AutoCAD Binary DXF', 'latin1');
 const BINARY_MSG = 'binary DXF is not supported — save as ASCII DXF';
 const PARSE_TIMEOUT_MS = 10 * 60e3;
@@ -36,6 +49,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // the PARSER_VERSION whose parse failed (status 'failed'); a newer parser tries the file once more (NULL: failed before
   // this column, so also tried once more)
   if (!db.prepare('PRAGMA table_info(drawings)').all().some(c => c.name === 'failed_version')) db.exec('ALTER TABLE drawings ADD COLUMN failed_version INTEGER');
+  // PDF / image (batch 3): the page number (NULL: a PDF whose pages are not registered yet), its size in page units (PDF
+  // points, image pixels), the PDF page /Rotate, and for pages 2..n the drawing row of page 1 (same file)
+  for (const [c, type] of [['page', 'INTEGER'], ['page_w', 'REAL'], ['page_h', 'REAL'], ['rotation', 'INTEGER'], ['parent_id', 'INTEGER']])
+    if (!db.prepare('PRAGMA table_info(drawings)').all().some(x => x.name === c)) db.exec(`ALTER TABLE drawings ADD COLUMN ${c} ${type}`);
   // 1 = saved with confirm_uom: the user accepted that qty_unit differs from the row's unit
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'uom_confirmed')) db.exec('ALTER TABLE measurements ADD COLUMN uom_confirmed INTEGER NOT NULL DEFAULT 0');
   // 1 = saved with confirm_incomplete: its layer had shapes with no area (area) or approximated curves
@@ -62,6 +79,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   for (const f of fs.readdirSync(DIR)) if (f.startsWith('tmp-')) { try { fs.unlinkSync(path.join(DIR, f)); } catch (e) { /* in use or gone */ } }
   const dxfFile = sha => path.join(DIR, sha + '.dxf'), cacheFile = sha => path.join(DIR, sha + '.json.gz'), summaryFile = sha => path.join(DIR, sha + '.summary.json.gz');
   const renderFile = sha => path.join(DIR, sha + '.render.bin.gz');
+  const storedFile = (sha, ext) => path.join(DIR, sha + '.' + ext);   // the uploaded file: ext dxf | pdf | png | jpg
+  // the stored file type of a drawing row (an image is .png or .jpg: the same content always has the same name)
+  const extOf = d => d.kind === 'pdf' ? 'pdf' : d.kind === 'image' ? (fs.existsSync(storedFile(d.sha256, 'png')) ? 'png' : 'jpg') : 'dxf';
   const tmpName = (ext = '') => path.join(DIR, 'tmp-' + crypto.randomBytes(12).toString('hex') + ext);
   // tmp -> dest. Content-addressed, so an existing dest is the same content: on Windows rename onto it can fail
   // (EPERM/EEXIST); then the tmp copy is dropped and the existing file kept.
@@ -101,14 +121,21 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // revise: copy the drawings rows (same sha256, no file copy) and the measurements with row ids remapped
   const cloneForTender = (oldTid, newTid, rowIdMap) => {
     const dmap = new Map(), parsing = [];
-    const insD = db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,rev,replaced_by,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)');
+    const insD = db.prepare(`INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,page,page_w,page_h,rotation,parent_id,rev,replaced_by,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,NULL,?,?)`);
     const olds = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(oldTid);
     for (const d of olds) {
-      const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.failed_version, d.rev, d.created, d.created_by).lastInsertRowid);
+      const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.failed_version, d.page, d.page_w, d.page_h, d.rotation,
+        d.rev, d.created, d.created_by).lastInsertRowid);
       dmap.set(d.id, nid);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
+    // a PDF page row keeps its page 1 row (never detached silently)
+    for (const d of olds) if (d.parent_id !== null) {
+      if (!dmap.has(d.parent_id)) bad(`drawing ${d.id}: its page 1 is not in this tender`, 409);
+      db.prepare('UPDATE drawings SET parent_id=? WHERE id=?').run(dmap.get(d.parent_id), dmap.get(d.id));
+    }
     const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,created,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) SELECT ?, handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
@@ -140,23 +167,30 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // deleted or stopped being a draft while the body arrived) and no other holder, parse or row is removed
   const holds = new Map();
   const hold = sha => holds.set(sha, (holds.get(sha) || 0) + 1);
-  function release(sha, used) {
+  function release(sha, used, ext = 'dxf') {
     const n = (holds.get(sha) || 1) - 1;
     if (n > 0) holds.set(sha, n); else holds.delete(sha);
     if (used || n > 0 || inflight.has(sha) || db.prepare('SELECT 1 FROM drawings WHERE sha256=? LIMIT 1').get(sha)) return;
-    try { fs.unlinkSync(dxfFile(sha)); } catch (e) { /* gone already */ }
+    try { fs.unlinkSync(storedFile(sha, ext)); } catch (e) { /* gone already */ }
   }
   const httpErr = (msg, status) => Object.assign(new Error(msg), { status });
-  function receive(req) {
+  // expect: the type the name says (NAME_EXT) or null. Resolves { sha, bytes, ext, size } (size: an image's pixels).
+  function receive(req, expect) {
     const tmp = tmpName();
     const out = fs.createWriteStream(tmp, { flags: 'wx' }), hash = crypto.createHash('sha256');
-    let bytes = 0, head = Buffer.alloc(0), done = false;
+    let bytes = 0, head = Buffer.alloc(0), done = false, ext = null, first = [], firstLen = 0;
     return new Promise((ok, no) => {
       const fail = err => {
         if (done) return; done = true;
         req.removeListener('data', onData); req.pause();
         out.destroy();
         out.once('close', () => fsp.unlink(tmp).catch(() => {}).then(() => no(err)));
+      };
+      // the type is known once the head is complete (or at the end of a shorter file); it must match the name
+      const typed = () => {
+        ext = sniff(head);
+        if (expect && expect !== ext) { fail(httpErr(`the file does not match its name: it is not ${EXT_LABEL[expect]}`, 400)); return false; }
+        return true;
       };
       const onData = chunk => {
         if (done) return;
@@ -165,7 +199,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
         if (head.length < BINARY.length) {
           head = Buffer.concat([head, chunk.subarray(0, BINARY.length - head.length)]);
           if (head.length === BINARY.length && head.equals(BINARY)) return fail(httpErr(BINARY_MSG, 400));
+          if (head.length === BINARY.length && !typed()) return;
         }
+        if ((ext === 'png' || ext === 'jpg') && bytes > MAX_IMAGE_BYTES) return fail(httpErr('the image is larger than 50 MB', 413));
+        if (ext !== 'dxf' && ext !== 'pdf' && firstLen < IMAGE_HEAD) { const c = chunk.subarray(0, IMAGE_HEAD - firstLen); first.push(c); firstLen += c.length; }
         hash.update(chunk);
         if (!out.write(chunk)) { req.pause(); out.once('drain', () => { if (!done) req.resume(); }); }
       };
@@ -173,6 +210,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       req.on('end', () => {
         if (done) return;
         if (bytes === 0) return fail(httpErr('the file is empty', 400));
+        if (ext === null && !typed()) return;
         out.end();
       });
       req.on('aborted', () => fail(httpErr('upload aborted', 400)));
@@ -182,11 +220,22 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       out.on('finish', async () => {
         if (done) return; done = true;
         const sha = hash.digest('hex');
+        let size = null;
+        if (ext === 'png' || ext === 'jpg') {
+          // the pixel size from the header; a header longer than the kept head (large metadata) is read from the file
+          try { size = imageSize(Buffer.concat(first)); }
+          catch (e) {
+            try {
+              if (e.message === 'not a PNG or JPEG image' && bytes > firstLen) size = imageSize(await fsp.readFile(tmp)); else throw e;
+            } catch (e2) { await fsp.unlink(tmp).catch(() => {}); return no(httpErr(e2.code ? 'could not read the upload (' + e2.code + ')' : e2.message, e2.code ? 500 : 400)); }
+          }
+        }
         hold(sha);   // released by upload(): until then no clean-up removes this file
         try {
           // same content -> same name: keep one copy
-          if (fs.existsSync(dxfFile(sha))) await fsp.unlink(tmp); else await place(tmp, dxfFile(sha));
-          ok({ sha, bytes });
+          const dest = storedFile(sha, ext);
+          if (fs.existsSync(dest)) await fsp.unlink(tmp); else await place(tmp, dest);
+          ok({ sha, bytes, ext, size });
         } catch (e) { release(sha, true); await fsp.unlink(tmp).catch(() => {}); no(httpErr('could not store the upload (' + (e.code || 'error') + ')', 500)); }
       });
     });
@@ -320,26 +369,87 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     if (!name) bad('name is required');
     if (name.length > 200) bad('name must be at most 200 characters');
     if (Number(req.headers['content-length']) > MAX_BYTES) bad('the drawing is larger than 100 MB', 413);
-    const got = await receive(req);
+    // a DXF, a PDF (status 'pages' until the browser registers them) or a PNG/JPEG image (one page, ready), by magic bytes
+    const got = await receive(req, NAME_EXT[(/\.([a-z]+)$/i.exec(name) || [])[1]?.toLowerCase()] || null);
     let used = false;
     try {
       // the tender can be deleted or change status while the body arrives
       const stillDraft = () => { const cur = tenderRow(t.id); if (!cur) bad('tender not found', 404); mustDraft(cur); };
       stillDraft();
+      const kind = got.ext === 'dxf' ? 'dxf' : got.ext === 'pdf' ? 'pdf' : 'image';
       // the same file already parsed (and not being parsed again) -> reuse its cache, ready at once
-      const prev = !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && await summaryCurrent(got.sha)
+      const prev = kind === 'dxf' && !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && await summaryCurrent(got.sha)
         ? db.prepare("SELECT suggested_units FROM drawings WHERE sha256=? AND status='ready' ORDER BY id DESC LIMIT 1").get(got.sha) : null;
+      const status = kind === 'pdf' ? 'pages' : kind === 'image' || prev ? 'ready' : 'parsing';
+      const img = kind === 'image' ? got.size : null;
       const id = tx(() => {
         stillDraft();
-        const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,rev,created,created_by) VALUES(?,?,?,?,?,?,?,1,?,?)')
-          .run(t.id, 'dxf', name, got.sha, got.bytes, prev ? prev.suggested_units : null, prev ? 'ready' : 'parsing', new Date().toISOString(), me.username).lastInsertRowid);
-        audit(me, 'upload', 'drawings', did, { name, bytes: got.bytes, sha256: got.sha });
+        const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,page,page_w,page_h,rotation,rev,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?)')
+          .run(t.id, kind, name, got.sha, got.bytes, prev ? prev.suggested_units : null, status, img ? 1 : null, img ? img.width : null, img ? img.height : null, img ? 0 : null,
+            new Date().toISOString(), me.username).lastInsertRowid);
+        audit(me, 'upload', 'drawings', did, { name, bytes: got.bytes, sha256: got.sha, ...(kind !== 'dxf' ? { kind } : {}), ...(img ? { width: img.width, height: img.height } : {}) });
         return did;
       });
       used = true;
-      if (!prev) startParse(id, got.sha);
+      if (status === 'parsing') startParse(id, got.sha);
       return reply(res, 202, { id });
-    } finally { release(got.sha, used); }
+    } finally { release(got.sha, used, got.ext); }
+  }
+
+  // POST /drawings/:id/pages { pages: [{ page, width, height, rotation }] }: what pdf.js read in the browser (the server
+  // cannot read a PDF, so it checks the values only). Once, on a PDF row in status 'pages': page 1 is this row, pages 2..n
+  // new rows on the same file (parent_id = this row). All end 'ready'.
+  async function registerPages(req, res, d, t, me) {
+    need(me, 'admin', 'qs'); mustDraft(t);
+    if (d.kind !== 'pdf') bad('pages apply to a PDF drawing');
+    const b = await ctx.readBody(req);
+    for (const k of Object.keys(b)) if (k !== 'pages') bad('unknown field: ' + k);
+    if (!Array.isArray(b.pages) || b.pages.length < 1 || b.pages.length > MAX_PAGES) bad(`pages must be a list of 1 to ${MAX_PAGES} pages`);
+    const n = b.pages.length, seen = new Set();
+    const size = (p, k) => { if (!finNum(p[k]) || !(p[k] > 0) || p[k] > MAX_PAGE_PT) bad(`page ${k} must be a number > 0 and ≤ ${MAX_PAGE_PT} (points)`); return p[k]; };
+    const pages = b.pages.map(p => {
+      if (!p || typeof p !== 'object' || Array.isArray(p)) bad('each page must be { page, width, height, rotation }');
+      for (const k of Object.keys(p)) if (!['page', 'width', 'height', 'rotation'].includes(k)) bad('unknown field in a page: ' + k);
+      if (!Number.isInteger(p.page)) bad('page must be a page number');
+      if (p.page < 1 || p.page > n || seen.has(p.page)) bad(`pages 1 to ${n} must each be listed exactly once`);
+      seen.add(p.page);
+      if (![0, 90, 180, 270].includes(p.rotation)) bad('page rotation must be 0, 90, 180 or 270');
+      return { page: p.page, width: size(p, 'width'), height: size(p, 'height'), rotation: p.rotation };
+    }).sort((a, c) => a.page - c.page);
+    const ids = tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = drawingRow(d.id);
+      if (!cur || cur.status !== 'pages') bad('the pages of this drawing are already registered', 409);
+      const [p1] = pages, now = new Date().toISOString();
+      db.prepare("UPDATE drawings SET status='ready', page=?, page_w=?, page_h=?, rotation=? WHERE id=? AND status='pages'").run(p1.page, p1.width, p1.height, p1.rotation, cur.id);
+      const ins = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,page_w,page_h,rotation,parent_id,rev,created,created_by) VALUES(?,'pdf',?,?,?,'ready',?,?,?,?,?,?,?,?)");
+      const out = [cur.id];
+      for (const p of pages.slice(1))
+        out.push(Number(ins.run(cur.tender_id, `${cur.name} — p${p.page}`, cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, cur.id, cur.rev, now, me.username).lastInsertRowid));
+      audit(me, 'pages', 'drawings', cur.id, { pages: n });
+      return out;
+    });
+    return reply(res, 200, { drawings: ids.map(drawingRow) });
+  }
+
+  // GET /drawings/:id/file: the uploaded bytes as they are (a page row: the shared file). Any reader. no-cache + ETag (the
+  // content never changes for a sha256, the browser asks every time and gets 304).
+  async function serveFile(req, res, d, me) {
+    need(me, 'admin', 'qs', 'viewer');
+    const ext = extOf(d), etag = `"${d.sha256}"`;
+    let fh;
+    try { fh = await fsp.open(storedFile(d.sha256, ext), 'r'); } catch (e) { bad('the stored drawing file is missing: upload the drawing again', 409); }
+    const tags = String(req.headers['if-none-match'] || '').split(',').map(x => x.trim().replace(/^W\//, ''));
+    const head = { ETag: etag, 'Cache-Control': 'private, no-cache', 'X-Content-Type-Options': 'nosniff' };
+    if (tags.includes(etag) || tags.includes('*')) { await fh.close().catch(() => {}); res.writeHead(304, head); res.end(); return true; }
+    let size;
+    try { size = (await fh.stat()).size; } catch (e) { await fh.close().catch(() => {}); throw e; }
+    res.writeHead(200, { 'Content-Type': MIME[ext], 'Content-Length': size, ...head });
+    const rs = fh.createReadStream();   // closes the file when done
+    rs.on('error', () => res.destroy());
+    res.on('close', () => rs.destroy());
+    rs.pipe(res);
+    return true;
   }
 
   // a drawing that failed under another parser version: parse it again, once (this version's failure, if any, sticks).
@@ -362,20 +472,24 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const t = tenderRow(d.tender_id);
     if (!t) bad('drawing not found', 404);
     if (method === 'GET') d = retryFailed(d);
+    // the DXF parse results (layers, display file, units, DXF measurements) do not apply to a PDF or an image
+    const dxfOnly = () => { if (d.kind !== 'dxf') bad('this applies to DXF drawings only'); };
     if (sub === undefined && parts.length === 2 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer');
-      const c = d.status === 'ready' ? await readSummary(d.sha256) : null;
+      const c = d.kind === 'dxf' && d.status === 'ready' ? await readSummary(d.sha256) : null;
       return reply(res, 200, { ...d, header: c && c.header, ignored: c && c.ignored, warnings: c && c.warnings });
     }
     if (sub === 'layers' && parts.length === 3 && method === 'GET') {
-      need(me, 'admin', 'qs', 'viewer');
+      need(me, 'admin', 'qs', 'viewer'); dxfOnly();
       if (d.status !== 'ready') bad(`drawing is ${d.status}: no layers yet`, 409);
       const c = await readSummary(d.sha256), lt = scaledTable(c.raw, d.units);
       return reply(res, 200, { units: d.units, units_confirmed: d.units !== null, layers: lt.layers, warnings: [...c.warnings, ...lt.warnings] });
     }
-    if (sub === 'render' && parts.length === 3 && method === 'GET') return serveRender(req, res, d, me);
+    if (sub === 'render' && parts.length === 3 && method === 'GET') { need(me, 'admin', 'qs', 'viewer'); dxfOnly(); return serveRender(req, res, d, me); }
+    if (sub === 'file' && parts.length === 3 && method === 'GET') return serveFile(req, res, d, me);
+    if (sub === 'pages' && parts.length === 3 && method === 'POST') return registerPages(req, res, d, t, me);
     if (sub === 'units' && parts.length === 3 && method === 'PUT') {
-      need(me, 'admin', 'qs'); mustDraft(t);
+      need(me, 'admin', 'qs'); mustDraft(t); dxfOnly();
       const b = await ctx.readBody(req);
       for (const k of Object.keys(b)) if (k !== 'units') bad('unknown field: ' + k);
       if (!hasUnit(b.units)) bad('units must be one of ' + Object.keys(UNIT_TO_M).join(', '));
@@ -558,6 +672,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   async function createMeasurement(req, res, d, t, me) {
     need(me, 'admin', 'qs'); mustDraft(t);
     const m = cleanMeasure(await ctx.readBody(req));
+    if (d.kind !== 'dxf') bad('the DXF tools apply to DXF drawings only');
     if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to measure yet`, 409);
     if (d.units === null) bad('confirm the drawing units first', 409);
     if (m.tool === 'dxf_selection') return createSelection(res, d, t, me, m);
