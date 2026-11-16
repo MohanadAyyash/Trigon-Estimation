@@ -32,6 +32,16 @@ netsh advfirewall firewall add rule name="Trigon Estimation 3100" dir=in action=
 ### التطبيق لا يكتب أبداً في الـ ERP
 يفتح التطبيق قاعدة بيانات الـ ERP بوضع القراءة فقط، ويأخذ منها مجاميع فقط (متوسط أجر كل مهنة وعدد العاملين) دون أسماء أو أرقام هوية أو رواتب فردية. المهن التي يقل عدد عامليها عن 3 لا تظهر أجورها لمهندس الكميات.
 
+### المخططات والقياس (Take-off)
+- **الرفع:** من تبويب «المخططات» في المناقصة ارفع ملف DXF نصي (ASCII) حتى 100 MB. الـ DXF الثنائي يُرفض: احفظه من AutoCAD كـ ASCII DXF. يُقرأ الملف في الخلفية؛ الملف نفسه المرفوع مرة ثانية يُستعمل فوراً.
+- **الوحدات:** لا تظهر أي كمية قبل تأكيد وحدة المخطط (مم، سم، م، كم، قدم، إنش). الوحدة المقترحة من الملف تظهر مختارة مسبقاً؛ تأكد منها ثم اضغط «تأكيد الوحدات». لا تتغير الوحدة بعد وجود قياسات.
+- **جدول الطبقات:** لكل طبقة طول الخطوط المفتوحة، ومحيط الأشكال المغلقة، والمساحة، وعدد البلوكات (المستوى الأعلى / المتداخلة)، مع تنبيهات: أشكال خارج المساحة، منحنيات تقريبية، أشكال غير مقيسة، تكرار محتمل.
+- **الربط:** زر «ربط…» بجانب الرقم يربطه ببند BOQ، مع عرض أو عمق أو معامل عند الحاجة. وحدة البند يجب أن توافق وحدة القياس (م، م²، م³، عدد).
+- **العارض:** «فتح العارض» يعرض المخطط: العجلة للتكبير، السحب بالزر الأوسط أو الأيمن للتحريك، وإظهار الطبقات وإخفاؤها (لا يغيّر الكميات).
+- **التحديد:** نقر، أو «نافذة» (العناصر داخل المستطيل كاملة)، أو «تقاطع» (ما يلمسه المستطيل). المجموع المعروض **معاينة فقط**؛ الكمية المحفوظة يحسبها الخادم من الملف الأصلي. عدد البلوكات يكون **بالاسم وفي المستوى الأعلى**؛ البلوكات المتداخلة تظهر منفصلة ولا تُعدّ إلا باختيار «تضمين البلوكات المتداخلة». «عرض» في قائمة القياسات يُظهر عناصر قياس محفوظ.
+- **التأكيدات:** يطلب التطبيق تأكيداً صريحاً (ويسجّله) قبل حفظ: كمية ناقصة، تكرار محتمل، جزء مقيس من قبل على نفس البند، عدّ أكثر من بلوك معاً، أو وحدة بند غير معروفة.
+- **النسخ الاحتياطي:** ملفات المخططات في `data\drawings` وتُنسخ يومياً إلى `data\backups\drawings` (انظر «النسخ الاحتياطي» أدناه).
+
 ### النسخ الاحتياطي
 كل بيانات التطبيق في مجلد `data`: الملف `data\estimation.db` والمجلد `data\drawings` (ملفات المخططات المرفوعة). انسخهما **معاً** دائماً: القياسات في قاعدة البيانات تعتمد على ملفات المخططات. عند كل تشغيل لـ `Estimation-Start.bat` تؤخذ نسخة من قاعدة البيانات إلى `data\backups\estimation-YYYYMMDD.db` إن لم تكن نسخة اليوم موجودة (أي نسخة واحدة يومياً عند التشغيل، لا نسخة كل يوم إن لم يُشغَّل التطبيق)، ويحتفظ بآخر 14 نسخة. وتُنسخ ملفات المخططات تلقائياً أيضاً إلى `data\backups\drawings` (الملفات الناقصة فقط، ولا يُحذف منها شيء). **الاستعادة:** أوقف التطبيق (أغلق نافذة الأوامر)؛ احذف الملفين `data\estimation.db-wal` و`data\estimation.db-shm` إن وُجدا (وإلا قد تُعاد عليها تغييرات قديمة من قاعدة البيانات السابقة)؛ انسخ `data\backups\estimation-YYYYMMDD.db` المطلوبة إلى `data\estimation.db` (بعد تغيير اسمها إلى `estimation.db`)؛ انسخ محتويات `data\backups\drawings\*` إلى `data\drawings`؛ ثم شغّل التطبيق. أي ملخص مفقود لمخطط يُبنى من جديد تلقائياً من ملف DXF المحفوظ دون إعادة رفعه. إذا فشل النسخ تظهر رسالة تحذير في نافذة الأوامر ويُسجَّل السبب في `data\backups\backup-errors.log`؛ راجع هذا الملف من وقت لآخر. انسخ مجلد `data` بانتظام إلى قرص أو جهاز آخر.
 
@@ -71,6 +81,16 @@ Do not open the port on Public networks. The office network must be set to **Pri
 
 ### The app never writes to the ERP
 The ERP database is opened read-only and only aggregates are taken from it (average rate and headcount per trade), never names, ID numbers or individual salaries. A trade with fewer than 3 people never shows its own rate to the QS.
+
+### Drawings & take-off
+- **Upload:** in a tender's Drawings tab, upload an ASCII DXF of up to 100 MB. A binary DXF is refused: save it from AutoCAD as ASCII DXF. The file is read in the background; the same file uploaded again is ready at once.
+- **Units:** no quantity is shown before the drawing's unit is confirmed (mm, cm, m, km, ft, in). The unit suggested by the file is pre-selected; check it and press Confirm units. The unit cannot change once something is measured.
+- **Layer table:** per layer, the open length, the perimeter of closed shapes, the area and the block counts (top level / nested), with notes: shapes left out of the area, approximated curves, shapes not measured, possible duplicates.
+- **Linking:** the Link… button next to a number links it to a BOQ row, with a width, depth or factor when needed. The row unit must match the measured unit (m, m2, m3, nr).
+- **Viewer:** Open viewer shows the drawing: wheel to zoom, middle or right drag to pan, layers on and off (this never changes a quantity).
+- **Selection:** click, Window (entities fully inside the box) or Crossing (anything the box touches). The total shown is a **preview only**; the saved quantity is computed by the server from the original file. Blocks are counted **by name at the top level**; nested blocks are shown apart and counted only when "Include nested inserts" is ticked. Show in the measurement list highlights a saved selection.
+- **Confirmations:** the app asks for an explicit (and audited) confirmation before it saves an incomplete quantity, possible duplicates, something already measured on the same row, a count of several different blocks, or a row whose unit it does not recognise.
+- **Backup:** the drawing files live in `data\drawings` and are copied daily to `data\backups\drawings` (see Backups below).
 
 ### Backups
 All app data lives in the `data` folder: `data\estimation.db` and `data\drawings` (the uploaded drawings). Always back them up **together**: the measurements in the database depend on the drawing files. Each time `Estimation-Start.bat` starts the app it copies the database to `data\backups\estimation-YYYYMMDD.db` unless today's copy already exists (so: at most one copy per day, taken at start — no copy on a day the app is not started), and keeps the last 14. The drawing files are copied automatically too, to `data\backups\drawings` (only files not already there; nothing in that folder is ever deleted). **Restore:** stop the app (close the command window); delete `data\estimation.db-wal` and `data\estimation.db-shm` if they are there (otherwise old changes of the previous database can be replayed onto the restored one); copy the chosen `data\backups\estimation-YYYYMMDD.db` to `data\estimation.db` (renaming it to `estimation.db`); copy `data\backups\drawings\*` into `data\drawings`; then start the app. A drawing whose parsed summary is missing is rebuilt automatically from its stored DXF, with no re-upload. If a backup fails, the command window shows a warning and the reason is written to `data\backups\backup-errors.log`; check that file now and then. Copy the `data` folder regularly to another disk or PC.
