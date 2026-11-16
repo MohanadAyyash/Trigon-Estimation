@@ -185,11 +185,14 @@ async function api(req, res, url) {
 // ---- static files -------------------------------------------------------------
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8' };
 const PUB = path.join(__dirname, 'public');
+// server code the browser also runs, served from its one source file (never copied under public/): the manual take-off
+// formulas (UMD) behind the measuring tools' preview
+const SHARED = { '/lib/takeoff/manual.js': path.join(__dirname, 'lib', 'takeoff', 'manual.js') };
 function serveStatic(req, res, url) {
   let rel; try { rel = decodeURIComponent(url.pathname); } catch (e) { return send(res, 400, 'bad request'); }
   if (rel === '/') rel = '/index.html';
-  const file = path.join(PUB, rel);
-  if (file !== PUB && !file.startsWith(PUB + path.sep)) return send(res, 403, 'forbidden');
+  const file = Object.hasOwn(SHARED, rel) ? SHARED[rel] : path.join(PUB, rel);
+  if (!Object.hasOwn(SHARED, rel) && file !== PUB && !file.startsWith(PUB + path.sep)) return send(res, 403, 'forbidden');
   fs.readFile(file, (err, buf) => err ? send(res, 404, 'not found') : send(res, 200, buf, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' }));
 }
 

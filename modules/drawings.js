@@ -11,6 +11,7 @@ const { UNIT_TO_M, normUom } = require('../lib/units');
 const { PARSER_VERSION } = require('../lib/dxf/summary.js');
 const { imageSize } = require('../lib/takeoff/imagesize.js');
 const calib = require('../lib/takeoff/calib.js');
+const manual = require('../lib/takeoff/manual.js');
 
 const MAX_QTY = 1e12;                          // the same cap as an imported or edited row qty (tenders.js MAX)
 const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit (DXF and PDF)
@@ -77,8 +78,13 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   p2x REAL NOT NULL, p2y REAL NOT NULL, real REAL NOT NULL, unit TEXT NOT NULL, scale REAL NOT NULL, verify_pct REAL, created TEXT, created_by TEXT);
 CREATE INDEX IF NOT EXISTS calibrations_drawing ON calibrations(drawing_id);
 CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) WHERE region IS NULL;`);
-  // the calibration a manual measurement on a PDF page or an image was computed with (written by Task 4's manual tool)
+  // the calibration a manual measurement on a PDF page or an image was computed with (NULL on a DXF: its units)
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'calibration_id')) db.exec('ALTER TABLE measurements ADD COLUMN calibration_id INTEGER');
+  // tool 'manual' (lib/takeoff/manual.js): geom = the shape drawn, JSON { tool: line|polyline|area|rect|count, … } in
+  // drawing units (DXF) or page units (PDF points, image pixels); metric = length|area|perimeter|count; deduct = 1: a
+  // deduction (its qty is negative). NULL / 0 for the DXF tools.
+  for (const [c, type] of [['geom', 'TEXT'], ['deduct', 'INTEGER NOT NULL DEFAULT 0']])
+    if (!db.prepare('PRAGMA table_info(measurements)').all().some(x => x.name === c)) db.exec(`ALTER TABLE measurements ADD COLUMN ${c} ${type}`);
   // dxf_selection: the handles of the entities that made its qty (written, copied and deleted with the measurement)
   db.exec('CREATE TABLE IF NOT EXISTS measurement_handles(measurement_id INTEGER NOT NULL, handle TEXT NOT NULL, PRIMARY KEY(measurement_id, handle))');
   // the entity's geomKey: an exact copy measured by another selection on the same row needs confirm_duplicate
@@ -128,7 +134,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     for (const id of rowIds) n += Number(st.run(id).changes);
     return n;
   };
-  // revise: copy the drawings rows (same sha256, no file copy) and the measurements with row ids remapped
+  // revise: copy the drawings rows (same sha256, no file copy), their calibrations and the measurements with drawing,
+  // row and calibration ids remapped
   const cloneForTender = (oldTid, newTid, rowIdMap) => {
     const dmap = new Map(), parsing = [];
     const insD = db.prepare(`INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,page,page_w,page_h,rotation,parent_id,rev,replaced_by,created,created_by)
@@ -146,22 +153,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (!dmap.has(d.parent_id)) bad(`drawing ${d.id}: its page 1 is not in this tender`, 409);
       db.prepare('UPDATE drawings SET parent_id=? WHERE id=?').run(dmap.get(d.parent_id), dmap.get(d.id));
     }
-    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,created,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    // calibrations in id order, so the lower-id rule between regions sharing an edge picks the same one in the copy
+    const cmap = new Map();
+    const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+    for (const c of db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? ORDER BY c.id').all(oldTid))
+      cmap.set(c.id, Number(insC.run(dmap.get(c.drawing_id), c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.verify_pct, c.created, c.created_by).lastInsertRowid));
+    const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,geom,deduct,calibration_id,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) SELECT ?, handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
     let n = 0;
     for (const m of db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(oldTid)) {
       // never drop or detach a measurement silently: a broken link stops the revision
       if (!dmap.has(m.drawing_id)) bad(`measurement ${m.id}: its drawing is not in this tender`, 409);
       if (m.row_id !== null && !rowIdMap.has(m.row_id)) bad(`measurement ${m.id}: its row is not in this tender`, 409);
+      if (m.calibration_id !== null && !cmap.has(m.calibration_id)) bad(`measurement ${m.id}: its calibration is not in this tender`, 409);
       const nid = Number(insM.run(dmap.get(m.drawing_id), newTid, m.row_id === null ? null : rowIdMap.get(m.row_id), m.tool, m.layer, m.block, m.metric, m.nested, m.width, m.depth, m.factor, m.label, m.color,
-        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.mixed, m.base, m.selection_summary, m.created, m.created_by).lastInsertRowid);
+        m.qty, m.qty_unit, m.handles_count, m.review_needed, m.uom_confirmed, m.incomplete, m.duplicate, m.mixed, m.base, m.selection_summary,
+        m.geom, m.deduct, m.calibration_id === null ? null : cmap.get(m.calibration_id), m.created, m.created_by).lastInsertRowid);
       if (m.tool === 'dxf_selection') insH.run(nid, m.id);
       n++;
     }
     // a copy taken while its file was still parsing gets its own result once the caller's transaction is over
     if (parsing.length) setTimeout(() => { for (const [id, sha] of parsing) { const d = drawingRow(id); if (d && d.sha256 === sha && d.status === 'parsing') startParse(id, sha); } }, 0);
-    return { drawings: dmap.size, measurements: n };
+    return { drawings: dmap.size, measurements: n, calibrations: cmap.size };
   };
   // delete a draft tender: its drawings and measurements rows go too (files stay: they are shared by sha256)
   const deleteForTender = tid => ({
@@ -460,23 +474,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const calibrationsOf = drawingId => db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY region IS NOT NULL, id').all(drawingId).map(calView);
   // how many measurements were computed with this calibration (they stop its deletion)
   const calibrationUsers = calId => db.prepare('SELECT COUNT(*) n FROM measurements WHERE calibration_id=?').get(calId).n;
-  // HOOK for Task 4 (manual measurements). The measurements whose qty changes when `next` ({ region, scale }: the
+  // The manual measurements of this drawing whose qty or calibration changes when `next` ({ region, scale }: the
   // calibration about to be stored) replaces `replaced` (the stored calibration row, or null when `next` is new), each
   // with the qty and base it would get: [{ measurement_id, row_id, old_qty, new_qty, base }]. Runs inside the tx.
-  // Today it lists the measurements saved with the replaced calibration (calibration_id). No tool writes calibration_id
-  // before Task 4, so the list is empty and a re-calibration is a plain replace. Task 4 fills in manualRescale and also
-  // lists, for a new region, the measurements of this page whose first point falls in it (they move from the page
-  // calibration to the region's).
+  // - saved with the replaced calibration: listed when their qty changes (a count never does);
+  // - any other: listed when its first point would resolve to `next` (a new region over measurements that used the page
+  //   calibration). The apply path sets calibration_id to the stored calibration's id for every one listed.
   function calibrationChanges(d, replaced, next) {
-    if (!replaced) return [];
-    return db.prepare('SELECT * FROM measurements WHERE calibration_id=? ORDER BY id').all(replaced.id).map(m => {
-      const q = manualRescale(m, next);
-      return { measurement_id: m.id, row_id: m.row_id, old_qty: m.qty, new_qty: q.qty, base: q.base };
-    });
+    const nextCal = { id: replaced ? replaced.id : Infinity, region: next.region, scale: next.scale };   // a new one: the highest id
+    const cals = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(d.id);
+    const after = replaced ? cals.map(c => c.id === replaced.id ? nextCal : c) : [...cals, nextCal];
+    const out = [];
+    for (const m of db.prepare("SELECT * FROM measurements WHERE drawing_id=? AND (tool='manual' OR calibration_id IS NOT NULL) ORDER BY id").all(d.id)) {
+      const kept = replaced !== null && m.calibration_id === replaced.id;
+      if (!kept) {
+        let fp = null;
+        try { fp = calib.checkPoint(manual.firstPoint(parseGeom(m.geom))); } catch (e) { /* unreadable: refused below */ }
+        if (fp === null) cannotRescale(m);
+        if (calib.calibrationFor(after, fp) !== nextCal) continue;
+      }
+      const q = manualRescale(m, nextCal);
+      if (kept && q.qty === m.qty && q.base === m.base) continue;
+      out.push({ measurement_id: m.id, row_id: m.row_id, old_qty: m.qty, new_qty: q.qty, base: q.base });
+    }
+    return out;
   }
-  // HOOK for Task 4: { qty, base } of a manual measurement under the calibration `cal` (lib/takeoff/manual.js manualQty
-  // on its stored geometry). Until then nothing can be recomputed, so nothing is ever changed.
-  const manualRescale = m => bad(`measurement ${m.id} cannot be recomputed with another calibration`, 409);
+  const cannotRescale = m => bad(`measurement ${m.id} cannot be recomputed with another calibration`, 409);
+  // { qty, base } of a stored manual measurement under the calibration `cal`: manualQty on its stored geometry with its
+  // own width/depth/factor/deduct. Anything that cannot be recomputed exactly the same way stops the change (409).
+  function manualRescale(m, cal) {
+    const g = m.tool === 'manual' ? parseGeom(m.geom) : null;
+    if (!g) cannotRescale(m);
+    let q;
+    try { q = manual.manualQty(g, manualOpts(g, m, cal.scale)); } catch (e) { cannotRescale(m); }
+    if (q.qty_unit !== m.qty_unit || !(Math.abs(q.qty) <= MAX_QTY)) cannotRescale(m);
+    return { qty: q.qty, base: q.base };
+  }
   const CAL_FIELDS = ['region', 'p1', 'p2', 'real', 'unit', 'apply'];
   // the calibration routes apply to a PDF page or an image (a DXF has confirmed units instead)
   const rasterOnly = d => { if (d.kind !== 'pdf' && d.kind !== 'image') bad('calibration applies to PDF and image drawings only'); };
@@ -485,7 +518,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (!c) bad('calibration not found', 404);
     return c;
   };
-  // a pure-function refusal (lib/takeoff/calib.js) is a 400 with its message
+  // R12: a point of a PDF page (unrotated user space, points) or an image (pixels) lies within [−w, 2w] × [−h, 2h];
+  // anything further out was taken in another coordinate space. named: [[name, [x, y]], …] (already finite).
+  const onPage = (d, named) => {
+    if (d.kind !== 'pdf' && d.kind !== 'image') return;
+    const w = d.page_w, h = d.page_h;
+    if (!(w > 0) || !(h > 0)) bad('the page size of this drawing is not known yet', 409);
+    for (const [name, p] of named)
+      if (!(p[0] >= -w && p[0] <= 2 * w && p[1] >= -h && p[1] <= 2 * h)) bad(`${name} is outside the page (${w} × ${h}): points must lie within −1 to 2 page widths and heights`);
+  };
+  // a pure-function refusal (lib/takeoff/calib.js, lib/takeoff/manual.js) is a 400 with its message
   const calc = fn => { try { return fn(); } catch (e) { if (e.status) throw e; bad(e.message); } };
 
   async function calibrationApi(req, res, parts, d, t, me) {
@@ -500,6 +542,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       const c = calibOf(d, parts[3]), b = await ctx.readBody(req);
       for (const k of Object.keys(b)) if (!['p1', 'p2', 'real', 'unit'].includes(k)) bad('unknown field: ' + k);
       const pct = calc(() => calib.verifyPct(c, b.p1, b.p2, b.real, b.unit)), warning = Math.abs(pct) > 1;
+      onPage(d, [['p1', b.p1], ['p2', b.p2]]);
       tx(() => {
         mustDraft(tenderRow(t.id));
         if (!db.prepare('UPDATE calibrations SET verify_pct=? WHERE id=? AND scale=?').run(pct, c.id, c.scale).changes) bad('the calibration changed: verify again', 409);
@@ -536,6 +579,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     const region = b.region === undefined || b.region === null ? null : calc(() => calib.normRect(b.region));
     const scale = calc(() => calib.scaleOf(b.p1, b.p2, b.real, b.unit));
     if (!(scale > 0) || !Number.isFinite(scale)) bad('the calibration gives no usable scale');
+    onPage(d, [['p1', b.p1], ['p2', b.p2], ...(region === null ? [] : [['region', [region[0], region[1]]], ['region', [region[2], region[3]]]])]);
     const regionText = region === null ? null : JSON.stringify(region);
     const out = tx(() => {
       mustDraft(tenderRow(t.id));
@@ -700,7 +744,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   function cleanMeasure(b) {
     for (const k of Object.keys(b)) if (!MFIELDS.includes(k)) bad('unknown field: ' + k);
     const m = { row_id: rowIdOf(b.row_id), tool: b.tool, metric: b.metric };
-    if (!['dxf_layer', 'dxf_blocks', 'dxf_selection'].includes(m.tool)) bad('tool must be dxf_layer, dxf_blocks or dxf_selection');
+    if (!['dxf_layer', 'dxf_blocks', 'dxf_selection'].includes(m.tool)) bad('tool must be manual, dxf_layer, dxf_blocks or dxf_selection');
     if (m.tool === 'dxf_selection') {
       if (b.layer !== undefined || b.block !== undefined) bad('layer and block do not apply to a selection');
       if (!SELECTION_METRICS.includes(m.metric)) bad('metric must be one of ' + SELECTION_METRICS.join(', '));
@@ -736,11 +780,138 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     m.confirm_duplicate = optBool(b, 'confirm_duplicate'); m.confirm_mixed_blocks = optBool(b, 'confirm_mixed_blocks');
     return m;
   }
-  // a selection's audit summary: counts only, never its handles
-  const summaryOf = m => m.tool === 'dxf_selection'
+  // a selection's audit summary: counts only, never its handles; a manual one: its shape and point count, never coordinates
+  const summaryOf = m => m.tool === 'manual' ? manualSummary(m) : m.tool === 'dxf_selection'
     ? { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, metric: m.metric, ...(m.metric === 'count' ? { nested: !!m.nested } : {}), used: m.handles_count, qty: m.qty, qty_unit: m.qty_unit }
     : { drawing_id: m.drawing_id, row_id: m.row_id, tool: m.tool, layer: m.layer, ...(m.tool === 'dxf_blocks' ? { block: m.block, nested: !!m.nested } : {}), metric: m.metric, qty: m.qty, qty_unit: m.qty_unit };
   const parseSummary = s => { try { return s ? JSON.parse(s) : null; } catch (e) { return null; } };
+
+  // ---- manual measurements (lib/takeoff/manual.js): shapes drawn on a DXF, a PDF page or an image -----------------
+  // qty = manualQty(geom, { scale, width, depth, factor, deduct, metric }) — the one formula, also the browser preview's.
+  // scale: UNIT_TO_M[confirmed units] (DXF) or the calibration of the region containing the first point, else the
+  // page's (PDF/image); the calibration used is stored (calibration_id) so a re-calibration lists what it changes.
+  const MANUAL_FIELDS = ['tool', 'geom', 'row_id', 'width', 'depth', 'factor', 'deduct', 'metric', 'label', 'color', 'confirm_uom', 'confirm_overlap'];
+  const MANUAL_EDIT = ['row_id', 'width', 'depth', 'factor', 'deduct', 'label'];
+  const parseGeom = s => { try { const g = typeof s === 'string' ? JSON.parse(s) : null; return g && typeof g === 'object' && !Array.isArray(g) ? g : null; } catch (e) { return null; } };
+  const isClosed = g => g.tool === 'area' || g.tool === 'rect';
+  // manualQty options of a measurement (stored row or cleaned request) at a scale
+  const manualOpts = (g, m, scale) => ({ scale, width: m.width, depth: m.depth, factor: m.factor, deduct: m.deduct === true || m.deduct === 1, metric: isClosed(g) ? m.metric : undefined });
+  function manualSummary(m) {
+    const g = typeof m.geom === 'string' ? parseGeom(m.geom) : m.geom;
+    let points = null;
+    try { points = manual.pointCount(g); } catch (e) { /* unreadable geometry: no count */ }
+    return { drawing_id: m.drawing_id, row_id: m.row_id, tool: 'manual', shape: g && typeof g.tool === 'string' ? g.tool : null, metric: m.metric, points,
+      qty: m.qty, qty_unit: m.qty_unit, deduct: m.deduct === true || m.deduct === 1, calibration_id: m.calibration_id };
+  }
+  function cleanManual(b) {
+    for (const k of Object.keys(b)) if (!MANUAL_FIELDS.includes(k)) bad('unknown field: ' + k);
+    const m = { tool: 'manual', row_id: rowIdOf(b.row_id) };
+    calc(() => manual.validateGeom(b.geom));
+    m.geom = b.geom;
+    m.width = dim(b, 'width'); m.depth = dim(b, 'depth');
+    const f = dim(b, 'factor'); m.factor = f === null ? 1 : f;
+    m.deduct = optBool(b, 'deduct');
+    m.metric = b.metric === undefined ? null : b.metric;   // checked by manualQty below
+    m.label = optText(b, 'label', 200); m.color = optText(b, 'color', 32);
+    m.confirm_uom = optBool(b, 'confirm_uom'); m.confirm_overlap = optBool(b, 'confirm_overlap');
+    // every option is checked before the calibration lookup: the shape at scale 1 (its units and combinations)
+    m.metric = calc(() => manual.manualQty(m.geom, { ...manualOpts(m.geom, m, 1), metric: m.metric })).metric;
+    return m;
+  }
+  // the scale a stored manual measurement was computed with: the drawing units (DXF) or its calibration (PDF/image)
+  function storedScale(cur, d) {
+    if (d.kind === 'dxf') { if (!hasUnit(d.units)) bad('the drawing units are not confirmed', 409); return UNIT_TO_M[d.units]; }
+    const c = cur.calibration_id === null ? null : db.prepare('SELECT scale FROM calibrations WHERE id=? AND drawing_id=?').get(cur.calibration_id, d.id);
+    if (!c) bad(`measurement ${cur.id} has no calibration: delete it and measure again`, 409);
+    return c.scale;
+  }
+  // how many manual measurements on the row have the identical geometry (normalised, manual.geomKey) on the same page of
+  // the same file. An unreadable stored geometry counts (never assume no overlap). Runs inside the tx.
+  function manualOverlaps(m, d, tenderId, selfId) {
+    const key = manual.geomKey(m.geom);
+    let n = 0;
+    for (const o of db.prepare(`SELECT m.geom FROM measurements m JOIN drawings d ON d.id=m.drawing_id
+      WHERE m.row_id=? AND m.tender_id=? AND m.id<>? AND m.tool='manual' AND d.sha256=? AND d.page IS ?`).all(m.row_id, tenderId, selfId, d.sha256, d.page)) {
+      let k = null;
+      try { k = manual.geomKey(parseGeom(o.geom)); } catch (e) { /* unreadable */ }
+      if (k === null || k === key) n++;
+    }
+    return n;
+  }
+  function createManual(res, d, t, me, m) {
+    if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to measure yet`, 409);
+    if (d.kind === 'dxf' && d.units === null) bad('confirm the drawing units first', 409);
+    onPage(d, manual.points(m.geom).map((p, i) => ['point ' + (i + 1), p]));
+    m.drawing_id = d.id;
+    const out = tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = drawingRow(d.id);
+      if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
+      let scale, cal = null;
+      if (d.kind === 'dxf') scale = UNIT_TO_M[d.units];
+      else {
+        cal = calib.calibrationFor(db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(d.id), manual.firstPoint(m.geom));
+        if (!cal) bad('calibrate this page first', 409);
+        scale = cal.scale;
+      }
+      const q = calc(() => manual.manualQty(m.geom, manualOpts(m.geom, m, scale)));
+      if (!(Math.abs(q.qty) <= MAX_QTY)) bad(`the quantity ${q.qty} is out of range: it must be at most ${MAX_QTY}`);
+      Object.assign(m, { qty: q.qty, qty_unit: q.qty_unit, base: q.base, metric: q.metric, calibration_id: cal ? cal.id : null });
+      const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap, {}, manualOverlaps(m, d, t.id, -1));
+      const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,metric,width,depth,factor,label,color,qty,qty_unit,uom_confirmed,base,geom,deduct,calibration_id,created,created_by)
+        VALUES(?,?,?,'manual',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.metric, m.width, m.depth, m.factor, m.label, m.color, m.qty, m.qty_unit, ch.uomConfirmed,
+        m.base, JSON.stringify(m.geom), m.deduct ? 1 : 0, m.calibration_id, new Date().toISOString(), me.username).lastInsertRowid);
+      const sum = summaryOf(m);
+      audit(me, 'measure', 'measurements', id, sum);
+      if (ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', id, { ...sum, row_unit: ch.row.unit });
+      if (ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', id, { ...sum, overlaps: ch.overlaps });
+      return { id, qty: m.qty, qty_unit: m.qty_unit, base: m.base, calibration_id: m.calibration_id, row_qty: recompute(m.row_id) };
+    });
+    return reply(res, 200, out);
+  }
+  // PUT /measurements/:id on a manual measurement: row_id, width, depth, factor, deduct, label (the geometry never
+  // changes: delete and redraw). qty is recomputed with the calibration (or units) it was saved with; the unit and
+  // overlap gates run when the row or the unit changes; both rows are recomputed in the tx.
+  async function editManual(req, res, m, t, me) {
+    const b = await ctx.readBody(req);
+    for (const k of Object.keys(b)) if (![...MANUAL_EDIT, 'confirm_uom', 'confirm_overlap'].includes(k)) bad('unknown field: ' + k);
+    if (!MANUAL_EDIT.some(k => b[k] !== undefined)) bad('nothing to change: send row_id, width, depth, factor, deduct or label');
+    const set = {};
+    if (b.row_id !== undefined) set.row_id = rowIdOf(b.row_id);
+    if (b.width !== undefined) set.width = dim(b, 'width');
+    if (b.depth !== undefined) set.depth = dim(b, 'depth');
+    if (b.factor !== undefined) { const f = dim(b, 'factor'); set.factor = f === null ? 1 : f; }
+    if (b.deduct !== undefined) set.deduct = optBool(b, 'deduct') ? 1 : 0;
+    if (b.label !== undefined) set.label = optText(b, 'label', 200);
+    const confirmUom = optBool(b, 'confirm_uom'), confirmOverlap = optBool(b, 'confirm_overlap');
+    const out = tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = db.prepare('SELECT * FROM measurements WHERE id=?').get(m.id);
+      if (!cur) bad('measurement not found', 404);
+      const d = drawingRow(cur.drawing_id);
+      if (!d) bad('the drawing of this measurement is missing', 409);
+      const g = parseGeom(cur.geom);
+      if (!g) bad(`the shape of measurement ${cur.id} cannot be read: delete it and measure again`, 409);
+      const next = { ...cur, ...set };
+      const q = calc(() => manual.manualQty(g, manualOpts(g, next, storedScale(cur, d))));
+      if (!(Math.abs(q.qty) <= MAX_QTY)) bad(`the quantity ${q.qty} is out of range: it must be at most ${MAX_QTY}`);
+      Object.assign(next, { qty: q.qty, qty_unit: q.qty_unit, base: q.base, geom: g });
+      const moved = next.row_id !== cur.row_id;
+      let ch = null;
+      if (next.row_id !== null && (moved || next.qty_unit !== cur.qty_unit)) {
+        ch = checkRow(me, next, d.sha256, t.id, cur.id, confirmUom, confirmOverlap, {}, moved ? manualOverlaps(next, d, t.id, cur.id) : 0);
+        next.uom_confirmed = ch.uomConfirmed;
+      }
+      db.prepare('UPDATE measurements SET row_id=?, width=?, depth=?, factor=?, deduct=?, label=?, qty=?, qty_unit=?, base=?, uom_confirmed=? WHERE id=?')
+        .run(next.row_id, next.width, next.depth, next.factor, next.deduct, next.label, next.qty, next.qty_unit, next.base, next.uom_confirmed, cur.id);
+      const sum = { ...summaryOf(next), width: next.width, depth: next.depth, factor: next.factor, ...(moved ? { from_row_id: cur.row_id } : {}) };
+      audit(me, 'measure_edit', 'measurements', cur.id, sum);
+      if (ch && ch.uomConfirmed) audit(me, 'measure_uom_confirmed', 'measurements', cur.id, { ...sum, row_unit: ch.row.unit });
+      if (ch && ch.overlaps) audit(me, 'measure_overlap_confirmed', 'measurements', cur.id, { ...sum, overlaps: ch.overlaps });
+      return { ok: 1, id: cur.id, qty: next.qty, qty_unit: next.qty_unit, base: next.base, row_qty: recompute(next.row_id), ...(moved ? { old_row_qty: recompute(cur.row_id) } : {}) };
+    });
+    return reply(res, 200, out);
+  }
   // how many measurements already on the row count some of the same geometry (same file). Runs inside the tx.
   // A selection (m.sel = { handles: Set, layers: Set, pairs: Set of layer\0block }) overlaps: another selection of the
   // same metric family holding one of its handles; a dxf_layer measurement of that family on a layer it uses; a
@@ -814,7 +985,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
 
   async function createMeasurement(req, res, d, t, me) {
     need(me, 'admin', 'qs'); mustDraft(t);
-    const m = cleanMeasure(await ctx.readBody(req));
+    const b = await ctx.readBody(req);
+    if (b.tool === 'manual') return createManual(res, d, t, me, cleanManual(b));
+    const m = cleanMeasure(b);
     if (d.kind !== 'dxf') bad('the DXF tools apply to DXF drawings only');
     if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to measure yet`, 409);
     if (d.units === null) bad('confirm the drawing units first', 409);
@@ -962,6 +1135,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       });
       return reply(res, 200, out);
     }
+    if (method === 'PUT' && m.tool === 'manual') return editManual(req, res, m, t, me);
     if (method === 'PUT') {
       const b = await ctx.readBody(req);
       for (const k of Object.keys(b)) if (!['row_id', 'confirm_uom', 'confirm_overlap', 'confirm_duplicate'].includes(k)) bad('unknown field: ' + k);
@@ -995,9 +1169,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   }
 
   function tenderMeasurements(t) {
-    const all = db.prepare(`SELECT m.*, d.name AS drawing_name, r.no AS row_no, r.description AS row_description, r.unit AS row_unit
-      FROM measurements m JOIN drawings d ON d.id=m.drawing_id LEFT JOIN tender_rows r ON r.id=m.row_id WHERE m.tender_id=? ORDER BY m.id`).all(t.id);
-    for (const x of all) x.selection_summary = parseSummary(x.selection_summary);   // handles_count and this; never the handle list
+    const all = db.prepare(`SELECT m.*, d.name AS drawing_name, r.no AS row_no, r.description AS row_description, r.unit AS row_unit,
+      c.region AS cal_region, c.scale AS cal_scale, c.verify_pct AS cal_verify_pct
+      FROM measurements m JOIN drawings d ON d.id=m.drawing_id LEFT JOIN tender_rows r ON r.id=m.row_id LEFT JOIN calibrations c ON c.id=m.calibration_id WHERE m.tender_id=? ORDER BY m.id`).all(t.id);
+    for (const x of all) {
+      x.selection_summary = parseSummary(x.selection_summary);   // handles_count and this; never the handle list
+      x.geom = parseGeom(x.geom);   // a manual measurement's shape, for the viewer
+      // which calibration a PDF/image quantity used (page or region) and its verify %
+      x.calibration = x.calibration_id === null || x.cal_scale === null ? null : { id: x.calibration_id, region: x.cal_region !== null, scale: x.cal_scale, verify_pct: x.cal_verify_pct };
+      delete x.cal_region; delete x.cal_scale; delete x.cal_verify_pct;
+    }
     return { measurements: all.filter(x => x.row_id !== null), unlinked: all.filter(x => x.row_id === null) };
   }
 

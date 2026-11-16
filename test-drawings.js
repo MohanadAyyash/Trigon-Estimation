@@ -1619,6 +1619,237 @@ server.listen(0, async () => {
       }
     }
 
+    // ---- batch 3 Task 4: manual measurements (line, polyline, area with holes, rect, count) on PDF, image and DXF ------
+    {
+      const TM = require('./lib/takeoff/manual.js');
+      const { makePdf, PDF_PAGES, makePng } = require('./test/fixtures/make-takeoff.js');
+      const near = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) < 1e-9, `${msg}: expected ≈${b}, got ${a}`);
+      const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
+      const audits = action => db.prepare("SELECT detail FROM audit_log WHERE action=? ORDER BY id").all(action).map(a => JSON.parse(a.detail));
+      const auditFrom = db.prepare('SELECT COALESCE(MAX(id), 0) n FROM audit_log').get().n;
+      const T = (await ok(call('POST', 'tenders', { title: 'Test Manual Take-off', kind: 'rta' }, qs), 'tender')).id;
+      const newRow = async (description, unit) => (await ok(call('POST', `tenders/${T}/rows`, { description, unit }, qs), 'row ' + description)).id;
+      const rM = await newRow('Fake kerb', 'm'), rM2 = await newRow('Fake paving', 'm2'), rNr = await newRow('Fake gullies', 'nr'), rDxf = await newRow('Fake edging', 'm');
+      const qtyOf = id => db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(id).qty;
+      const mRow = id => db.prepare('SELECT * FROM measurements WHERE id=?').get(id);
+      const nM = () => db.prepare('SELECT COUNT(*) n FROM measurements WHERE tender_id=?').get(T).n;
+      const measure = (did, b, ck = qs) => call('POST', `drawings/${did}/measurements`, { tool: 'manual', ...b }, ck);
+      const put = (id, b, ck = qs) => call('PUT', `measurements/${id}`, b, ck);
+      const sq = (x, y, s) => [[x, y], [x + s, y], [x + s, y + s], [x, y + s]];
+      const poly = { tool: 'polyline', pts: [[0, 0], [30, 40], [30, 100]] };                    // 110 units
+      const area = { tool: 'area', outer: sq(200, 200, 100), holes: [sq(240, 240, 20)] };     // 9600 units²
+      const dline = { tool: 'line', pts: [[300, 500], [300, 520]] };                          // 20 units
+
+      // a PDF whose pages are not registered: nothing to measure
+      const pdfUp = await upload(T, 'Manual sheets', makePdf(), qs);
+      let r = await measure(pdfUp.j.id, { row_id: rM, geom: poly });
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j));
+      const [P1, P2] = (await ok(call('POST', `drawings/${pdfUp.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages')).drawings.map(x => x.id);
+
+      // no calibration → 409; a viewer → 403; nothing stored
+      r = await measure(P1, { row_id: rM, geom: poly });
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'calibrate this page first');
+      assert.strictEqual((await measure(P1, { row_id: rM, geom: poly }, viewer)).s, 403);
+      assert.strictEqual(nM(), 0);
+      const pageCal = (await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'calibrate')).calibration;   // 0.05 m/unit
+      // R12: points beyond [−w, 2w] × [−h, 2h] are refused (wrong coordinate space), for calibrations too
+      for (const b of [{ p1: [0, 0], p2: [1191, 0], real: 5, unit: 'm' }, { p1: [0, -843], p2: [0, 0], real: 5, unit: 'm' }, { region: [0, 0, 100, 1685], p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }]) {
+        const x = await call('POST', `drawings/${P1}/calibrations`, b, qs);
+        assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, /outside the page/);
+      }
+
+      // bad bodies → 400, nothing stored (validation before the calibration lookup)
+      for (const [b, re] of [
+        [{ row_id: rM, geom: { tool: 'area', outer: [[0, 0], [10, 10], [10, 0], [0, 10]], holes: [] } }, /self-intersect/],
+        [{ row_id: rM2, geom: { tool: 'area', outer: sq(0, 0, 100), holes: [sq(200, 200, 10)] } }, /outside the outline/],
+        [{ row_id: rM, geom: { tool: 'polyline', pts: [[0, 0], [1e400, 0]] } }, /point/],
+        [{ row_id: rM, geom: { tool: 'polyline', pts: [[0, 0], [1191, 0]] } }, /outside the page/],
+        [{ row_id: rM, geom: { tool: 'polyline', pts: [[-596, 0], [0, 0]] } }, /outside the page/],
+        [{ row_id: rM, geom: { tool: 'rect', p1: [5, 5], p2: [5, 50] } }, /size/],
+        [{ row_id: rNr, geom: { tool: 'count', pts: [[1, 1]] }, width: 1 }, /count/],
+        [{ row_id: rM2, geom: area, width: 1 }, /depth, not width/],
+        [{ row_id: rM, geom: poly, layer: 'X' }, /unknown field/],
+        [{ row_id: rM, geom: poly, handles: ['1'] }, /unknown field/],
+        [{ row_id: rM, geom: poly, metric: 'area' }, /metric/],
+        [{ row_id: rM, geom: poly, deduct: 'yes' }, /deduct/],
+        [{ row_id: rM }, /geom/]]) {
+        const x = await measure(P1, b);
+        assert.strictEqual(x.s, 400, JSON.stringify(b) + ' ' + JSON.stringify(x.j)); assert.match(x.j.error, re, JSON.stringify(b));
+      }
+      assert.strictEqual(nM(), 0);
+
+      // a polyline on the calibrated page onto a take-off row in m: qty = manualQty, stored with its geometry and calibration
+      const mPoly = await ok(measure(P1, { row_id: rM, geom: poly, label: 'Fake kerb A' }), 'polyline');
+      const want = TM.manualQty(poly, { scale: 0.05 });
+      assert.strictEqual(mPoly.qty, want.qty); near(mPoly.qty, 5.5, 'polyline 110 units × 0.05'); assert.strictEqual(mPoly.qty_unit, 'm');
+      assert.strictEqual(mPoly.calibration_id, pageCal.id); near(mPoly.row_qty, 5.5, 'row qty'); near(qtyOf(rM), 5.5, 'row stored');
+      let s = mRow(mPoly.id);
+      assert.deepStrictEqual(JSON.parse(s.geom), poly);
+      assert.deepStrictEqual({ tool: s.tool, metric: s.metric, base: s.base, deduct: s.deduct, calibration_id: s.calibration_id, label: s.label, factor: s.factor },
+        { tool: 'manual', metric: 'length', base: want.base, deduct: 0, calibration_id: pageCal.id, label: 'Fake kerb A', factor: 1 });
+      assert.deepStrictEqual(audits('measure').at(-1), { drawing_id: P1, row_id: rM, tool: 'manual', shape: 'polyline', metric: 'length', points: 3, qty: want.qty, qty_unit: 'm', deduct: false, calibration_id: pageCal.id }, 'summary only');
+      // the list shows the geometry and which calibration was used
+      const listed = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === mPoly.id);
+      assert.deepStrictEqual(listed.geom, poly);
+      assert.deepStrictEqual(listed.calibration, { id: pageCal.id, region: false, scale: 0.05, verify_pct: null });
+
+      // an area with a hole onto an m2 row → (10000 − 400) × 0.05² = 24; a length on it → 400 (known units must match)
+      const mArea = await ok(measure(P1, { row_id: rM2, geom: area }), 'area');
+      near(mArea.qty, 24, 'area with a hole'); assert.strictEqual(mArea.qty, TM.manualQty(area, { scale: 0.05 }).qty); near(qtyOf(rM2), 24, 'm2 row');
+      r = await measure(P1, { row_id: rM2, geom: dline });
+      assert.strictEqual(r.s, 400); assert.deepStrictEqual(r.j, { error: 'unit mismatch — add width/depth', row_unit: 'm2', qty_unit: 'm' });
+
+      // identical geometry (reversed, noise below 1e-6) on the same row → 409 unless confirm_overlap (audited)
+      const again = { tool: 'polyline', pts: poly.pts.slice().reverse().map(([x, y]) => [x + 1e-8, y]) };
+      r = await measure(P1, { row_id: rM, geom: again });
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'already measured on this row');
+      const dup = await ok(measure(P1, { row_id: rM, geom: again, confirm_overlap: true }), 'overlap confirmed');
+      assert.strictEqual(audits('measure_overlap_confirmed').at(-1).overlaps, 1);
+      await ok(call('DELETE', `measurements/${dup.id}`, null, qs), 'delete the copy');
+      near(qtyOf(rM), 5.5, 'back to one polyline');
+
+      // a deduction reduces the row; a row below 0 → 400, rolled back
+      const mDed = await ok(measure(P1, { row_id: rM, geom: dline, deduct: true }), 'deduct');
+      near(mDed.qty, -1, 'deduct 20 units'); near(qtyOf(rM), 4.5, 'row reduced'); assert.strictEqual(mRow(mDed.id).deduct, 1);
+      const n0 = nM();
+      r = await measure(P1, { row_id: rM, geom: { tool: 'line', pts: [[0, 600], [0, 800]] }, deduct: true });
+      assert.strictEqual(r.s, 400); assert.match(r.j.error, /deductions exceed/);
+      assert.strictEqual(nM(), n0, 'nothing stored'); near(qtyOf(rM), 4.5, 'row unchanged');
+
+      // PUT: factor 2 → qty recomputed, row updated; deduct off and on; label; width on an area and m3 on an m2 row refused
+      let e = await ok(put(mPoly.id, { factor: 2 }), 'factor');
+      near(e.qty, 11, 'factor 2'); near(qtyOf(rM), 10, 'row after factor'); near(mRow(mPoly.id).base, 5.5, 'base unchanged');
+      assert.deepStrictEqual(audits('measure_edit').at(-1), { drawing_id: P1, row_id: rM, tool: 'manual', shape: 'polyline', metric: 'length', points: 3, qty: e.qty, qty_unit: 'm', deduct: false, calibration_id: pageCal.id, width: null, depth: null, factor: 2 });
+      await ok(put(mDed.id, { deduct: false }), 'deduct off'); near(qtyOf(rM), 12, 'deduct off');
+      await ok(put(mDed.id, { deduct: true, label: 'Fake gap' }), 'deduct on'); near(qtyOf(rM), 10, 'deduct on'); assert.strictEqual(mRow(mDed.id).label, 'Fake gap');
+      const areaBefore = mRow(mArea.id);
+      for (const [b, re, st] of [[{ width: 2 }, /depth, not width/, 400], [{ depth: 0.5 }, /unit mismatch/, 400], [{ geom: poly }, /unknown field/, 400], [{ factor: 0 }, /factor/, 400], [{}, /nothing to change/, 400], [{ row_id: rM }, /unit mismatch/, 400]]) {
+        const x = await put(mArea.id, b);
+        assert.strictEqual(x.s, st, JSON.stringify(b)); assert.match(x.j.error, re, JSON.stringify(b));
+      }
+      assert.deepStrictEqual(mRow(mArea.id), areaBefore, 'refused edits change nothing');
+      assert.strictEqual((await put(mPoly.id, { factor: 3 }, viewer)).s, 403);
+      // making the deduction bigger than the row → 400, rolled back
+      r = await put(mDed.id, { factor: 20 });
+      assert.strictEqual(r.s, 400); assert.match(r.j.error, /deductions exceed/); near(qtyOf(rM), 10, 'row unchanged'); assert.strictEqual(mRow(mDed.id).factor, 1);
+
+      // re-calibrating the page (scale × 2): 409 with the before/after list, nothing changed; apply → qty doubled (area × 4)
+      const snap = () => JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(T), db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(P1), qtyOf(rM), qtyOf(rM2)]);
+      const before = snap();
+      r = await call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 10, unit: 'm' }, qs);
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'calibration changes measured quantities');
+      const at = (g, o) => TM.manualQty(g, { scale: 0.1, ...o }).qty;
+      assert.deepStrictEqual(r.j.changes, [
+        { measurement_id: mPoly.id, row_id: rM, old_qty: mRow(mPoly.id).qty, new_qty: at(poly, { factor: 2 }) },
+        { measurement_id: mArea.id, row_id: rM2, old_qty: mRow(mArea.id).qty, new_qty: at(area) },
+        { measurement_id: mDed.id, row_id: rM, old_qty: -1, new_qty: at(dline, { deduct: true }) }]);
+      assert.strictEqual(snap(), before, 'nothing changed without apply');
+      r = await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 10, unit: 'm', apply: true }, qs), 'apply');
+      assert.strictEqual(r.changes.length, 3);
+      near(mRow(mPoly.id).qty, 22, 'polyline doubled'); near(mRow(mPoly.id).base, 11, 'base doubled'); near(mRow(mArea.id).qty, 96, 'area × 4'); near(mRow(mDed.id).qty, -2, 'deduction doubled');
+      near(qtyOf(rM), 20, 'row m updated'); near(qtyOf(rM2), 96, 'row m2 updated');
+      assert.deepStrictEqual(audits('calibrate').at(-1), { drawing_id: P1, region: false, scale: 0.1, real: 10, unit: 'm', replaced: true, changed: 3, rows: 2 });
+      // the same calibration again changes nothing: a plain replace
+      assert.deepStrictEqual((await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 10, unit: 'm' }, qs), 'same')).changes, []);
+
+      // a new region: measurements whose first point falls in it move to it (409 list, apply)
+      const regBody = { region: [150, 150, 350, 350], p1: [150, 150], p2: [350, 150], real: 5, unit: 'm' };   // 0.025 m/unit
+      r = await call('POST', `drawings/${P1}/calibrations`, regBody, qs);
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j));
+      assert.deepStrictEqual(r.j.changes, [{ measurement_id: mArea.id, row_id: rM2, old_qty: 96, new_qty: TM.manualQty(area, { scale: 0.025 }).qty }], 'only the area starts inside the region');
+      assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM calibrations WHERE drawing_id=?').get(P1).n, 1, 'no region stored');
+      const reg = (await ok(call('POST', `drawings/${P1}/calibrations`, { ...regBody, apply: true }, qs), 'region apply')).calibration;
+      assert.strictEqual(mRow(mArea.id).calibration_id, reg.id); near(mRow(mArea.id).qty, 6, 'area at 0.025'); near(qtyOf(rM2), 6, 'm2 row');
+      assert.strictEqual(mRow(mPoly.id).calibration_id, pageCal.id, 'the polyline stays on the page calibration');
+      // a new measurement starting in the region uses it
+      const mRect = await ok(measure(P1, { row_id: rM2, geom: { tool: 'rect', p1: [160, 160], p2: [200, 180] } }), 'rect in region');
+      assert.strictEqual(mRect.calibration_id, reg.id); near(mRect.qty, 0.5, 'rect 40×20 × 0.025²'); near(qtyOf(rM2), 6.5, 'm2 row');
+      assert.strictEqual((await call('DELETE', `drawings/${P1}/calibrations/${reg.id}`, null, qs)).s, 409, 'a used region cannot be deleted');
+      // the same geometry on page 2 of the same file is not an overlap
+      await ok(call('POST', `drawings/${P2}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'page 2');
+      const mP2 = await ok(measure(P2, { row_id: rM, geom: poly }), 'page 2 polyline');
+      near(mP2.qty, 5.5, 'page 2'); near(qtyOf(rM), 25.5, 'row m');
+
+      // an image: calibrated in pixels; a count onto an nr row (bounds 2 × 640 by 2 × 480)
+      const img = await upload(T, 'Fake photo', makePng(640, 480), qs);
+      r = await measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[10, 10]] } });
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'calibrate this page first');
+      await ok(call('POST', `drawings/${img.j.id}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'image calibration');
+      assert.match((await measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[10, 10], [1281, 10]] } })).j.error, /outside the page/);
+      const mCount = await ok(measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[10, 10], [20, 20], [30, 10]] } }), 'count');
+      assert.strictEqual(mCount.qty, 3); assert.strictEqual(mCount.qty_unit, 'nr'); assert.strictEqual(qtyOf(rNr), 3);
+      // a count does not depend on the scale: re-calibrating lists nothing and keeps its calibration link
+      assert.deepStrictEqual((await ok(call('POST', `drawings/${img.j.id}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 7, unit: 'm' }, qs), 'image re-calibration')).changes, []);
+      assert.strictEqual(mRow(mCount.id).qty, 3); assert.strictEqual(mRow(mCount.id).calibration_id, mCount.calibration_id);
+      // R12 on the verify line too
+      const iv = await call('POST', `drawings/${img.j.id}/calibrations/${mCount.calibration_id}/verify`, { p1: [0, 0], p2: [0, 961], real: 5, unit: 'm' }, qs);
+      assert.strictEqual(iv.s, 400); assert.match(iv.j.error, /p2 is outside the page/);
+
+      // DXF: units first; then scale = UNIT_TO_M[units] (mm), no calibration, georeferenced coordinates exact
+      const dx = await upload(T, 'Fake site', FIXTURE, qs);
+      assert.strictEqual((await waitDone(dx.j.id, qs)).status, 'ready');
+      const geo = { tool: 'polyline', pts: [[500000, 2700000], [503000, 2704000], [503000, 2704000.5]] };   // 5000.5 mm
+      r = await measure(dx.j.id, { row_id: rDxf, geom: geo });
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'confirm the drawing units first');
+      await ok(call('PUT', `drawings/${dx.j.id}/units`, { units: 'mm' }, qs), 'units');
+      const mDxf = await ok(measure(dx.j.id, { row_id: rDxf, geom: geo }), 'dxf polyline');
+      near(mDxf.qty, 5.0005, 'mm'); assert.strictEqual(mDxf.qty, TM.manualQty(geo, { scale: 0.001 }).qty); assert.strictEqual(mDxf.calibration_id, null);
+      near(qtyOf(rDxf), 5.0005, 'dxf row');
+      const mDxf2 = await ok(measure(dx.j.id, { row_id: rDxf, geom: { tool: 'line', pts: [[0, 0], [5000, 0]] } }), 'dxf line');
+      near(mDxf2.qty, 5, '5000 mm'); near(qtyOf(rDxf), 10.0005, 'dxf row');
+      await ok(put(mDxf2.id, { factor: 2 }), 'dxf factor'); near(qtyOf(rDxf), 15.0005, 'dxf row after factor');
+      // the DXF tools still refuse a manual measurement's fields
+      assert.match((await call('POST', `drawings/${dx.j.id}/measurements`, { tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', row_id: rDxf, geom: poly }, qs)).j.error, /unknown field/);
+
+      // no coordinates anywhere in the audit
+      for (const a of db.prepare("SELECT action, detail FROM audit_log WHERE id>? AND entity IN ('measurements','calibrations')").all(auditFrom))
+        assert.ok(!/[[\]]/.test(a.detail || ''), a.action + ' ' + a.detail);
+
+      // an approved tender: no manual measurement can be added, edited or deleted
+      db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
+      const frozen = snap();
+      assert.strictEqual((await measure(P1, { row_id: rM, geom: { tool: 'line', pts: [[0, 0], [0, 50]] } })).s, 409);
+      assert.strictEqual((await put(mPoly.id, { factor: 5 })).s, 409);
+      assert.strictEqual((await call('DELETE', `measurements/${mPoly.id}`, null, qs)).s, 409);
+      assert.strictEqual(snap(), frozen, 'nothing changed');
+
+      // revise: calibrations and manual measurements copied, drawings, rows and calibration_id remapped
+      const rv = (await ok(call('POST', `tenders/${T}/revise`, null, qs), 'revise')).id;
+      const od = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(T), nd = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(rv);
+      const dmap = new Map(od.map((x, i) => [x.id, nd[i].id]));
+      const calsOf = tid => db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? ORDER BY c.id').all(tid);
+      const oc = calsOf(T), nc = calsOf(rv);
+      assert.strictEqual(nc.length, oc.length); assert.ok(oc.length >= 4);
+      const cmap = new Map();
+      oc.forEach((c, i) => {
+        const n = nc[i];
+        assert.strictEqual(n.drawing_id, dmap.get(c.drawing_id), 'calibration drawing remapped'); assert.notStrictEqual(n.id, c.id);
+        for (const k of ['region', 'p1x', 'p1y', 'p2x', 'p2y', 'real', 'unit', 'scale', 'verify_pct', 'created', 'created_by']) assert.strictEqual(n[k], c[k], k);
+        cmap.set(c.id, n.id);
+      });
+      const oRows = db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(T), nRows = db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(rv);
+      const rmap = new Map(oRows.map((x, i) => [x.id, nRows[i].id]));
+      const om = db.prepare("SELECT * FROM measurements WHERE tender_id=? AND tool='manual' ORDER BY id").all(T), nm = db.prepare("SELECT * FROM measurements WHERE tender_id=? AND tool='manual' ORDER BY id").all(rv);
+      assert.strictEqual(nm.length, om.length); assert.strictEqual(om.length, 8);
+      om.forEach((o, i) => {
+        const n = nm[i];
+        assert.strictEqual(n.drawing_id, dmap.get(o.drawing_id)); assert.strictEqual(n.row_id, rmap.get(o.row_id));
+        assert.strictEqual(n.calibration_id, o.calibration_id === null ? null : cmap.get(o.calibration_id), 'calibration_id remapped');
+        for (const k of ['geom', 'deduct', 'metric', 'width', 'depth', 'factor', 'label', 'qty', 'qty_unit', 'base']) assert.strictEqual(n[k], o[k], k);
+      });
+      for (const o of oRows) assert.strictEqual(nRows.find(x => x.seq === o.seq).qty, o.qty, 'Rev row qty = original');
+      // the Rev re-calibrates on its own: only its own measurements are listed
+      r = await call('POST', `drawings/${dmap.get(P1)}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs);
+      assert.strictEqual(r.s, 409);
+      assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), [nm[0].id, nm[2].id], 'the Rev polyline and deduction');
+
+      // the browser loads the same formula file (one source)
+      const mf = await fetch(`http://localhost:${server.address().port}/lib/takeoff/manual.js`);
+      assert.strictEqual(mf.status, 200); assert.match(mf.headers.get('content-type'), /^text\/javascript/);
+      assert.ok(Buffer.from(await mf.arrayBuffer()).equals(fs.readFileSync(path.join(__dirname, 'lib', 'takeoff', 'manual.js'))));
+      for (const p of ['lib/takeoff/calib.js', 'lib/units.js', 'server.js', 'lib/takeoff/']) assert.strictEqual((await fetch(`http://localhost:${server.address().port}/${p}`)).status, 404, p);
+    }
+
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------
     {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-restart-'));

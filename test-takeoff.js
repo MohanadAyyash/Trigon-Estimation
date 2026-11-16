@@ -116,4 +116,129 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
   for (const p of [[NaN, 0], [0, Infinity], null, [1]]) assert.throws(() => calibrationFor(cals, p), /point/, 'calibrationFor ' + JSON.stringify(p));
 }
 
+// ---- manual measurements (lib/takeoff/manual.js, UMD): the same cases in Node and in a browser-like vm context ----
+{
+  const MANUAL = path.join(__dirname, 'lib', 'takeoff', 'manual.js');
+  const node = require(MANUAL);
+  // the browser path: a plain script with no module/require, which sets window.TakeoffManual
+  const vm = require('vm'), sandbox = { window: {} };
+  vm.runInNewContext(fs.readFileSync(MANUAL, 'utf8'), sandbox, { filename: 'manual.js' });
+  const browser = sandbox.window.TakeoffManual;
+  assert.ok(browser && typeof browser.manualQty === 'function', 'the UMD sets window.TakeoffManual');
+  assert.strictEqual(sandbox.module, undefined); assert.strictEqual(typeof sandbox.require, 'undefined');
+  const sq = (x, y, s) => [[x, y], [x + s, y], [x + s, y + s], [x, y + s]];
+  for (const [where, M] of [['node', node], ['vm', browser]]) {
+    const near = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) < 1e-9, `${where} ${msg}: ${a} vs ${b}`);
+    const plain = v => JSON.parse(JSON.stringify(v));   // vm objects come from another realm
+    const q = (g, o) => plain(M.manualQty(g, o));
+    const throwsMsg = (fn, re, msg) => { let err = null; try { fn(); } catch (e) { err = e; } assert.ok(err && re.test(err.message), `${where} ${msg}: ${err ? err.message : 'no throw'}`); };
+    const poly = { tool: 'polyline', pts: [[0, 0], [30, 40], [30, 100]] };
+
+    // polyline 50 + 60 = 110 units × 0.1 → 11 m
+    let r = q(poly, { scale: 0.1 });
+    near(r.base, 11, 'polyline base'); near(r.qty, 11, 'polyline qty'); assert.strictEqual(r.unit, 'm'); assert.strictEqual(r.qty_unit, 'm');
+    r = q({ tool: 'line', pts: [[0, 0], [0, 250]] }, { scale: 0.02 });
+    near(r.qty, 5, 'line'); assert.strictEqual(r.qty_unit, 'm');
+    // area 100×100 minus a 20×20 hole at 0.05 m/unit → (10000 − 400) × 0.0025 = 24 m²
+    const area = { tool: 'area', outer: sq(0, 0, 100), holes: [sq(40, 40, 20)] };
+    r = q(area, { scale: 0.05 });
+    near(r.base, 24, 'area base'); near(r.qty, 24, 'area qty'); assert.strictEqual(r.unit, 'm2'); assert.strictEqual(r.qty_unit, 'm2');
+    near(r.perimeter, 24, 'an area also reports its perimeter');
+    // the same outline drawn clockwise: same area
+    near(q({ tool: 'area', outer: sq(0, 0, 100).reverse(), holes: [sq(40, 40, 20)] }, { scale: 0.05 }).qty, 24, 'clockwise');
+    // metric perimeter: outer + holes = (400 + 80) × 0.05 = 24 m
+    r = q(area, { scale: 0.05, metric: 'perimeter' });
+    near(r.qty, 24, 'perimeter'); assert.strictEqual(r.qty_unit, 'm');
+    // width on a length → m2; width + depth → m3; depth on an area → m3; factor; deduct → negative
+    r = q(poly, { scale: 0.1, width: 0.5 }); near(r.base, 11, 'base before width'); near(r.qty, 5.5, 'width'); assert.strictEqual(r.qty_unit, 'm2');
+    r = q(poly, { scale: 0.1, width: 0.5, depth: 2 }); near(r.qty, 11, 'width × depth'); assert.strictEqual(r.qty_unit, 'm3');
+    r = q(area, { scale: 0.05, depth: 0.25 }); near(r.qty, 6, 'area × depth'); assert.strictEqual(r.qty_unit, 'm3');
+    r = q(area, { scale: 0.05, depth: 0.25, factor: 2 }); near(r.qty, 12, 'factor 2');
+    r = q(area, { scale: 0.05, factor: 2, deduct: true }); near(r.qty, -48, 'deduct'); near(r.base, 24, 'the base stays positive'); assert.strictEqual(r.qty_unit, 'm2');
+    throwsMsg(() => M.manualQty(area, { scale: 0.05, width: 2 }), /depth, not width/, 'width on an area');
+    throwsMsg(() => M.manualQty(poly, { scale: 0.1, depth: 2 }), /depth needs a width/, 'depth without width');
+    // rect: corners in any order; area or perimeter
+    r = q({ tool: 'rect', p1: [50, 30], p2: [10, 10] }, { scale: 0.5 }); near(r.qty, 200, 'rect 40×20 × 0.25'); assert.strictEqual(r.qty_unit, 'm2');
+    near(q({ tool: 'rect', p1: [50, 30], p2: [10, 10] }, { scale: 0.5, metric: 'perimeter' }).qty, 60, 'rect perimeter');
+    // count: the number of points; scale plays no part; width/depth refused
+    r = q({ tool: 'count', pts: [[1, 1], [5, 5], [9, 1]] }, { scale: 0.05, factor: 2 });
+    near(r.base, 3, 'count base'); near(r.qty, 6, 'count × factor'); assert.strictEqual(r.qty_unit, 'nr');
+    throwsMsg(() => M.manualQty({ tool: 'count', pts: [[1, 1]] }, { scale: 0.05, width: 1 }), /width and depth do not apply to a count/, 'count with width');
+    throwsMsg(() => M.manualQty({ tool: 'count', pts: [[1, 1]] }, { scale: 0.05, depth: 1 }), /count/, 'count with depth');
+    throwsMsg(() => M.manualQty(poly, { scale: 0.1, metric: 'area' }), /metric/, 'metric on a line');
+    // options
+    for (const o of [{}, { scale: 0 }, { scale: -1 }, { scale: NaN }, { scale: Infinity }, { scale: '0.1' }]) throwsMsg(() => M.manualQty(poly, o), /scale/, 'scale ' + JSON.stringify(o));
+    for (const k of ['width', 'depth', 'factor']) for (const v of [0, -1, NaN, Infinity, '1']) throwsMsg(() => M.manualQty(k === 'depth' ? area : poly, { scale: 0.1, [k]: v }), new RegExp(k), k + ' ' + String(v));
+    throwsMsg(() => M.manualQty(poly, { scale: 0.1, deduct: 'yes' }), /deduct/, 'deduct must be a boolean');
+    throwsMsg(() => M.manualQty(area, { scale: 0.05, metric: 'volume' }), /metric/, 'unknown metric');
+    throwsMsg(() => M.manualQty(poly, { scale: 1e300, width: 1e6, depth: 1e6 }), /out of range/, 'overflow');
+
+    // validateGeom: outlines that self-intersect (proper, through a vertex, T, along a collinear stretch)
+    const outer = pts => ({ tool: 'area', outer: pts, holes: [] });
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 10], [10, 0], [0, 10]])), /self-intersect/, 'bowtie');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [5, 5], [10, 10], [10, 0], [5, 5], [0, 10]])), /self-intersect/, 'bowtie crossing through a vertex');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 0], [10, 5], [5, 0], [5, -5], [0, -5]])), /self-intersect/, 'T crossing: a vertex on an edge');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 0], [10, -4], [8, -4], [8, 0], [2, 0], [2, -4], [0, -4]])), /self-intersect/, 'collinear overlap (conservative rule)');
+    throwsMsg(() => M.manualQty(outer([[0, 0], [10, 10], [10, 0], [0, 10]]), { scale: 1 }), /self-intersect/, 'manualQty validates');
+    // touching at one vertex without crossing (batch-1 rule: not a crossing) → the two lobes' area
+    near(q(outer([[0, 0], [4, 0], [5, 5], [6, 0], [10, 0], [10, 10], [6, 10], [5, 5], [4, 10], [0, 10]]), { scale: 1 }).qty, 90, 'pinched outline');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 0], [20, 0]])), /no area/, 'a flat outline');
+    // holes: strictly inside, never touching the outline or each other, never nested, never self-intersecting
+    const withHoles = holes => ({ tool: 'area', outer: sq(0, 0, 100), holes });
+    throwsMsg(() => M.validateGeom(withHoles([sq(200, 200, 10)])), /hole 1 lies outside the outline/, 'a hole outside');
+    throwsMsg(() => M.validateGeom(withHoles([sq(90, 40, 20)])), /hole 1 touches or crosses the outline/, 'a hole crossing the outline');
+    throwsMsg(() => M.validateGeom(withHoles([sq(0, 40, 20)])), /hole 1 touches or crosses the outline/, 'a hole along the outline');
+    throwsMsg(() => M.validateGeom(withHoles([[[0, 50], [20, 40], [20, 60]]])), /hole 1 touches or crosses the outline/, 'a hole touching the outline at a vertex');
+    throwsMsg(() => M.validateGeom(withHoles([sq(10, 10, 20), sq(25, 25, 20)])), /holes 1 and 2 touch or cross/, 'overlapping holes');
+    throwsMsg(() => M.validateGeom(withHoles([sq(10, 10, 20), sq(30, 10, 20)])), /holes 1 and 2 touch or cross/, 'holes sharing an edge');
+    throwsMsg(() => M.validateGeom(withHoles([sq(10, 10, 40), sq(20, 20, 10)])), /hole 2 lies inside hole 1/, 'a hole inside a hole');
+    throwsMsg(() => M.validateGeom(withHoles([[[10, 10], [20, 20], [20, 10], [10, 20]]])), /hole 1 must not self-intersect/, 'a bowtie hole');
+    near(q(withHoles([sq(10, 10, 20), sq(50, 50, 20)]), { scale: 1 }).qty, 10000 - 800, 'two holes');
+    // rect, points, sizes
+    throwsMsg(() => M.validateGeom({ tool: 'rect', p1: [5, 5], p2: [5, 50] }), /size/, 'a rect of zero width');
+    throwsMsg(() => M.validateGeom({ tool: 'rect', p1: [5, 5], p2: [5, 5] }), /size/, 'a rect of zero size');
+    throwsMsg(() => M.validateGeom({ tool: 'polyline', pts: [[0, 0], [1, 1], [1, 1], [2, 0]] }), /repeated point/, 'repeated consecutive points');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 0], [10, 10], [0, 0]])), /repeated point/, 'an outline whose last point repeats the first');
+    throwsMsg(() => M.validateGeom({ tool: 'count', pts: [[3, 3], [3, 3]] }), /repeated point/, 'the same count point twice');
+    for (const p of [[0, NaN], [0, Infinity], [0, 1e9 + 1], [0], [0, '1'], null, [0, 1, 2]]) throwsMsg(() => M.validateGeom({ tool: 'polyline', pts: [[0, 0], p] }), /point/, 'point ' + JSON.stringify(p));
+    near(q({ tool: 'line', pts: [[-1e9, 0], [1e9, 0]] }, { scale: 1e-9 }).qty, 2, '±1e9 is allowed');
+    throwsMsg(() => M.validateGeom({ tool: 'polyline', pts: [[0, 0]] }), /at least 2/, 'one point');
+    throwsMsg(() => M.validateGeom({ tool: 'line', pts: [[0, 0], [1, 0], [2, 0]] }), /line/, 'a line has 2 points');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [1, 0]])), /at least 3/, 'outer of 2 points');
+    throwsMsg(() => M.validateGeom(withHoles([[[10, 10], [20, 10]]])), /at least 3/, 'hole of 2 points');
+    throwsMsg(() => M.validateGeom({ tool: 'count', pts: [] }), /at least 1/, 'no count point');
+    throwsMsg(() => M.validateGeom({ tool: 'polyline', pts: Array.from({ length: 100001 }, (_, i) => [i, i % 2]) }), /100000/, 'too many points');
+    for (const g of [null, [], 'x', { tool: 'circle' }, { tool: 'polyline' }, { tool: 'polyline', pts: [[0, 0], [1, 1]], extra: 1 }, { tool: 'area', outer: sq(0, 0, 1), holes: 'x' }])
+      throwsMsg(() => M.validateGeom(g), /geom|tool|pts|outer|holes|unknown/, 'bad geom ' + JSON.stringify(g));
+    // a large hand-drawn outline (a 20000-gon) validates and measures as a circle
+    {
+      const n = 20000, R = 1000, ring = Array.from({ length: n }, (_, i) => [R * Math.cos(2 * Math.PI * i / n), R * Math.sin(2 * Math.PI * i / n)]);
+      const t0 = Date.now(), a = q({ tool: 'area', outer: ring, holes: [] }, { scale: 1 }).qty;
+      assert.ok(Math.abs(a - Math.PI * R * R) / (Math.PI * R * R) < 1e-6, `${where} 20000-gon area ${a}`);
+      assert.ok(Date.now() - t0 < 5000, `${where} 20000-gon validated in ${Date.now() - t0} ms`);
+    }
+
+    // geomKey: identical geometry whatever the start point, direction, rect/area form or noise below 1e-6
+    const k = g => M.geomKey(g);
+    const ring = [[0, 0], [100, 0], [100, 50], [0, 50]];
+    assert.strictEqual(k(outer(ring)), k(outer([ring[2], ring[3], ring[0], ring[1]])), `${where} rotated ring`);
+    assert.strictEqual(k(outer(ring)), k(outer(ring.slice().reverse())), `${where} reversed ring`);
+    assert.strictEqual(k(outer(ring)), k({ tool: 'rect', p1: [100, 50], p2: [0, 0] }), `${where} a rect = the same outline`);
+    assert.strictEqual(k(outer(ring)), k(outer(ring.map(([x, y]) => [x + 1e-8, y - 1e-8]))), `${where} below 1e-6`);
+    assert.notStrictEqual(k(outer(ring)), k(outer(ring.map(([x, y]) => [x + 1e-3, y]))), `${where} a real shift`);
+    assert.strictEqual(k({ tool: 'area', outer: sq(0, 0, 100), holes: [sq(10, 10, 5), sq(50, 50, 5)] }), k({ tool: 'area', outer: sq(0, 0, 100), holes: [sq(50, 50, 5).reverse(), sq(10, 10, 5)] }), `${where} holes in any order`);
+    assert.notStrictEqual(k(outer(sq(0, 0, 100))), k({ tool: 'area', outer: sq(0, 0, 100), holes: [sq(10, 10, 5)] }), `${where} a hole makes it different`);
+    assert.strictEqual(k(poly), k({ tool: 'polyline', pts: poly.pts.slice().reverse() }), `${where} a reversed polyline`);
+    assert.strictEqual(k({ tool: 'line', pts: [[0, 0], [5, 5]] }), k({ tool: 'polyline', pts: [[5, 5], [0, 0]] }), `${where} line = polyline`);
+    assert.notStrictEqual(k({ tool: 'polyline', pts: [[0, 0], [5, 0], [5, 5]] }), k(outer([[0, 0], [5, 0], [5, 5]])), `${where} an open path is not an outline`);
+    assert.strictEqual(k({ tool: 'count', pts: [[1, 1], [2, 2]] }), k({ tool: 'count', pts: [[2, 2], [1, 1]] }), `${where} count points in any order`);
+    assert.deepStrictEqual(plain(M.firstPoint(area)), [0, 0]); assert.deepStrictEqual(plain(M.firstPoint({ tool: 'rect', p1: [7, 8], p2: [1, 1] })), [7, 8]);
+    assert.strictEqual(M.pointCount(area), 8); assert.strictEqual(M.pointCount({ tool: 'rect', p1: [7, 8], p2: [1, 1] }), 2);
+  }
+  // node and browser give bit-identical results
+  for (const [g, o] of [[{ tool: 'polyline', pts: [[0.1, 0.2], [30.3, 40.7], [31, 100.9]] }, { scale: 0.0123, width: 0.37, factor: 1.1 }],
+    [{ tool: 'area', outer: [[0, 0], [97.3, 1.1], [101, 77.7], [3, 66.6]], holes: [[[10, 10], [20, 11], [15, 19]]] }, { scale: 0.0371, depth: 0.15 }]])
+    assert.strictEqual(JSON.stringify(browser.manualQty(g, o)), JSON.stringify(node.manualQty(g, o)));
+}
+
 console.log('takeoff ok');
