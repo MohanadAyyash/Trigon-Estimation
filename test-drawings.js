@@ -235,7 +235,8 @@ server.listen(0, async () => {
       db.prepare('UPDATE drawings SET units=? WHERE id=?').run(units, id);
       // not ready → 409
       for (const st of ['failed', 'parsing']) {
-        const nid = Number(db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(?,?,?,1,?,'x')").run(tid, 'nr', 'f'.repeat(64), st).lastInsertRowid);
+        // failed by this parser version (an older version's failure is parsed again: see the corrupt-file test)
+        const nid = Number(db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,failed_version,created) VALUES(?,?,?,1,?,?,'x')").run(tid, 'nr', 'f'.repeat(64), st, st === 'failed' ? PARSER_VERSION : null).lastInsertRowid);
         const r = await getRaw(`drawings/${nid}/render`, qs);
         assert.strictEqual(r.s, 409, st); assert.match(JSON.parse(r.b).error, new RegExp('drawing is ' + st));
         db.prepare('DELETE FROM drawings WHERE id=?').run(nid);
@@ -441,6 +442,28 @@ server.listen(0, async () => {
       assert.strictEqual((await call('PUT', `drawings/${r.j.id}/units`, { units: 'm' }, qs)).s, 409, 'units need a ready drawing');
       const pf = (await call('GET', 'audit', null, admin)).j.find(a => a.action === 'parse_failed');
       assert.ok(pf && /truncated/.test(JSON.parse(pf.detail).error));
+      // final review item 3: the failure keeps the parser version that failed; a newer parser tries the file once more
+      const { PARSER_VERSION: PV } = require('./lib/dxf/summary.js'), w = ctx.drawings._workers, fid = r.j.id;
+      assert.strictEqual(db.prepare('SELECT failed_version FROM drawings WHERE id=?').get(fid).failed_version, PV, 'failed_version stored');
+      let s0 = w.started;
+      assert.strictEqual((await call('GET', `drawings/${fid}`, null, qs)).j.status, 'failed');
+      assert.strictEqual(w.started - s0, 0, 'failed by this parser version: not parsed again');
+      db.prepare('UPDATE drawings SET failed_version=? WHERE id=?').run(PV - 1, fid);   // as if an older parser had failed
+      const g1 = await call('GET', `drawings/${fid}`, null, qs);
+      assert.strictEqual(g1.s, 200); assert.strictEqual(g1.j.status, 'parsing', 'an older version\'s failure is queued again');
+      const f2 = await waitDone(fid, qs);
+      assert.strictEqual(f2.status, 'failed'); assert.match(f2.error, /truncated/); assert.strictEqual(w.started - s0, 1, 'one re-parse');
+      assert.strictEqual(db.prepare('SELECT failed_version FROM drawings WHERE id=?').get(fid).failed_version, PV);
+      s0 = w.started;
+      assert.strictEqual((await call('GET', `drawings/${fid}`, null, qs)).j.status, 'failed'); assert.strictEqual(w.started - s0, 0, 'once only');
+      // a file an older parser could not read and this one can (failed_version NULL: failed before the column): ready again
+      const oid = Number(db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,error,created) VALUES(?,'old failure',?,1,'failed','old parser error','x')").run(tid, d.sha256).lastInsertRowid);
+      assert.strictEqual((await call('GET', `drawings/${oid}`, null, viewer)).j.status, 'parsing');
+      const o2 = await waitDone(oid, qs);
+      assert.strictEqual(o2.status, 'ready', o2.error); assert.strictEqual(o2.error, null);
+      const pr = (await call('GET', 'audit', null, admin)).j.filter(a => a.action === 'parse_retry').map(a => [Number(a.entity_id), JSON.parse(a.detail)]);
+      assert.deepStrictEqual(pr, [[oid, { failed_version: null, parser_version: PV }], [fid, { failed_version: PV - 1, parser_version: PV }]], 'retries audited');
+      db.prepare('DELETE FROM drawings WHERE id=?').run(oid);
     }
 
     // ---- responsiveness: the server answers while a 100,000-LINE parse runs ------------------------------

@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS measurements(id INTEGER PRIMARY KEY AUTOINCREMENT, dr
 CREATE INDEX IF NOT EXISTS measurements_drawing ON measurements(drawing_id);
 CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
 `);
+  // the PARSER_VERSION whose parse failed (status 'failed'); a newer parser tries the file once more (NULL: failed before
+  // this column, so also tried once more)
+  if (!db.prepare('PRAGMA table_info(drawings)').all().some(c => c.name === 'failed_version')) db.exec('ALTER TABLE drawings ADD COLUMN failed_version INTEGER');
   // 1 = saved with confirm_uom: the user accepted that qty_unit differs from the row's unit
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'uom_confirmed')) db.exec('ALTER TABLE measurements ADD COLUMN uom_confirmed INTEGER NOT NULL DEFAULT 0');
   // 1 = saved with confirm_incomplete: its layer had shapes with no area (area) or approximated curves
@@ -98,10 +101,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // revise: copy the drawings rows (same sha256, no file copy) and the measurements with row ids remapped
   const cloneForTender = (oldTid, newTid, rowIdMap) => {
     const dmap = new Map(), parsing = [];
-    const insD = db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,rev,replaced_by,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?,?)');
+    const insD = db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,rev,replaced_by,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)');
     const olds = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(oldTid);
     for (const d of olds) {
-      const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.rev, d.created, d.created_by).lastInsertRowid);
+      const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.failed_version, d.rev, d.created, d.created_by).lastInsertRowid);
       dmap.set(d.id, nid);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
@@ -248,7 +251,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
           if (r.ok) db.prepare("UPDATE drawings SET status='ready', suggested_units=?, error=NULL WHERE id=? AND status='parsing'").run(r.suggested_units, id);
           else {
             const error = plain(r.error).slice(0, 500);
-            if (db.prepare("UPDATE drawings SET status='failed', error=? WHERE id=? AND status='parsing'").run(error, id).changes) audit('system', 'parse_failed', 'drawings', id, { error });
+            if (db.prepare("UPDATE drawings SET status='failed', error=?, failed_version=? WHERE id=? AND status='parsing'").run(error, PARSER_VERSION, id).changes) audit('system', 'parse_failed', 'drawings', id, { error });
           }
         });
       } catch (e) { console.error('drawings: could not record the parse result for drawing ' + id, e); }
@@ -280,7 +283,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       if (!r.transient) try {
         tx(() => {
           for (const d of db.prepare("SELECT id FROM drawings WHERE sha256=? AND status='ready'").all(sha))
-            if (db.prepare("UPDATE drawings SET status='failed', error=? WHERE id=? AND status='ready'").run(error, d.id).changes) audit('system', 'parse_failed', 'drawings', d.id, { error });
+            if (db.prepare("UPDATE drawings SET status='failed', error=?, failed_version=? WHERE id=? AND status='ready'").run(error, PARSER_VERSION, d.id).changes) audit('system', 'parse_failed', 'drawings', d.id, { error });
         });
       } catch (e) { console.error('drawings: could not record the failed re-parse of drawing file ' + sha, e); }
       bad('the drawing could not be read again: ' + error, 409);
@@ -339,12 +342,26 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     } finally { release(got.sha, used); }
   }
 
+  // a drawing that failed under another parser version: parse it again, once (this version's failure, if any, sticks).
+  // Runs on every read of a drawing; the guarded UPDATE lets only one request queue it. Returns the current row.
+  function retryFailed(d) {
+    if (d.status !== 'failed' || d.failed_version === PARSER_VERSION) return d;
+    const queued = tx(() => {
+      const n = db.prepare("UPDATE drawings SET status='parsing', error=NULL WHERE id=? AND status='failed' AND (failed_version IS NULL OR failed_version<>?)").run(d.id, PARSER_VERSION).changes;
+      if (n) audit('system', 'parse_retry', 'drawings', d.id, { failed_version: d.failed_version, parser_version: PARSER_VERSION });
+      return n > 0;
+    });
+    if (queued) startParse(d.id, d.sha256);
+    return drawingRow(d.id);
+  }
+
   async function drawingApi(req, res, parts, me) {
     const [, idStr, sub] = parts, method = req.method;
-    const d = drawingRow(idOf(idStr));
+    let d = drawingRow(idOf(idStr));
     if (!d) bad('drawing not found', 404);
     const t = tenderRow(d.tender_id);
     if (!t) bad('drawing not found', 404);
+    if (method === 'GET') d = retryFailed(d);
     if (sub === undefined && parts.length === 2 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer');
       const c = d.status === 'ready' ? await readSummary(d.sha256) : null;
