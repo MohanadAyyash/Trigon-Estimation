@@ -207,8 +207,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (require.main === module) server.listen(PORT, HOST, () => {
-  console.log(`Trigon Estimation on http://${HOST}:${PORT}`);
-  ctx.costs.startScheduler();   // once now, then every sync_minutes (skipped when ERP_SYNC_DISABLED=1)
-});
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Trigon Estimation on http://${HOST}:${PORT}`);
+    ctx.costs.startScheduler();   // once now, then every sync_minutes (skipped when ERP_SYNC_DISABLED=1)
+  });
+  // stopped (Ctrl+C, a service stop, Ctrl+Break, or the command window closed on Windows: SIGHUP): fold the WAL into
+  // estimation.db and close it, so the data folder holds the whole database in one file. Best effort: the restore steps
+  // in README.md still delete a leftover -wal / -shm.
+  const stop = () => {
+    try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch (e) { console.error('could not checkpoint the database: ' + e.message); }
+    try { db.close(); } catch (e) { console.error('could not close the database: ' + e.message); }
+    process.exit(0);
+  };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, stop);
+}
 module.exports = { server, db, ctx };

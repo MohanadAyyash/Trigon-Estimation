@@ -111,4 +111,38 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
   assert.deepStrictEqual(fs.readdirSync(bd), [f], 'no .tmp left');
   fs.rmSync(dir, { recursive: true, force: true });
 }
-console.log('backup ok');
+// final review item 2: a stopped server leaves no WAL to replay. On SIGINT / SIGTERM the server checkpoints the WAL into
+// estimation.db (TRUNCATE) and closes the database, so a restore that replaces estimation.db never meets a stale -wal.
+(async () => {
+  const { spawn } = require('child_process'), net = require('net');
+  const freePort = () => new Promise(ok => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => ok(p)); }); });
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-backup-wal-'));
+    const port = await freePort();
+    const child = spawn(process.execPath, ['--no-warnings', path.join(__dirname, 'server.js')],
+      { env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', ERP_SYNC_DISABLED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', c => { out += c; }); child.stderr.on('data', c => { out += c; });
+    const exited = new Promise(ok => child.on('exit', (code, signal) => ok({ code, signal })));
+    for (const t0 = Date.now(); !out.includes('Trigon Estimation on');) {
+      if (Date.now() - t0 > 10000) { child.kill('SIGKILL'); throw new Error('server did not start: ' + out); }
+      await new Promise(f => setTimeout(f, 20));
+    }
+    // a write through the server: the WAL holds frames that are not in estimation.db yet
+    const r = await fetch(`http://127.0.0.1:${port}/api/setup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'admin', password: 'secret12' }) });
+    assert.strictEqual(r.status, 200, sig + ' setup');
+    const wal = path.join(dir, 'estimation.db-wal');
+    assert.ok(fs.existsSync(wal) && fs.statSync(wal).size > 0, sig + ': the WAL has frames while the server runs');
+    child.kill(sig);
+    const ex = await exited;
+    assert.strictEqual(ex.code, 0, sig + ': clean exit ' + JSON.stringify(ex) + ' ' + out);
+    assert.ok(!fs.existsSync(wal) || fs.statSync(wal).size === 0, sig + ': WAL checkpointed (size ' + (fs.existsSync(wal) ? fs.statSync(wal).size : 'absent') + ')');
+    // estimation.db alone (no -wal, no -shm) has the data
+    for (const f of ['estimation.db-wal', 'estimation.db-shm']) fs.rmSync(path.join(dir, f), { force: true });
+    const b = new DatabaseSync(path.join(dir, 'estimation.db'), { readOnly: true });
+    assert.strictEqual(b.prepare("SELECT COUNT(*) n FROM users WHERE username='admin'").get().n, 1, sig + ': the write is in estimation.db');
+    b.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  console.log('backup ok');
+})().catch(e => { console.error(e); process.exit(1); });
