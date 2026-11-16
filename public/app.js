@@ -667,10 +667,14 @@
     viewerOpeners.set(d.id, openViewer);
     const f = lt.units_confirmed ? UNIT_TO_M[lt.units] : null;
 
-    // one open at a time per card: a second Open or Show while loading waits for the same one
+    const errorBanner = msg => h('div', { id: 'tv-error', class: 'banner banner-red' }, h('strong', null, t('tv_unavailable')), ': ', msg);
+    // one open at a time per card: a second Open or Show while loading waits for the same one. Any failure (the download,
+    // the display file, building the viewer) puts the card back to Open with the message: never a stuck button.
     let opening = null;
     function openViewer() {
-      if (!opening) opening = loadViewer().finally(() => { opening = null; });
+      if (!opening) opening = loadViewer().catch(e => {
+        if (sec.isConnected) idle(errorBanner(String((e && e.message) || e)));
+      }).finally(() => { opening = null; });
       return opening;
     }
     async function loadViewer() {
@@ -688,7 +692,7 @@
         R = TV.decodeRender(ab);
       } catch (e) {
         if (tok !== routeTok) return;
-        return idle(h('div', { id: 'tv-error', class: 'banner banner-red' }, h('strong', null, t('tv_unavailable')), ': ', e.message));
+        return idle(errorBanner(e.message));
       }
       const canvas = h('canvas', { id: 'tv-canvas' });
       const layersBox = h('div', { class: 'tv-layer-list' });

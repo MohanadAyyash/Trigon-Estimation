@@ -412,6 +412,20 @@ server.listen(0, async () => {
     assert.ok(await page.$(D + ' #dw-layers') && await page.isEnabled(D + ' #tv-open'), 'the tab keeps working; Open can be tried again');
     await page.unroute('**/api/drawings/*/render');
     { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'display refusal logged'); errors.splice(i, 1); }
+    // final review item 10: a 500 from render, or a failure while the viewer is built: back to Open with the message
+    await page.route('**/api/drawings/*/render', r => r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'internal error' }) }));
+    await page.click(D + ' #tv-open');
+    await page.waitForSelector(D + ' #tv-error');
+    assert.ok((await page.textContent(D + ' #tv-error')).includes('internal error'), '500 shown');
+    assert.ok(await page.isEnabled(D + ' #tv-open'), 'Open can be tried again after a 500');
+    await page.unroute('**/api/drawings/*/render');
+    { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('500')); assert.ok(i >= 0, '500 logged'); errors.splice(i, 1); }
+    await page.evaluate(() => { window.__tvCreateReal = TVCanvas.create; TVCanvas.create = () => { throw new Error('test engine failure'); }; });
+    await page.click(D + ' #tv-open');
+    await page.waitForSelector(D + ' #tv-error');
+    assert.ok((await page.textContent(D + ' #tv-error')).includes('test engine failure'), 'a failure after the download is shown too');
+    assert.ok(await page.isEnabled(D + ' #tv-open'), 'no stuck disabled Open'); assert.strictEqual(await page.$(D + ' #tv-loading'), null, 'not stuck loading');
+    await page.evaluate(() => { TVCanvas.create = window.__tvCreateReal; });
     await openViewer();
     assert.strictEqual(await page.$(D + ' #tv-error'), null, 'banner gone once shown');
     assert.ok(await page.evaluate(() => typeof window.__tvLastFrameMs === 'number'), 'a frame was drawn');
