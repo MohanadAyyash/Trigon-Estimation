@@ -214,7 +214,7 @@ server.listen(0, async () => {
       const r1 = await getRaw(`drawings/${id}/render`, viewer);
       assert.strictEqual(r1.s, 200, r1.b.toString());
       assert.strictEqual(r1.h['content-type'], 'application/octet-stream'); assert.strictEqual(r1.h['content-encoding'], 'gzip');
-      assert.strictEqual(r1.h.etag, `"${d.sha256}-${PARSER_VERSION}"`); assert.strictEqual(r1.h['cache-control'], 'private, max-age=86400');
+      assert.strictEqual(r1.h.etag, `"${d.sha256}-${PARSER_VERSION}"`); assert.strictEqual(r1.h['cache-control'], 'private, no-cache', 'revalidated with the ETag every time');
       assert.ok(r1.b.equals(fs.readFileSync(rf)), 'the stored gz bytes as they are');
       assert.strictEqual(Number(r1.h['content-length']), r1.b.length);
       const raw = zlib.gunzipSync(r1.b), header = JSON.parse(raw.subarray(4, 4 + raw.readUInt32LE(0)).toString('utf8'));
@@ -223,7 +223,7 @@ server.listen(0, async () => {
       assert.ok(header.layers.some(l => l.name === 'أسفلت'), 'Arabic layer name round-trips');
       assert.deepStrictEqual(header.blocks, ['MH1']);
       const r2 = await getRaw(`drawings/${id}/render`, qs, { 'If-None-Match': r1.h.etag });
-      assert.strictEqual(r2.s, 304); assert.strictEqual(r2.b.length, 0); assert.strictEqual(r2.h.etag, r1.h.etag);
+      assert.strictEqual(r2.s, 304); assert.strictEqual(r2.b.length, 0); assert.strictEqual(r2.h.etag, r1.h.etag); assert.strictEqual(r2.h['cache-control'], 'private, no-cache');
       assert.strictEqual((await getRaw(`drawings/${id}/render`, qs, { 'If-None-Match': '"other", ' + r1.h.etag })).s, 304, 'a list of tags');
       assert.strictEqual((await getRaw(`drawings/${id}/render`, qs, { 'If-None-Match': `"${d.sha256}-1"` })).s, 200, 'another parser version: full body');
       assert.strictEqual((await getRaw(`drawings/${id}/render`, '')).s, 401);

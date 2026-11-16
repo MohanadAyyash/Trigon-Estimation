@@ -395,6 +395,7 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   }
 
   // the display file, gzipped bytes as stored. Geometry is not a quantity: served before units are confirmed.
+  // no-cache: the browser keeps it but asks every time (ETag, 304), so a re-parsed file is never shown from a stale copy.
   async function serveRender(req, res, d, me) {
     need(me, 'admin', 'qs', 'viewer');
     if (d.status !== 'ready') bad(`drawing is ${d.status}: nothing to show yet`, 409);
@@ -403,12 +404,12 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
     const v = await readSummary(sha);
     if (v.render && v.render.ok === false) bad('display not available for this drawing: ' + plain(v.render.error), 409);   // recorded: no re-parse
     const tags = String(req.headers['if-none-match'] || '').split(',').map(t => t.trim().replace(/^W\//, ''));
-    if (tags.includes(etag) || tags.includes('*')) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'private, max-age=86400' }); res.end(); return true; }
+    if (tags.includes(etag) || tags.includes('*')) { res.writeHead(304, { ETag: etag, 'Cache-Control': 'private, no-cache' }); res.end(); return true; }
     let fh;
     try { fh = await fsp.open(renderFile(sha), 'r'); } catch (e) { bad('the parsed drawing is missing: upload the drawing again', 409); }
     let size;
     try { size = (await fh.stat()).size; } catch (e) { await fh.close().catch(() => {}); throw e; }
-    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Encoding': 'gzip', 'Content-Length': size, ETag: etag, 'Cache-Control': 'private, max-age=86400' });
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Encoding': 'gzip', 'Content-Length': size, ETag: etag, 'Cache-Control': 'private, no-cache' });
     const rs = fh.createReadStream();   // closes the file when done
     rs.on('error', () => res.destroy());
     res.on('close', () => rs.destroy());
