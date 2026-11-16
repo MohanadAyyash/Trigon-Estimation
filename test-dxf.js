@@ -793,4 +793,20 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   }
 }
 
-console.log('ok test-dxf');
+// final review item 11: the parse worker says whether a failure is transient (the file could not be read) or about the
+// file itself, instead of the server matching its message
+(async () => {
+  const { Worker } = require('worker_threads'), fs = require('fs'), os = require('os'), path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-dxf-worker-'));
+  const run = file => new Promise((ok, no) => { const w = new Worker(path.join(__dirname, 'lib', 'dxf', 'worker.js'), { workerData: { file } }); w.once('message', m => { w.terminate(); ok(m); }); w.once('error', no); });
+  try {
+    assert.deepStrictEqual(await run(path.join(dir, 'missing.dxf')), { ok: false, transient: true, error: 'the stored drawing file is missing' });
+    fs.mkdirSync(path.join(dir, 'a-folder.dxf'));
+    const r = await run(path.join(dir, 'a-folder.dxf'));
+    assert.strictEqual(r.transient, true, 'a read error is transient'); assert.match(r.error, /^could not read the stored drawing file \(EISDIR\)$/);
+    fs.writeFileSync(path.join(dir, 'bad.dxf'), '0\nSECTION\n2\nENTITIES\n0\nLINE\n5\nA\n');
+    const b = await run(path.join(dir, 'bad.dxf'));
+    assert.strictEqual(b.ok, false); assert.strictEqual(b.transient, false, 'a file that cannot be parsed is not transient'); assert.match(b.error, /truncated/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  console.log('ok test-dxf');
+})().catch(e => { console.error(e); process.exit(1); });

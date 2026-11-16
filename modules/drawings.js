@@ -216,8 +216,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
       w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, transient: true, error: msg.stopped + ' (exit code ' + code + ')' }); });
     });
   }
-  const runWorker = sha => spawnWorker(WORKER, { file: dxfFile(sha) },
-    m => m.ok === false && /^(the stored drawing file is missing|could not read the stored)/.test(String(m.error)) ? { ...m, transient: true } : m,
+  // the worker says whether its failure is transient (the file could not be read) or about the file itself
+  const runWorker = sha => spawnWorker(WORKER, { file: dxfFile(sha) }, m => m.ok === false ? { ...m, transient: m.transient === true } : m,
     { timeout: 'parse timed out', bad: 'bad parser reply', oom: TOO_LARGE, stopped: 'the parser stopped unexpectedly' });
   // a selection total: never changes a drawing's status (any failure is reported to the caller only)
   const runSelect = (sha, handles, metric, nested) => spawnWorker(SELECT_WORKER, { file: cacheFile(sha), handles, metric, nested: !!nested }, m => m,
