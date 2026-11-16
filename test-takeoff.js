@@ -106,6 +106,14 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
   near(verifyPct({ scale: 0.05 }, [0, 0], [0, 200], 10000, 'mm'), 0, 'exact in mm');
   assert.throws(() => verifyPct({ scale: 0.05 }, [0, 0], [5, 0], 1, 'm'), /at least 10/);
   assert.throws(() => verifyPct({ scale: 0.05 }, [0, 0], [50, 0], 0, 'm'), /real length/);
+  // non-finite or zero results never pass as a number (1e306 km overflows to Infinity, 5e-324 mm underflows to 0)
+  assert.throws(() => scaleOf([0, 0], [100, 0], 1e306, 'km'), /real length/, 'real in metres overflows');
+  assert.throws(() => scaleOf([0, 0], [100, 0], 5e-324, 'mm'), /real length/, 'real in metres underflows to 0');
+  assert.throws(() => scaleOf([0, 0], [1e9, 0], 1e-320, 'm'), /scale/, 'scale underflows to 0');
+  assert.throws(() => verifyPct({ scale: 0.05 }, [0, 0], [200, 0], 1e306, 'km'), /real length/, 'verify: real overflows');
+  assert.throws(() => verifyPct({ scale: 1e308 }, [-1e9, 0], [1e9, 0], 1e-300, 'm'), /verify/, 'verify: % overflows');
+  assert.throws(() => verifyPct({ scale: NaN }, [0, 0], [200, 0], 10, 'm'), /verify/, 'verify: bad stored scale');
+  for (const p of [[NaN, 0], [0, Infinity], null, [1]]) assert.throws(() => calibrationFor(cals, p), /point/, 'calibrationFor ' + JSON.stringify(p));
 }
 
 console.log('takeoff ok');

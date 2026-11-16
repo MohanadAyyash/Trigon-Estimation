@@ -1511,9 +1511,11 @@ server.listen(0, async () => {
       assert.strictEqual(v.s, 200); assert.ok(Math.abs(v.j.pct) < 1); assert.strictEqual(v.j.warning, false);
       assert.strictEqual((await call('GET', cpath(P1), null, viewer)).j.calibrations[0].verify_pct, v.j.pct);
       for (const [b, re] of [[{ p1: [0, 0], p2: [5, 0], real: 1, unit: 'm' }, /at least 10/], [{ p1: [0, 0], p2: [50, 0], real: -1, unit: 'm' }, /real length/],
-        [{ p1: [0, 0], p2: [50, 0], real: 1, unit: 'm', apply: true }, /unknown field/]]) {
+        [{ p1: [0, 0], p2: [50, 0], real: 1, unit: 'm', apply: true }, /unknown field/], [{ p1: [0, 0], p2: [200, 0], real: 1e306, unit: 'km' }, /real length/]]) {
+        const pctBefore = calRows(P1).find(c => c.id === pageId).verify_pct;
         const x = await call('POST', vpath(pageId), b, qs);
-        assert.strictEqual(x.s, 400); assert.match(x.j.error, re);
+        assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, re);
+        assert.strictEqual(calRows(P1).find(c => c.id === pageId).verify_pct, pctBefore, 'verify_pct unchanged');
       }
       const p2cal = calRows(P2)[0].id;
       assert.strictEqual((await call('POST', vpath(p2cal), { p1: [0, 0], p2: [200, 0], real: 10, unit: 'm' }, qs)).s, 404, 'a calibration of another drawing');
@@ -1525,6 +1527,17 @@ server.listen(0, async () => {
       let x = await call('DELETE', `${cpath(P1)}/${regB.id}`, null, qs);
       assert.strictEqual(x.s, 409); assert.match(x.j.error, /measurements use/);
       assert.ok(calRows(P1).some(c => c.id === regB.id));
+      // re-calibrating it while a measurement uses it: 409 with or without apply (no manual recompute before Task 4),
+      // the measurement and the calibration unchanged
+      {
+        const mBefore = db.prepare('SELECT * FROM measurements WHERE id=?').get(fakeM), cBefore = calRows(P1);
+        for (const apply of [undefined, true]) {
+          const y = await call('POST', cpath(P1), { region: [300, 100, 400, 300], p1: [300, 100], p2: [400, 100], real: 2, unit: 'm', ...(apply ? { apply } : {}) }, qs);
+          assert.strictEqual(y.s, 409, 'apply ' + apply + ': ' + JSON.stringify(y.j)); assert.match(y.j.error, /recomputed/);
+        }
+        assert.deepStrictEqual(db.prepare('SELECT * FROM measurements WHERE id=?').get(fakeM), mBefore, 'measurement unchanged');
+        assert.deepStrictEqual(calRows(P1), cBefore, 'calibrations unchanged');
+      }
       db.prepare('DELETE FROM measurements WHERE id=?').run(fakeM);
       x = await call('DELETE', `${cpath(P1)}/${regB.id}`, null, qs);
       assert.strictEqual(x.s, 200, JSON.stringify(x.j));
