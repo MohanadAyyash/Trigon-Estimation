@@ -715,6 +715,7 @@
         selListeners.clear();
         const form = linkForm({ drawing_id: d.id, tool: 'dxf_selection', metric: 'open_length', handles: () => eng.selectedHandles(), count: () => Number(selected.getAttribute('data-n')),
           onSelectionChange: fn => selListeners.add(fn), setNested: on => { nestedOn = on; showSel(); },
+          hasNested: () => TV.previewBlocks(R, eng.selection()).some(b => b.nested > 0),
           // changed: the selection (or form) changed while the save was on its way: keep the new selection
           onSaved: async (res, changed) => {
             selListeners.clear(); host.replaceChildren(); nestedOn = false;
@@ -806,7 +807,8 @@
 
   // the server's refusal of a link: its message, plus a confirm box only for the refusals a user may confirm
   // A selection (isSel) gets the same gates in selection words, with the server's counts.
-  function linkRefusal(e, msg, addConfirm, isSel) {
+  // nestedOff: a selection count holding nested inserts, sent without them (a refusal for nothing countable then points to the box)
+  function linkRefusal(e, msg, addConfirm, isSel, nestedOff) {
     const j = e.body || {};
     const selText = isSel && e.status === 409 ? ({ 'already measured on this row': t('tv_r_overlap'), 'layer quantity is incomplete': t('tv_r_incomplete'),
       'possible duplicates on this layer': t('tv_r_duplicates'), 'unit mismatch': t('tv_r_uom'), 'selection contains several blocks': t('tv_r_mixed') })[j.error] : null;
@@ -822,6 +824,7 @@
     else if (mixed) box = addConfirm('confirm_mixed_blocks', t('tv_confirm_mixed', { n: Object.keys(j.blocks).length }));
     else if (e.status === 409 && j.error === 'layer quantity is incomplete') box = addConfirm('confirm_incomplete', t('lk_confirm_incomplete', { a: j.area_excluded || 0, b: j.approx || 0, c: j.dropped || 0 }));
     else if (e.status === 400 && /^unit mismatch/.test(j.error || '')) msg.append(h('p', { class: 'warn', id: 'lk-hint-width' }, t('lk_hint_width', { row: j.row_unit || '—', qty: j.qty_unit || '—' })));
+    else if (e.status === 400 && nestedOff && j.error === 'nothing in the selection can be measured as count') msg.append(h('p', { class: 'warn', id: 'lk-hint-nested' }, t('lk_hint_nested')));
     if (box) msg.append(h('p', { class: 'muted small' }, t('lk_tick_to_save')));
   }
   // width / depth / factor: plain digits with a dot only. "1,5" is refused, never read as 15 (or 1.5).
@@ -902,7 +905,7 @@
         save.disabled = false;
         // a refusal of what was sent before a change: no confirm box (it would go out with the new choice)
         if (g !== gen) msg.replaceChildren(h('p', { class: 'warn', id: 'lk-changed' }, t('lk_changed_save_again')));
-        else linkRefusal(e, msg, cb.add, isSel);
+        else linkRefusal(e, msg, cb.add, isSel, isSel && metric === 'count' && !b.nested && target.hasNested());
         return;
       }
       flash(t('saved'), 'ok');

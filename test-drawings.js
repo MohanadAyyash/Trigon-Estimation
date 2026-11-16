@@ -218,7 +218,7 @@ server.listen(0, async () => {
       assert.ok(r1.b.equals(fs.readFileSync(rf)), 'the stored gz bytes as they are');
       assert.strictEqual(Number(r1.h['content-length']), r1.b.length);
       const raw = zlib.gunzipSync(r1.b), header = JSON.parse(raw.subarray(4, 4 + raw.readUInt32LE(0)).toString('utf8'));
-      assert.strictEqual(header.version, 2);
+      assert.strictEqual(header.version, 3);
       assert.deepStrictEqual(header.handles, cache.flat.map(f => f.handle), 'one entity per cache entry, same order');
       assert.ok(header.layers.some(l => l.name === 'أسفلت'), 'Arabic layer name round-trips');
       assert.deepStrictEqual(header.blocks, ['MH1']);

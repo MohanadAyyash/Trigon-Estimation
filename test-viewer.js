@@ -40,7 +40,7 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   const big = new ArrayBuffer(buf.length + 8);
   new Uint8Array(big, 8).set(buf);
   const R = TV.decodeRender(big, 8);
-  assert.strictEqual(R.n, 2); assert.strictEqual(R.version, 2);
+  assert.strictEqual(R.n, 2); assert.strictEqual(R.version, 3);
   assert.deepStrictEqual(R.handles, ['A', 'S']); assert.deepStrictEqual(ids(R.kind), [0, 1]); assert.deepStrictEqual(ids(R.count), [2, 4]);
   assert.ok(R.pts instanceof Float32Array && R.eo instanceof Float64Array && R.len instanceof Float64Array);
   assert.strictEqual(R.pts.buffer, big, 'pts is a view on the given buffer');
@@ -144,6 +144,51 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   assert.deepStrictEqual(TV.snap(G, R, 4.05, 1.02, 0.1, on), { x: 4, y: 1, kind: 'end' });
   assert.deepStrictEqual(TV.snap(G, R, 2.45, 1.05, 0.1, on), { x: 2.5, y: 1, kind: 'mid' });
   assert.strictEqual(TV.snap(G, R, 3.2, 1.5, 0.1, on), null);
+}
+
+// ---- display file v3: snap only to true vertices (vtx = 1); a midpoint only of a straight segment; never a tessellation point ----
+{
+  const lwpB = (h, pts, closed, layer = '0') => [[0, 'LWPOLYLINE'], [5, h], [8, layer], [90, pts.length], [70, closed ? 1 : 0],
+    ...pts.flatMap(([x, y, b]) => [[10, x], [20, y], ...(b ? [[42, b]] : [])])];
+  // a closed square s × s at (x0, y0) whose bottom edge is a half-circle bulge (through (x0 + s/2, y0 - s/2))
+  const shape = (x0, y0, s) => lwpB('B', [[x0, y0, 1], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s]], true);
+  for (const [X, Y, s, what] of [[0, 0, 10, 'local'], [500000, 2700000, 10, 'georeferenced m'], [500000000, 2700000000, 10000, 'georeferenced mm']]) {
+    const R = load(ents(shape(X, Y, s))), G = TV.buildGrid(R), on = allOn(R);
+    assert.ok(R.vtx instanceof Uint8Array && R.vtx.length === R.pts.length / 2, what + ': one vtx flag per point');
+    const st = R.start[0], c = R.count[0], v = ids(R.vtx.subarray(st, st + c));
+    assert.ok(c > 8, what + ': the arc is tessellated');
+    assert.deepStrictEqual(v, [1, ...Array(c - 4).fill(0), 1, 1, 1], what + ': vtx 1 at the four vertices only');
+    const tol = s / 20;
+    // every tessellation point: never a snap target (nothing, or a true vertex)
+    for (let k = st + 1; k < st + c - 3; k++) {
+      const wx = R.eo[0] + R.pts[2 * k], wy = R.eo[1] + R.pts[2 * k + 1], r = TV.snap(G, R, wx, wy, tol, on);
+      assert.ok(r === null || (r.kind === 'end' && [[X, Y], [X + s, Y]].some(([a, b]) => Math.abs(r.x - a) <= 1e-3 && Math.abs(r.y - b) <= 1e-3)),
+        what + ': no snap to the arc point ' + k + ': ' + JSON.stringify(r));
+    }
+    // the arc's chords have no midpoint snap; the bottom of the arc snaps to nothing
+    assert.strictEqual(TV.snap(G, R, X + s / 2, Y - s / 2, tol, on), null, what + ': nothing at the bottom of the arc');
+    // true vertices reproduce within 1e-3 drawing units, also next to the arc
+    for (const [a, b] of [[X, Y], [X + s, Y], [X + s, Y + s], [X, Y + s]]) {
+      const r = TV.snap(G, R, a + tol / 3, b - tol / 4, tol, on);
+      assert.strictEqual(r && r.kind, 'end', what + ': vertex ' + a + ',' + b);
+      near(r.x, a, 1e-3, what + ' vertex x'); near(r.y, b, 1e-3, what + ' vertex y');
+    }
+    // a straight edge's midpoint (also the closing edge); within 1e-3
+    for (const [a, b] of [[X + s, Y + s / 2], [X + s / 2, Y + s], [X, Y + s / 2]]) {
+      const r = TV.snap(G, R, a + tol / 4, b + tol / 5, tol, on);
+      assert.strictEqual(r && r.kind, 'mid', what + ': midpoint ' + a + ',' + b);
+      near(r.x, a, 1e-3, what + ' mid x'); near(r.y, b, 1e-3, what + ' mid y');
+    }
+  }
+  // a short arc (one chord) has no midpoint snap either; insert markers and text anchors snap as 'end'
+  const A = load([...sec('BLOCKS', block('B', [])), ...ents([[0, 'ARC'], [5, 'A'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 3],
+    ...insert('I1', 'B', 'MH', 50, 50), [0, 'MTEXT'], [5, 'T'], [8, 'TX'], [10, 60], [20, 60], [1, 'NOTE']])]);
+  const GA = TV.buildGrid(A), onA = allOn(A);
+  const cx = 10 * Math.cos(1.5 * Math.PI / 180), cy = 10 * Math.sin(1.5 * Math.PI / 180);
+  assert.strictEqual(TV.snap(GA, A, cx, cy, 0.05, onA), null, 'no midpoint on a short arc');
+  assert.strictEqual(TV.snap(GA, A, 10, 0.01, 0.05, onA).kind, 'end', 'the arc start is a true vertex');
+  assert.deepStrictEqual(TV.snap(GA, A, 50.1, 50, 0.5, onA), { x: 50, y: 50, kind: 'end' }, 'insert marker');
+  assert.deepStrictEqual(TV.snap(GA, A, 60, 60.1, 0.5, onA), { x: 60, y: 60, kind: 'end' }, 'text anchor');
 }
 
 // ---- preview totals (display only): two 5 m lines drawn in mm → 10 ----

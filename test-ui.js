@@ -17,6 +17,9 @@ const used = [...new Set([...app.matchAll(/\bt\('([^']+)'/g)].map(m => m[1]))];
 assert.ok(used.length > 50, 'app.js uses t() keys');
 for (const k of used) for (const l of ['en', 'ar']) assert.ok(typeof I18N[l][k] === 'string' && I18N[l][k].trim(), `key "${k}" missing in ${l}`);
 assert.deepStrictEqual(Object.keys(I18N.ar).sort(), Object.keys(I18N.en).sort(), 'ar and en have the same keys');
+// batch-2 carry-over: the imperative of «عدّ» is «عُدّ» (not «اعدّ»)
+assert.ok(I18N.ar.tv_confirm_mixed.includes('عُدّ') && !I18N.ar.tv_confirm_mixed.includes('اعدّ'), 'AR tv_confirm_mixed: ' + I18N.ar.tv_confirm_mixed);
+assert.ok(I18N.en.lk_hint_nested.includes('Include nested inserts') && I18N.ar.lk_hint_nested.includes(I18N.ar.lk_nested), 'the nested hint names the box');
 assert.ok(!/innerHTML\s*=(?!\s*'')/.test(app), 'no innerHTML assignments with content (BOQ text is untrusted)');
 
 const { server, db } = require('./server.js');
@@ -619,6 +622,22 @@ server.listen(0, async () => {
       assert.ok((await page.textContent(`${D} #dw-measurements tr[data-row="${doorRow}"]`)).includes('several blocks'), 'mixed flag listed');
       assert.strictEqual(await v('count'), '—', 'nested box gone with the form; selection cleared');
       for (let k = 0; k < 2; k++) { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'mixed refusal logged'); errors.splice(i, 1); }
+      // batch-2 carry-over: only nested inserts selected (the HINGE row of the doors) with nested off: the refusal says to tick the box
+      await band([-500, 1500], [10000, 2500]);
+      assert.ok(await nSel() > 0, 'hinges selected');
+      assert.strictEqual(await v('count'), '—', 'nothing at the top level');
+      await page.click('#tv-link');
+      await page.waitForSelector(D + ' #lk-form #lk-metric');
+      await page.selectOption('#lk-metric', 'count');
+      await page.selectOption('#lk-row', String(doorRow));
+      await page.click('#lk-save');
+      await page.waitForSelector(D + ' #lk-hint-nested');
+      assert.ok((await page.textContent(D + ' #lk-msg')).includes('nothing in the selection can be measured as count'), 'refusal: ' + await page.textContent(D + ' #lk-msg'));
+      assert.ok((await page.textContent(D + ' #lk-hint-nested')).includes('Include nested inserts'), 'hint names the box');
+      { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('400 (Bad Request)')); assert.ok(i >= 0, 'nested-only refusal logged'); errors.splice(i, 1); }
+      await page.check('#lk-nested');
+      assert.strictEqual(await page.$(D + ' #lk-hint-nested'), null, 'ticking the box clears the hint');
+      await page.click('#lk-cancel');
       // item 6: two lines with one handle: the selection sends it once and the server counts both (as the preview)
       await band([99000, -500], [102000, 500]);
       assert.strictEqual(await nSel(), 2);

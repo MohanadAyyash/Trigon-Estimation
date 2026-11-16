@@ -510,7 +510,7 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   const { buildRender } = require('./lib/dxf/render.js');
   const zlib = require('zlib');
   // tiny decoder (the real one is the browser's): uint32 headerLen, JSON, pad 4, layer/start/count u32, kind u8, pad 4,
-  // block u32, pad 8, len/area f64, eo f64 × 2n, pts f32 (relative to their entity's eo)
+  // block u32, pad 8, len/area f64, eo f64 × 2n, pts f32 (relative to their entity's eo), vtx u8 (one per point)
   const decode = buf => {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const hl = dv.getUint32(0, true), header = JSON.parse(buf.subarray(4, 4 + hl).toString('utf8'));
@@ -522,11 +522,15 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     const block = arr(p => dv.getUint32(p, true), 4); o = pad(o, 8);
     const len = arr(p => dv.getFloat64(p, true), 8), area = arr(p => dv.getFloat64(p, true), 8);
     const eo = arr(p => [dv.getFloat64(p, true), dv.getFloat64(p + 8, true)], 16);
-    assert.strictEqual((buf.byteLength - o) % 8, 0, 'pts are whole (x, y) Float32 pairs');
-    const pts = []; for (; o < buf.byteLength; o += 8) pts.push([dv.getFloat32(o, true), dv.getFloat32(o + 4, true)]);
+    assert.strictEqual((buf.byteLength - o) % 9, 0, 'pts are whole (x, y) Float32 pairs, each with one vtx byte');
+    const N = (buf.byteLength - o) / 9, pts = [], vtx = [];
+    for (let k = 0; k < N; k++, o += 8) pts.push([dv.getFloat32(o, true), dv.getFloat32(o + 4, true)]);
+    for (let k = 0; k < N; k++, o++) { vtx.push(dv.getUint8(o)); assert.ok(vtx[k] === 0 || vtx[k] === 1, 'vtx is 0 or 1'); }
     for (let i = 0; i < n; i++) assert.ok(start[i] + count[i] <= pts.length, 'entity ' + i + ' points in range');
     const P = i => pts.slice(start[i], start[i] + count[i]).map(([x, y]) => [x + eo[i][0], y + eo[i][1]]);
-    return { header, layer, start, count, kind, block, len, area, eo, pts, P, n };
+    const V = i => vtx.slice(start[i], start[i] + count[i]);
+    pts.forEach((q, k) => { if (Number.isNaN(q[0])) assert.strictEqual(vtx[k], 0, 'a path break is never a vertex'); });
+    return { header, layer, start, count, kind, block, len, area, eo, pts, vtx, P, V, n };
   };
   const render = pairs => { const d = parseDxf(dxf(pairs)), f = flatten(d, { withSegs: true }); return { d, f, r: decode(buildRender(d, f)) }; };
 
@@ -549,7 +553,7 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     const X = 500000, Y = 2700000;
     const { f, r } = render([...tables([layerRec('ROAD'), layerRec('OFF', -3)]), ...ents([...line('G1', 'ROAD', X, Y, X + 3, Y + 4), ...lwp('G2', sq(X + 10, Y + 20, 10), true, 'NEW')])]);
     assert.deepStrictEqual(r.header.origin, [X, Y]); assert.deepStrictEqual(r.header.bbox, [X, Y, X + 20, Y + 30]);
-    assert.strictEqual(r.header.version, 2);
+    assert.strictEqual(r.header.version, 3);
     assert.deepStrictEqual(r.eo, [[X, Y], [X + 10, Y + 20]], 'each entity\'s own bbox min');
     assert.strictEqual(r.len[0], 5); assert.strictEqual(r.kind[0], 0); assert.ok(Number.isNaN(r.area[0]), 'null area → NaN');
     r.P(0).forEach((p, k) => { near(p[0], [X, X + 3][k], 1e-3); near(p[1], [Y, Y + 4][k], 1e-3); });
@@ -563,6 +567,30 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
       { name: '0', color: 7, off: false, frozen: false }, { name: 'NEW', color: 7, off: false, frozen: false }]);
     assert.deepStrictEqual(r.layer.map(i => r.header.layers[i].name), ['ROAD', 'NEW']);
     assert.deepStrictEqual(r.block, [0xFFFFFFFF, 0xFFFFFFFF]); assert.deepStrictEqual(r.header.blocks, []);
+  }
+  // display file v3: vtx = 1 at true vertices (polyline/line vertices, arc and ellipse ends, markers), 0 at arc tessellation
+  // points and path breaks. A closed LWPOLYLINE with one bulge segment: 1 at its 4 vertices, 0 on the arc's inner points.
+  {
+    const lwpB = (h, pts) => [[0, 'LWPOLYLINE'], [5, h], [8, '0'], [90, pts.length], [70, 1], ...pts.flatMap(([x, y, b]) => [[10, x], [20, y], ...(b ? [[42, b]] : [])])];
+    const { r } = render(ents([...lwpB('BG', [[0, 0, 1], [10, 0], [10, 10], [0, 10]]), ...line('LN', '0', 20, 0, 25, 0)]));
+    const p = r.P(0), v = r.V(0);
+    assert.ok(r.count[0] > 8, 'the bulge is tessellated: ' + r.count[0]);
+    assert.deepStrictEqual(v, [1, ...Array(r.count[0] - 4).fill(0), 1, 1, 1]);
+    assert.deepStrictEqual(p.filter((q, k) => v[k]), [[0, 0], [10, 0], [10, 10], [0, 10]], 'the flagged points are the vertices');
+    assert.ok(p.filter((q, k) => !v[k]).every(q => q[1] < 0 && Math.abs(Math.hypot(q[0] - 5, q[1]) - 5) < 1e-4), 'the unflagged points are on the arc');
+    assert.deepStrictEqual(r.V(1), [1, 1], 'a LINE: both ends');
+    // a HATCH with an island: vertices 1, the break 0; arcs (incl. a short one: never a bare chord) end at vertices
+    const h = render(ents([...hatch('HI', [hpoly(sq(0, 0, 10)), hpoly(sq(4, 4, 2))], 0, 'K'), [0, 'ARC'], [5, 'A'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 3],
+      [0, 'CIRCLE'], [5, 'C'], [8, '0'], [10, 100], [20, 100], [40, 10]])).r;
+    assert.deepStrictEqual(h.V(0), [1, 1, 1, 1, 0, 1, 1, 1, 1]);
+    const av = h.V(1);
+    assert.ok(av.length >= 3 && av[0] === 1 && av[av.length - 1] === 1 && av.slice(1, -1).every(x => x === 0), 'short arc: ends 1, at least one inner point 0: ' + av);
+    const cv = h.V(2); assert.strictEqual(cv[0], 1); assert.ok(cv.slice(1).every(x => x === 0), 'circle: its start only');
+    // insert markers and text anchors are flagged
+    const m = render([...sec('BLOCKS', block('B0', [])), ...ents([...insert('I0', 'B0', 'MH'), [0, 'MTEXT'], [5, 'T'], [8, 'MH'], [10, 3], [20, 4], [1, 'NOTE']])]).r;
+    assert.deepStrictEqual([m.V(0), m.V(1)], [[1], [1]]);
+    // a stored display file of format 2 is rebuilt: the parser version (and with it the display file's ETag) moved on
+    assert.strictEqual(require('./lib/dxf/summary.js').PARSER_VERSION, 6);
   }
   // CIRCLE r 10: 4..256 points, chord error ≤ 0.02; ARC: ends exact; ELLIPSE: chord error ≤ 0.002 × major radius
   {

@@ -1,4 +1,4 @@
-// Drawing viewer core: pure functions over the display file (lib/dxf/render.js, version 2), no DOM, no Node APIs.
+// Drawing viewer core: pure functions over the display file (lib/dxf/render.js, version 3), no DOM, no Node APIs.
 // Loaded as a plain script in the browser (window.TV) and with require() in Node (tests).
 //
 // Coordinates:
@@ -13,7 +13,7 @@
 // Display data is approximate (Float32, arcs as chords): previewTotal is for display only, never a saved quantity.
 'use strict';
 (function () {
-const VERSION = 2;
+const VERSION = 3;
 const KIND_OPEN = 0, KIND_CLOSED = 1, KIND_INSERT = 2, KIND_DROPPED = 4, KIND_NESTED = 5;
 const LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
@@ -34,8 +34,8 @@ function decodeRender(ab, byteOffset, byteLength) {
   const n = header.handles.length;
   const up = (v, m) => Math.ceil(v / m) * m;
   const oIdx = up(4 + hl, 4), oKind = oIdx + 12 * n, oBlock = up(oKind + n, 4), oF64 = up(oBlock + 4 * n, 8), oPts = oF64 + 32 * n;
-  if (oPts > size || (size - oPts) % 8) throw bad('size');
-  const np = (size - oPts) / 4;
+  if (oPts > size || (size - oPts) % 9) throw bad('size');   // per point: Float32 x, y and one vtx byte
+  const np = (size - oPts) / 9 * 2;
   const view = (T, off, len, get) => {
     const abs = base + off;
     if (LE && abs % T.BYTES_PER_ELEMENT === 0) return new T(ab, abs, len);
@@ -51,7 +51,7 @@ function decodeRender(ab, byteOffset, byteLength) {
     layer: view(Uint32Array, oIdx, n, u32), start: view(Uint32Array, oIdx + 4 * n, n, u32), count: view(Uint32Array, oIdx + 8 * n, n, u32),
     kind: new Uint8Array(ab, base + oKind, n), block: view(Uint32Array, oBlock, n, u32),
     len: view(Float64Array, oF64, n, f64), area: view(Float64Array, oF64 + 8 * n, n, f64), eo: view(Float64Array, oF64 + 16 * n, 2 * n, f64),
-    pts: view(Float32Array, oPts, np, f32),
+    pts: view(Float32Array, oPts, np, f32), vtx: new Uint8Array(ab, base + oPts + 4 * np, np / 2),
   };
   const N = np / 2;
   for (let i = 0; i < n; i++) {
@@ -252,9 +252,12 @@ function boxSelect(G, R, rect, mode, layerOn) {
   return sortIdx(out);
 }
 
-// the nearest vertex ('end') or segment midpoint ('mid') within tol, in world coordinates; an endpoint wins a tie
+// the nearest true vertex ('end': vtx 1, or a marker / text anchor) or straight-segment midpoint ('mid': two consecutive
+// vtx 1 points) within tol, in world coordinates; an endpoint wins a tie. An arc's tessellation point (vtx 0) is never a
+// target, nor is a chord next to one. World = eo + pts in Float64, so a georeferenced vertex comes back within Float32's
+// precision over the entity's own extent.
 function snap(G, R, wx, wy, tol, layerOn) {
-  const px = wx - G.ox, py = wy - G.oy, bb = G.bb, t2 = tol * tol, p = R.pts;
+  const px = wx - G.ox, py = wy - G.oy, bb = G.bb, t2 = tol * tol, p = R.pts, v = R.vtx;
   let best = null, bestD = Infinity;
   const consider = (x, y, kind) => {   // world x, y
     const dx = x - G.ox - px, dy = y - G.oy - py, d2 = dx * dx + dy * dy;
@@ -264,10 +267,23 @@ function snap(G, R, wx, wy, tol, layerOn) {
     if (bb[4 * i] !== bb[4 * i] || !isOn(R, i, layerOn)) return;
     if (px < bb[4 * i] - tol || px > bb[4 * i + 2] + tol || py < bb[4 * i + 1] - tol || py > bb[4 * i + 3] + tol) return;
     const s = R.start[i], e = s + R.count[i], ex = R.eo[2 * i], ey = R.eo[2 * i + 1];
-    for (let k = s; k < e; k++) if (p[2 * k] === p[2 * k] && p[2 * k + 1] === p[2 * k + 1]) consider(ex + p[2 * k], ey + p[2 * k + 1], 'end');
-    if (isPoint(R, i)) return;
-    // midpoints from world coordinates (eo + pts), the segment walk gives local ones
-    forSegs(R, i, 0, 0, (x0, y0, x1, y1) => { consider((x0 + x1) / 2, (y0 + y1) / 2, 'mid'); });
+    if (isPoint(R, i)) {   // insert marker, text anchor, a one-point path
+      for (let k = s; k < e; k++) if (p[2 * k] === p[2 * k]) consider(ex + p[2 * k], ey + p[2 * k + 1], 'end');
+      return;
+    }
+    for (let k = s; k < e; k++) if (v[k] && p[2 * k] === p[2 * k] && p[2 * k + 1] === p[2 * k + 1]) consider(ex + p[2 * k], ey + p[2 * k + 1], 'end');
+    // midpoints of straight segments (both ends vtx 1), in world coordinates; within a path, and a closed ring's closing one
+    const mid = (a, b) => consider(ex + (p[2 * a] + p[2 * b]) / 2, ey + (p[2 * a + 1] + p[2 * b + 1]) / 2, 'mid');
+    const closed = R.kind[i] === KIND_CLOSED;
+    let rs = s;   // the current path's first point
+    for (let k = s; k <= e; k++) {
+      if (k === e || p[2 * k] !== p[2 * k] || p[2 * k + 1] !== p[2 * k + 1]) {   // end of a path
+        if (closed && k - rs >= 3 && v[k - 1] && v[rs]) mid(k - 1, rs);
+        rs = k + 1;
+        continue;
+      }
+      if (k > rs && v[k - 1] && v[k]) mid(k - 1, k);
+    }
   });
   return best;
 }
