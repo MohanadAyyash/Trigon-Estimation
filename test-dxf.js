@@ -510,7 +510,8 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
   const { buildRender } = require('./lib/dxf/render.js');
   const zlib = require('zlib');
   // tiny decoder (the real one is the browser's): uint32 headerLen, JSON, pad 4, layer/start/count u32, kind u8, pad 4,
-  // block u32, pad 8, len/area f64, eo f64 × 2n, pts f32 (relative to their entity's eo), vtx u8 (one per point)
+  // block u32, pad 8, len/area f64, eo f64 × 2n, pts f32 (relative to their entity's eo), vtx u8 (one per point),
+  // pad 8, vx f64 × 2V (the exact world x, y of every vtx 1 point, in point order)
   const decode = buf => {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const hl = dv.getUint32(0, true), header = JSON.parse(buf.subarray(4, 4 + hl).toString('utf8'));
@@ -522,15 +523,26 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     const block = arr(p => dv.getUint32(p, true), 4); o = pad(o, 8);
     const len = arr(p => dv.getFloat64(p, true), 8), area = arr(p => dv.getFloat64(p, true), 8);
     const eo = arr(p => [dv.getFloat64(p, true), dv.getFloat64(p + 8, true)], 16);
-    assert.strictEqual((buf.byteLength - o) % 9, 0, 'pts are whole (x, y) Float32 pairs, each with one vtx byte');
-    const N = (buf.byteLength - o) / 9, pts = [], vtx = [];
+    const N = count.reduce((a, c) => a + c, 0), pts = [], vtx = [];
     for (let k = 0; k < N; k++, o += 8) pts.push([dv.getFloat32(o, true), dv.getFloat32(o + 4, true)]);
     for (let k = 0; k < N; k++, o++) { vtx.push(dv.getUint8(o)); assert.ok(vtx[k] === 0 || vtx[k] === 1, 'vtx is 0 or 1'); }
+    o = pad(o, 8);
+    const V = vtx.filter(x => x).length, vx = [];
+    assert.strictEqual(buf.byteLength - o, 16 * V, 'one exact Float64 (x, y) per vtx 1 point');
+    for (; o < buf.byteLength; o += 16) vx.push([dv.getFloat64(o, true), dv.getFloat64(o + 8, true)]);
     for (let i = 0; i < n; i++) assert.ok(start[i] + count[i] <= pts.length, 'entity ' + i + ' points in range');
     const P = i => pts.slice(start[i], start[i] + count[i]).map(([x, y]) => [x + eo[i][0], y + eo[i][1]]);
-    const V = i => vtx.slice(start[i], start[i] + count[i]);
+    const Vf = i => vtx.slice(start[i], start[i] + count[i]);
+    // X(i): the exact coordinates of entity i's vtx 1 points
+    const X = i => { const before = vtx.slice(0, start[i]).filter(x => x).length; return vx.slice(before, before + Vf(i).filter(x => x).length); };
+    // every exact vertex matches its Float32 point (within the Float32 precision of its offset)
+    let q = 0;
+    for (let i = 0; i < n; i++) for (let k = start[i]; k < start[i] + count[i]; k++) if (vtx[k]) {
+      const w = [pts[k][0] + eo[i][0], pts[k][1] + eo[i][1]], ex = vx[q++];
+      for (const c of [0, 1]) assert.ok(Math.abs(w[c] - ex[c]) <= 1e-6 * Math.max(1, Math.abs(pts[k][c])), 'vx ~ eo + pts');
+    }
     pts.forEach((q, k) => { if (Number.isNaN(q[0])) assert.strictEqual(vtx[k], 0, 'a path break is never a vertex'); });
-    return { header, layer, start, count, kind, block, len, area, eo, pts, vtx, P, V, n };
+    return { header, layer, start, count, kind, block, len, area, eo, pts, vtx, vx, X, P, V: Vf, n };
   };
   const render = pairs => { const d = parseDxf(dxf(pairs)), f = flatten(d, { withSegs: true }); return { d, f, r: decode(buildRender(d, f)) }; };
 
@@ -591,6 +603,25 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     assert.deepStrictEqual([m.V(0), m.V(1)], [[1], [1]]);
     // a stored display file of format 2 is rebuilt: the parser version (and with it the display file's ETag) moved on
     assert.strictEqual(require('./lib/dxf/summary.js').PARSER_VERSION, 6);
+    assert.deepStrictEqual(r.X(0), [[0, 0], [10, 0], [10, 10], [0, 10]], 'the exact coordinates of the vertices');
+    // fix round 1 (R7): a long georeferenced entity keeps its exact vertices in vx
+    const X0 = 500000000.1234, Y0 = 2700000000.5678, X1 = X0 + 100000.3, Y1 = Y0 + 50000.7;
+    const g = render(ents(lwp('LG', [[X0, Y0], [X1, Y1]], false))).r;
+    assert.deepStrictEqual(g.X(0), [[X0, Y0], [X1, Y1]]);
+    // fix round 1 (R8): sampled runs are tessellation: a SPLINE's samples and an arc under a non-uniform block scale are vtx 0
+    // except the run's ends; the flag never changes a quantity or a geomKey
+    const splinePairs = ents([[0, 'SPLINE'], [5, 'S2'], [8, '0'], [70, 8], [71, 2], [72, 6], [73, 3], ...[0, 0, 0, 1, 1, 1].map(k => [40, k]), [10, 0], [20, 0], [10, 1], [20, 1], [10, 2], [20, 0]]);
+    const arcIns = [...sec('BLOCKS', block('BA', [[0, 'ARC'], [5, 'A1'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 90]])), ...ents(insert('I1', 'BA', '0', [[41, 2], [42, 1]]))];
+    for (const [pairs, what] of [[splinePairs, 'SPLINE'], [arcIns, 'arc under xscale 2, yscale 1']]) {
+      const { f, r: sr } = render(pairs), i = f.findIndex(e => e.kind === 'open');
+      assert.ok(f[i].approx, what + ': sampled');
+      const sv = sr.V(i);
+      assert.ok(sv.length > 10, what + ': many samples');
+      assert.deepStrictEqual(sv, [1, ...Array(sv.length - 2).fill(0), 1], what + ': only the run ends are vertices');
+      const plain = flatten(parseDxf(dxf(pairs)));
+      assert.deepStrictEqual(f.map(e => { const o = { ...e }; delete o.segs; delete o.ins; delete o.pathLens; return o; }), plain, what + ': same flats, quantities and geomKeys');
+      assert.ok(plain.every(e => !e.paths), 'no display data without withSegs');
+    }
   }
   // CIRCLE r 10: 4..256 points, chord error ≤ 0.02; ARC: ends exact; ELLIPSE: chord error ≤ 0.002 × major radius
   {

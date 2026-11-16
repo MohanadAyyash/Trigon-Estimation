@@ -191,6 +191,47 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   assert.deepStrictEqual(TV.snap(GA, A, 60, 60.1, 0.5, onA), { x: 60, y: 60, kind: 'end' }, 'text anchor');
 }
 
+// ---- fix round 1: exact vertices on a long georeferenced entity (R7); sampled runs never snap (R8); decoder checks ----
+{
+  // a 111.8 km two-point polyline in mm at (500,000,000; 2,700,000,000) with fractional coordinates: exact ends and midpoint
+  const X0 = 500000000.1234, Y0 = 2700000000.5678, X1 = X0 + 100000.3, Y1 = Y0 + 50000.7;
+  const R = load(ents(lwp('LG', [[X0, Y0], [X1, Y1]], false))), G = TV.buildGrid(R), on = allOn(R);
+  assert.deepStrictEqual(TV.snap(G, R, X0 + 0.4, Y0 - 0.3, 1, on), { x: X0, y: Y0, kind: 'end' }, 'start exact');
+  assert.deepStrictEqual(TV.snap(G, R, X1 - 0.2, Y1 + 0.5, 1, on), { x: X1, y: Y1, kind: 'end' }, 'end exact');
+  const m = TV.snap(G, R, (X0 + X1) / 2 + 0.3, (Y0 + Y1) / 2, 1, on);
+  assert.deepStrictEqual(m, { x: (X0 + X1) / 2, y: (Y0 + Y1) / 2, kind: 'mid' }, 'midpoint from the exact pair');
+  // sampled runs: a SPLINE, and an ARC in a block inserted with xscale 2, yscale 1: no sample point is an end or a mid
+  const sampled = [
+    [ents([[0, 'SPLINE'], [5, 'S2'], [8, '0'], [70, 8], [71, 2], [72, 6], [73, 3], ...[0, 0, 0, 1, 1, 1].map(k => [40, k]), [10, 0], [20, 0], [10, 1], [20, 1], [10, 2], [20, 0]]), [[0, 0], [2, 0]], 'SPLINE'],
+    [[...sec('BLOCKS', block('BA', [[0, 'ARC'], [5, 'A1'], [8, '0'], [10, 0], [20, 0], [40, 10], [50, 0], [51, 90]])),
+      ...ents([[0, 'INSERT'], [5, 'I1'], [8, '0'], [2, 'BA'], [10, 0], [20, 0], [41, 2], [42, 1]])], [[20, 0], [0, 10]], 'ARC under non-uniform scale'],
+  ];
+  for (const [pairs, ends, what] of sampled) {
+    const S = load(pairs), GS = TV.buildGrid(S), onS = allOn(S), i = Array.from(S.kind).indexOf(0);
+    const st = S.start[i], c = S.count[i];
+    assert.ok(c > 10, what + ': sampled into ' + c + ' points');
+    const tol = 1e-3;
+    for (let k = st + 1; k < st + c - 1; k++) {
+      const wx = S.eo[2 * i] + S.pts[2 * k], wy = S.eo[2 * i + 1] + S.pts[2 * k + 1];
+      assert.strictEqual(TV.snap(GS, S, wx, wy, tol, onS), null, what + ': sample ' + (k - st) + ' is no snap target');
+      const nx = S.eo[2 * i] + S.pts[2 * k + 2], ny = S.eo[2 * i + 1] + S.pts[2 * k + 3];
+      assert.strictEqual(TV.snap(GS, S, (wx + nx) / 2, (wy + ny) / 2, tol, onS), null, what + ': no chord midpoint ' + (k - st));
+    }
+    for (const [a, b] of ends) { const r = TV.snap(GS, S, a + 1e-4, b, tol, onS); assert.strictEqual(r && r.kind, 'end', what + ': run end'); near(r.x, a, 1e-9); near(r.y, b, 1e-9); }
+  }
+  // decoder: a format 2 file is refused by version; a truncated format 3 file by size
+  const d = parseDxf(dxf(ents([...line('A', 'K', 0, 0, 5, 0), ...lwp('S', sq(10, 0, 2), true, 'K')]))), buf = buildRender(d, flatten(d, { withSegs: true }));
+  const hl = buf.readUInt32LE(0), hdr = buf.subarray(4, 4 + hl).toString('utf8').replace('"version":3', '"version":2');
+  const v2 = Buffer.concat([buf.subarray(0, 4), Buffer.from(hdr, 'utf8'), buf.subarray(4 + hl)]);
+  assert.throws(() => TV.decodeRender(v2.buffer.slice(v2.byteOffset, v2.byteOffset + v2.length)), /invalid display file: version 2, expected 3/);
+  for (const cut of [1, 3, 8, 17]) {
+    const tr = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length - cut);
+    assert.throws(() => TV.decodeRender(tr), /invalid display file: size/, 'truncated by ' + cut);
+  }
+  const extra = new Uint8Array(buf.length + 8); extra.set(buf);
+  assert.throws(() => TV.decodeRender(extra.buffer), /invalid display file: size/, 'trailing bytes');
+}
+
 // ---- preview totals (display only): two 5 m lines drawn in mm → 10 ----
 {
   const R = load(ents([...line('A', '0', 0, 0, 5000, 0), ...line('B', '0', 0, 1000, 0, 6000), ...lwp('S', sq(0, 0, 2000), true),

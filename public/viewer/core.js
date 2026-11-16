@@ -34,8 +34,7 @@ function decodeRender(ab, byteOffset, byteLength) {
   const n = header.handles.length;
   const up = (v, m) => Math.ceil(v / m) * m;
   const oIdx = up(4 + hl, 4), oKind = oIdx + 12 * n, oBlock = up(oKind + n, 4), oF64 = up(oBlock + 4 * n, 8), oPts = oF64 + 32 * n;
-  if (oPts > size || (size - oPts) % 9) throw bad('size');   // per point: Float32 x, y and one vtx byte
-  const np = (size - oPts) / 9 * 2;
+  if (oPts > size) throw bad('size');
   const view = (T, off, len, get) => {
     const abs = base + off;
     if (LE && abs % T.BYTES_PER_ELEMENT === 0) return new T(ab, abs, len);
@@ -51,13 +50,27 @@ function decodeRender(ab, byteOffset, byteLength) {
     layer: view(Uint32Array, oIdx, n, u32), start: view(Uint32Array, oIdx + 4 * n, n, u32), count: view(Uint32Array, oIdx + 8 * n, n, u32),
     kind: new Uint8Array(ab, base + oKind, n), block: view(Uint32Array, oBlock, n, u32),
     len: view(Float64Array, oF64, n, f64), area: view(Float64Array, oF64 + 8 * n, n, f64), eo: view(Float64Array, oF64 + 16 * n, 2 * n, f64),
-    pts: view(Float32Array, oPts, np, f32), vtx: new Uint8Array(ab, base + oPts + 4 * np, np / 2),
   };
-  const N = np / 2;
+  // the points: N = Σ count (entities in order, back to back); per point Float32 x, y, then one vtx byte each; padding to 8;
+  // Float64 vx: the exact (x, y) of each vtx 1 point. vxs[i] = the vx slot of entity i's first vtx 1 point.
+  let N = 0;
   for (let i = 0; i < n; i++) {
-    if (R.start[i] + R.count[i] > N) throw bad('entity ' + i + ' points out of range');
+    if (R.start[i] !== N) throw bad('entity ' + i + ' points out of order');
     if (R.layer[i] >= R.layers.length) throw bad('entity ' + i + ' layer out of range');
+    N += R.count[i];
   }
+  const oVtx = oPts + 8 * N, oVx = up(oVtx + N, 8);
+  if (oVx > size) throw bad('size');
+  R.vtx = new Uint8Array(ab, base + oVtx, N);
+  R.vxs = new Uint32Array(n);
+  let V = 0;
+  for (let i = 0, k = 0; i < n; i++) {
+    R.vxs[i] = V;
+    for (const e = k + R.count[i]; k < e; k++) if (R.vtx[k]) V++;
+  }
+  if (size !== oVx + 16 * V) throw bad('size');
+  R.pts = view(Float32Array, oPts, 2 * N, f32);
+  R.vx = view(Float64Array, oVx, 2 * V, f64);
   return R;
 }
 
@@ -253,11 +266,11 @@ function boxSelect(G, R, rect, mode, layerOn) {
 }
 
 // the nearest true vertex ('end': vtx 1, or a marker / text anchor) or straight-segment midpoint ('mid': two consecutive
-// vtx 1 points) within tol, in world coordinates; an endpoint wins a tie. An arc's tessellation point (vtx 0) is never a
-// target, nor is a chord next to one. World = eo + pts in Float64, so a georeferenced vertex comes back within Float32's
-// precision over the entity's own extent.
+// vtx 1 points) within tol, in world coordinates; an endpoint wins a tie. An arc's tessellation point or a sampled run's
+// inner point (vtx 0) is never a target, nor is a chord next to one. Coordinates come from the exact Float64 vx, so a
+// snapped vertex (and a midpoint) is exact however long or far out its entity is.
 function snap(G, R, wx, wy, tol, layerOn) {
-  const px = wx - G.ox, py = wy - G.oy, bb = G.bb, t2 = tol * tol, p = R.pts, v = R.vtx;
+  const px = wx - G.ox, py = wy - G.oy, bb = G.bb, t2 = tol * tol, p = R.pts, v = R.vtx, X = R.vx;
   let best = null, bestD = Infinity;
   const consider = (x, y, kind) => {   // world x, y
     const dx = x - G.ox - px, dy = y - G.oy - py, d2 = dx * dx + dy * dy;
@@ -267,22 +280,31 @@ function snap(G, R, wx, wy, tol, layerOn) {
     if (bb[4 * i] !== bb[4 * i] || !isOn(R, i, layerOn)) return;
     if (px < bb[4 * i] - tol || px > bb[4 * i + 2] + tol || py < bb[4 * i + 1] - tol || py > bb[4 * i + 3] + tol) return;
     const s = R.start[i], e = s + R.count[i], ex = R.eo[2 * i], ey = R.eo[2 * i + 1];
+    let q = R.vxs[i];   // the vx slot of the next vtx 1 point
     if (isPoint(R, i)) {   // insert marker, text anchor, a one-point path
-      for (let k = s; k < e; k++) if (p[2 * k] === p[2 * k]) consider(ex + p[2 * k], ey + p[2 * k + 1], 'end');
+      for (let k = s; k < e; k++) {
+        if (v[k]) { consider(X[2 * q], X[2 * q + 1], 'end'); q++; }
+        else if (p[2 * k] === p[2 * k]) consider(ex + p[2 * k], ey + p[2 * k + 1], 'end');
+      }
       return;
     }
-    for (let k = s; k < e; k++) if (v[k] && p[2 * k] === p[2 * k] && p[2 * k + 1] === p[2 * k + 1]) consider(ex + p[2 * k], ey + p[2 * k + 1], 'end');
-    // midpoints of straight segments (both ends vtx 1), in world coordinates; within a path, and a closed ring's closing one
-    const mid = (a, b) => consider(ex + (p[2 * a] + p[2 * b]) / 2, ey + (p[2 * a + 1] + p[2 * b + 1]) / 2, 'mid');
+    // true vertices, and midpoints of straight segments (both ends vtx 1) from the exact pair: within a path, and a closed
+    // ring's closing segment
+    const mid = (qa, qb) => consider((X[2 * qa] + X[2 * qb]) / 2, (X[2 * qa + 1] + X[2 * qb + 1]) / 2, 'mid');
     const closed = R.kind[i] === KIND_CLOSED;
-    let rs = s;   // the current path's first point
+    let rs = s, rsq = -1, prev = -1;   // the current path's first point and its slot; the previous point's slot (-1: vtx 0)
     for (let k = s; k <= e; k++) {
       if (k === e || p[2 * k] !== p[2 * k] || p[2 * k + 1] !== p[2 * k + 1]) {   // end of a path
-        if (closed && k - rs >= 3 && v[k - 1] && v[rs]) mid(k - 1, rs);
-        rs = k + 1;
+        if (closed && k - rs >= 3 && prev >= 0 && rsq >= 0) mid(prev, rsq);
+        if (k < e && v[k]) q++;   // a break is never flagged; kept for safety
+        rs = k + 1; rsq = -1; prev = -1;
         continue;
       }
-      if (k > rs && v[k - 1] && v[k]) mid(k - 1, k);
+      const cur = v[k] ? q++ : -1;
+      if (cur >= 0) consider(X[2 * cur], X[2 * cur + 1], 'end');
+      if (k === rs) rsq = cur;
+      else if (prev >= 0 && cur >= 0) mid(prev, cur);
+      prev = cur;
     }
   });
   return best;
