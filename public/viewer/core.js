@@ -347,6 +347,45 @@ function previewBlocks(R, indices) {
   return [...by.values()].sort((a, b) => (a.block < b.block ? -1 : a.block > b.block ? 1 : 0));
 }
 
-const TV = { decodeRender, makeView, zoomAt, pan, toWorld, toScreen, buildGrid, visible, hitTest, boxSelect, snap, previewTotal, previewBlocks };
+// the entities a saved DXF measurement takes, in index order (display only: the PNG export colours them; batch 4 Task 6).
+// m: { tool, metric, layer, block, nested } as the measurement list gives it. The entity filter is previewTotal's: open_length
+// takes open entities (kind 0), closed_perimeter and area closed ones (kind 1), count top-level insert markers (kind 2) and
+// with m.nested also nested ones (kind 5); an entity whose value for the metric is NaN (a hatch's perimeter, an area that
+// cannot be computed) is left out. dxf_layer: the entities of m.layer; dxf_blocks: the inserts of m.block on m.layer;
+// dxf_selection: the entities holding one of handles (GET /measurements/:id/handles). Any other tool: none.
+function measurementIndices(R, m, handles) {
+  if (!METRICS[m.metric]) return new Uint32Array(0);
+  const nested = !!m.nested, area = m.metric === 'area';
+  const want = m.metric === 'count' ? k => k === KIND_INSERT || (nested && k === KIND_NESTED) : m.metric === 'open_length' ? k => k === KIND_OPEN : k => k === KIND_CLOSED;
+  let take;
+  if (m.tool === 'dxf_layer' || m.tool === 'dxf_blocks') {
+    const li = R.layers.findIndex(l => l.name === m.layer);
+    if (li < 0) return new Uint32Array(0);
+    const bi = m.tool === 'dxf_blocks' ? R.blocks.indexOf(m.block) : -1;
+    if (m.tool === 'dxf_blocks' && bi < 0) return new Uint32Array(0);
+    take = i => R.layer[i] === li && (bi < 0 || R.block[i] === bi);
+  } else if (m.tool === 'dxf_selection') {
+    const hs = new Set(handles || []);
+    take = i => hs.has(R.handles[i]);
+  } else return new Uint32Array(0);
+  const out = [];
+  for (let i = 0; i < R.n; i++) {
+    if (!want(R.kind[i]) || !take(i)) continue;
+    const v = area ? R.area[i] : R.len[i];
+    if (v !== v) continue;
+    out.push(i);
+  }
+  return Uint32Array.from(out);
+}
+// an entity's first drawn point in world coordinates (a path break skipped), or null
+function firstPoint(R, i) {
+  for (let k = R.start[i], e = k + R.count[i]; k < e; k++) {
+    const x = R.pts[2 * k], y = R.pts[2 * k + 1];
+    if (x === x && y === y) return [R.eo[2 * i] + x, R.eo[2 * i + 1] + y];
+  }
+  return null;
+}
+
+const TV = { decodeRender, makeView, zoomAt, pan, toWorld, toScreen, buildGrid, visible, hitTest, boxSelect, snap, previewTotal, previewBlocks, measurementIndices, firstPoint };
 if (typeof module !== 'undefined' && module.exports) module.exports = TV; else window.TV = TV;
 })();

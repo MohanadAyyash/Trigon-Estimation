@@ -274,6 +274,42 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   for (const bad of [0, -1, NaN, Infinity, '1', null, undefined]) assert.throws(() => TV.previewTotal(R, all, 'area', bad), /unit factor/);
 }
 
+// ---- batch 4 Task 6 fix: the entities of a saved layer / block / selection measurement (the PNG export colours them) ----
+{
+  const { layerTable } = require('./lib/dxf/summary.js');
+  const d = parseDxf(dxf([...sec('BLOCKS', [...block('B', []), ...block('OUTER', insert('N1', 'B', '0', 0, 0))]), ...ents([
+    ...lwp('C1', sq(0, 0, 10), true, 'SITE'), ...line('O1', 'SITE', 0, 20, 10, 20), ...hatch('H1', [hpoly(sq(30, 0, 4))], 'SITE'),
+    ...lwp('C2', sq(50, 0, 2), true, 'OTHER'), ...insert('I1', 'B', 'SITE', 5, 5), ...insert('I2', 'B', 'MH', 6, 6),
+    ...insert('I3', 'OUTER', 'SITE', 7, 7)])]));
+  const flat = flatten(d, { withSegs: true }), buf = buildRender(d, flat), R = TV.decodeRender(buf.buffer, buf.byteOffset);
+  const hs = idx => Array.from(idx, i => R.handles[i]);
+  const L = (metric, layer = 'SITE') => TV.measurementIndices(R, { tool: 'dxf_layer', layer, metric });
+  assert.deepStrictEqual(hs(L('open_length')), ['O1'], 'open length: the open entity only');
+  assert.deepStrictEqual(hs(L('closed_perimeter')), ['C1'], 'perimeter: closed, the hatch has none');
+  assert.deepStrictEqual(hs(L('area')).sort(), ['C1', 'H1'], 'area: closed shapes and the hatch');
+  assert.deepStrictEqual(hs(L('area', 'NOPE')), [], 'a layer the drawing no longer has');
+  // the same entities as the server's layer table totals
+  const lt = layerTable(flat, d.layers, 'm').layers.find(x => x.layer === 'SITE');
+  const sum = (idx, k) => Array.from(idx).reduce((s, i) => s + R[k][i], 0);
+  assert.strictEqual(sum(L('open_length'), 'len'), lt.open_length);
+  assert.strictEqual(sum(L('closed_perimeter'), 'len'), lt.closed_perimeter);
+  near(sum(L('area'), 'area'), lt.area, 1e-9);
+  // blocks: the inserts of the block on the layer; nested ones (kind 5) only with nested
+  const B = (block, nested) => hs(TV.measurementIndices(R, { tool: 'dxf_blocks', layer: 'SITE', block, metric: 'count', nested }));
+  assert.deepStrictEqual(B('B', false), ['I1'], 'top-level insert on SITE (not the one on MH)');
+  assert.ok(B('B', true).length === 2 && B('B', true)[0] === 'I1', 'nested too: ' + B('B', true));
+  assert.deepStrictEqual(B('OUTER', false), ['I3']);
+  assert.deepStrictEqual(B('NOPE', true), []);
+  // selection: the handles, filtered by the metric
+  const S = metric => hs(TV.measurementIndices(R, { tool: 'dxf_selection', metric }, ['C1', 'O1', 'I2']));
+  assert.deepStrictEqual(S('open_length'), ['O1']); assert.deepStrictEqual(S('area'), ['C1']); assert.deepStrictEqual(S('count'), ['I2']);
+  assert.deepStrictEqual(hs(TV.measurementIndices(R, { tool: 'manual', metric: 'length' })), [], 'a drawn shape: none');
+  // first drawn point, in world coordinates
+  const c1 = R.handles.indexOf('C1');
+  assert.deepStrictEqual(TV.firstPoint(R, c1), [0, 0]);
+  assert.deepStrictEqual(TV.firstPoint(R, R.handles.indexOf('I1')), [5, 5]);
+}
+
 // ---- final review item 1: nested inserts (kind 5) are counted only with the nested toggle; preview = saved either way ----
 {
   const { selectionTotals } = require('./lib/dxf/select.js');

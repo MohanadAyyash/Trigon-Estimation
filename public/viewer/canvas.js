@@ -16,10 +16,12 @@
 // Previous version (batch 4 Task 4, display only): opts.under = another decoded display file (the version this one
 // replaces) drawn under the drawing in grey, in the same world coordinates, its own off/frozen layers hidden; it is never
 // hit, selected or snapped. setUnder(on) shows or hides it (opts.underOn: the start), underOn() tells.
-// Export (batch 4 Task 6): exportFrame(whole) -> { w, h, toScreen(p), paint(g, k) } draws the drawing offscreen (the visible
-// canvas is not touched) with the same drawing code: whole = the whole drawing (its bounding box, long side EXPORT_LONG CSS
-// px), else the current view at the screen's size. paint(g, k) -> Promise draws it onto the 2-D context g at k device px per
-// CSS px (the layers as shown; no previous version, selection or hover); toScreen(p) is a world point's CSS px in that frame.
+// Export (batch 4 Task 6): exportFrame(whole, extra) -> { w, h, toScreen(p), paint(g, k) } draws the drawing offscreen (the
+// visible canvas is not touched) with the same drawing code: whole = the whole drawing (its bounding box, long side
+// EXPORT_LONG CSS px), else the current view at the screen's size. paint(g, k) -> Promise draws it onto the 2-D context g at
+// k device px per CSS px (the layers as shown; no previous version, selection or hover), then extra = [{ idx, colour, fill }]
+// over it: each saved layer / block / selection measurement's entities (TV.measurementIndices) stroked in its colour, closed
+// shapes filled at 15 % when fill (an area). toScreen(p) is a world point's CSS px in that frame.
 'use strict';
 (function () {
 const BG = '#1e1e1e', UNDER = '#6b6b6b', LIGHT = '#e0e0e0', SEL = '#ffa726', HI = '#26c6da', HOVER = 'rgba(255,255,255,0.45)', SNAP = '#00e676';
@@ -89,7 +91,7 @@ function create(canvas, R, opts) {
   const view0 = () => ({ view: V, w: W, h: H });
   // the drawing of frame f ({ view, w, h }: CSS px) onto context g at k device px per CSS px; marks: the screen's extras
   // (the previous version underneath, highlighted and selected entities)
-  function paint(g, f, k, marks) {
+  function paint(g, f, k, marks, extra) {
     const view = f.view;
     g.setTransform(1, 0, 0, 1, 0, 0);
     g.fillStyle = BG; g.fillRect(0, 0, Math.ceil(f.w * k), Math.ceil(f.h * k));
@@ -115,6 +117,13 @@ function create(canvas, R, opts) {
       for (let k = cnt[c]; k < cnt[c + 1]; k++) trace(g, order[k], R, view);
       g.strokeStyle = slots[c]; g.stroke();
     }
+    for (const x of extra || []) {   // the export's measured entities, each in its measurement's colour
+      if (!x.idx.length) continue;
+      g.beginPath();
+      for (let k = 0; k < x.idx.length; k++) trace(g, x.idx[k], R, view);
+      if (x.fill) { g.globalAlpha = 0.15; g.fillStyle = x.colour; g.fill('evenodd'); g.globalAlpha = 1; }
+      g.lineWidth = 2.5; g.strokeStyle = x.colour; g.stroke();
+    }
     if (!marks) return;
     for (const [flags, any, colour] of [[hi, nHi, HI], [sel, nSel, SEL]]) {
       if (!any) continue;
@@ -124,7 +133,7 @@ function create(canvas, R, opts) {
     }
   }
   // an export frame: the whole drawing (its bounding box with the view's 5 % margin) or the current view
-  function exportFrame(whole) {
+  function exportFrame(whole, extra) {
     if (!V) return null;
     let f;
     if (whole) {
@@ -133,7 +142,7 @@ function create(canvas, R, opts) {
       const w = m > 0 && a > 0 ? Math.max(1, Math.round(EXPORT_LONG * a / m)) : EXPORT_LONG, h = m > 0 && b > 0 ? Math.max(1, Math.round(EXPORT_LONG * b / m)) : EXPORT_LONG;
       f = { view: TV.makeView(bb, w, h, R.origin), w, h };
     } else f = { view: { ...V }, w: W, h: H };
-    return { w: f.w, h: f.h, toScreen: p => TV.toScreen(f.view, p[0], p[1]), paint: (g, k) => { paint(g, f, k, false); return Promise.resolve(); } };
+    return { w: f.w, h: f.h, toScreen: p => TV.toScreen(f.view, p[0], p[1]), paint: (g, k) => { paint(g, f, k, false, extra); return Promise.resolve(); } };
   }
 
   function frame() {

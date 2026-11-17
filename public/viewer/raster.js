@@ -309,13 +309,14 @@ function create(container, opts) {
         const c = document.createElement('canvas');
         c.width = Math.max(1, Math.ceil(r.w * rs)); c.height = Math.max(1, Math.ceil(r.h * rs));
         const p = pg;
+        busy++;   // whenIdle waits for the export render too
         try {
           await p.render({ canvasContext: c.getContext('2d'), viewport: p.getViewport({ scale: rs, rotation: rot, offsetX: -r.x * rs, offsetY: -r.y * rs }) }).promise;
           if (dead) throw new Error('viewer closed');
           const [rx, ry] = scr(r.x, r.y);
           g.setTransform(k, 0, 0, k, 0, 0);
           g.drawImage(c, rx, ry, c.width / rs * s, c.height / rs * s);
-        } finally { free(c); }
+        } finally { free(c); busy--; settle(); }
       }
     }
     g.lineWidth = 1; g.strokeStyle = EDGE; g.strokeRect(sx - 0.5, sy - 0.5, dw * s + 1, dh * s + 1);

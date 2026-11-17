@@ -1053,7 +1053,8 @@
         h('div', { class: 'row wrap tv-toolbar' }, modeBtn('select', t('tv_select')), modeBtn('window', t('tv_window')), modeBtn('crossing', t('tv_crossing')),
           h('button', { id: 'tv-clear', class: 'small secondary', onclick: () => { eng.clear(); highlightTxt.textContent = ''; } }, t('tv_clear')),
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
-          h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn, exportControls(() => mp),
+          // no export of a new version waiting: its quantities are not accepted yet
+          h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn, cmp && cmp.show ? null : exportControls(() => mp),
           underCb ? h('label', { class: 'tv-check' }, underCb, ' ' + t('tv_under')) : null,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
         h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_dxf')) : null,
@@ -1105,7 +1106,13 @@
       mp = measurePanel({ d, kind: 'dxf', unit: lt.units || '', editable, rows, savedOf: savedBoth, refreshList, alive: () => tok === routeTok,
         dxfScale: () => f, cursor: () => { const sp = eng.snapPoint(); return sp ? [sp.x, sp.y] : cur; },
         tender: xp.T, listed: () => xp.listedOf([d.id, ...(cmp && cmp.under ? [cmp.under.id] : [])]),
-        eng: { canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(), exportFrame: whole => eng.exportFrame(whole),
+        // the PNG export: each saved layer / block / selection measurement of this drawing -> its entities and badge point
+        dxfMarks: ms => Promise.all(ms.filter(m => m.drawing_id === d.id && /^dxf_/.test(m.tool)).map(async m => {
+          const handles = m.tool === 'dxf_selection' ? (await api('GET', `measurements/${m.id}/handles`)).handles : null;
+          const idx = TV.measurementIndices(R, m, handles);
+          return { m, idx, at: idx.length ? TV.firstPoint(R, idx[0]) : null };
+        })),
+        eng: { canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(), exportFrame: (whole, extra) => eng.exportFrame(whole, extra),
           setToolMode: on => { eng.setTool(on); if (on && !snapCb.checked) { snapCb.checked = true; eng.setSnap(true); } } } });
       barBox.replaceWith(mp.bar || '');
       infoBox.replaceWith(mp.info);
@@ -1221,7 +1228,7 @@
       sec.replaceChildren(title(), info,
         h('div', { class: 'row wrap tv-toolbar' },
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
-          u ? h('label', { class: 'tv-check tv-mix' }, t('tv_under') + ' ', mixIn, ' ', mixOut) : null, exportControls(() => mp),
+          u ? h('label', { class: 'tv-check tv-mix' }, t('tv_under') + ' ', mixIn, ' ', mixOut) : null, cmp && cmp.show ? null : exportControls(() => mp),
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
         h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_raster')) : null,
           u && u.kind !== d.kind ? h('p', { id: 'tv-under-note', class: 'warn small' }, t('tv_under_mixed')) : null),
@@ -1317,9 +1324,17 @@
   // bitmap cap, well inside the browser's canvas limits). Read only: any role, any tender status.
   const EXPORT_MAX_SIDE = 8000, EXPORT_MAX_PIXELS = 16e6;
   const LG_FONT = '"Segoe UI", Tahoma, Arial, sans-serif', LG_PAD = 14, LG_LH = 18, LG_TITLE = 24;
-  // a file name part: no path or reserved characters, no direction marks, at most 80 characters
-  const fileSafe = s => Array.from(String(s || '').replace(/[\\/:*?"<>|\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g, '_').replace(/\s+/g, ' ').trim().replace(/^\.+/, '')).slice(0, 80).join('').trim();
-  const pngName = (T, d) => (fileSafe(T.title) || 'tender') + '-' + (fileSafe(d.name) || 'drawing') + '-rev' + (d.rev || 1) + '.png';
+  // a file name part: direction marks removed (U+061C, U+200E/F, U+202A–E, U+2066–9), path, reserved and control characters
+  // replaced, at most maxBytes of UTF-8 (whole characters: a surrogate pair is never split)
+  const fileSafe = (s, maxBytes) => {
+    const clean = String(s || '').replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '').replace(/[\\/:*?"<>|\u0000-\u001f\u007f]+/g, '_').replace(/\s+/g, ' ').trim().replace(/^\.+/, '');
+    const enc = new TextEncoder();
+    let out = '', n = 0;
+    for (const ch of clean) { const b = enc.encode(ch).length; if (n + b > maxBytes) break; out += ch; n += b; }
+    return out.trim();
+  };
+  // ≤ 64 + 1 + 64 + "-rev" + n + ".png": about 150 bytes at most
+  const pngName = (T, d) => (fileSafe(T.title, 64) || 'tender') + '-' + (fileSafe(d.name, 64) || 'drawing') + '-rev' + (d.rev || 1) + '.png';
   function saveBlob(blob, name) {
     const url = URL.createObjectURL(blob), a = h('a', { href: url, download: name, style: 'display:none' });
     document.body.append(a); a.click(); a.remove();
@@ -1365,7 +1380,7 @@
     let y = y0 + P + 16;
     g.fillStyle = '#212121'; g.font = 'bold 15px ' + LG_FONT; put(head.title, P, CW, y);
     y += LG_TITLE - 16 + LG_LH - 4;
-    g.font = '13px ' + LG_FONT; put(t('xp_date', { d: iso(head.date) }) + '   ·   ' + head.scale, P, CW, y);
+    g.font = '13px ' + LG_FONT; put(t('xp_date', { d: iso(head.date) }) + '   ·   ' + '\u2068' + head.scale + '\u2069', P, CW, y);   // the scale line in its own direction (FSI…PDI)
     if (head.draft) { y += LG_LH; g.fillStyle = '#c62828'; g.font = 'bold 13px ' + LG_FONT; put(head.draft.join('   ·   '), P, CW, y); }
     // columns: number (with the overlay colour), label, qty, unit, row
     const gap = 8, wNo = 44, wQty = 90, wUnit = 50, rest = Math.max(120, CW - wNo - wQty - wUnit - 4 * gap), wLabel = Math.round(rest * 0.4), wRow = rest - wLabel;
@@ -1387,8 +1402,8 @@
 
   // c: { d (with id), kind: 'dxf'|'pdf'|'image', unit (label of a drawing/page unit), editable, rows, savedOf(), refreshList(),
   //      alive(), cursor(), axisLock, dxfScale() (DXF), cals, units (PDF/image), tender (T), listed() (every measurement of the
-  //      drawings shown, with its list number no: the PNG legend),
-  //      eng: { canvas, toScreen(p), toPage(sx, sy), requestDraw(), setToolMode(on), exportFrame(whole) } }
+  //      drawings shown, with its list number no: the PNG legend), dxfMarks(listed) -> Promise<[{ m, idx, at }]> (DXF),
+  //      eng: { canvas, toScreen(p), toPage(sx, sy), requestDraw(), setToolMode(on), exportFrame(whole, extra) } }
   // -> { bar (null when read only), info, tools, draw(ctx), exportPng(whole), destroy() }
   function measurePanel(c) {
     const raster = c.kind !== 'dxf';
@@ -1596,11 +1611,15 @@
     // PNG export: the drawing drawn offscreen by the viewer (exportFrame), the saved measurements with their numbers by the
     // screen's own overlay code (tools.drawSavedAt), the legend box under it; then saved as <tender>-<drawing>-rev<n>.png
     async function exportPng(whole) {
-      const f = c.eng.exportFrame(whole);
+      const T = c.tender, n = new Date(), listed = c.listed();
+      // DXF layer / block / selection measurements: their entities in their colour (the palette continues after the drawn ones)
+      // and a badge at their first entity's first point
+      const marks = c.dxfMarks ? await c.dxfMarks(listed) : [], savedN = c.savedOf().length;
+      const more = marks.map((x, j) => ({ id: x.m.id, no: x.m.no, color: x.m.color || TVTools.PALETTE[(savedN + j) % TVTools.PALETTE.length], at: x.at }));
+      const f = c.eng.exportFrame(whole, marks.map((x, j) => ({ idx: x.idx, colour: more[j].color, fill: x.m.metric === 'area' })));
       if (!f) throw new Error(t('tv_export_not_ready'));
-      const T = c.tender, n = new Date();
-      const legend = c.listed().map(m => ({ no: m.no, label: m.label || '', qty: mQtyText(m), unit: m.qty_unit || '', row: m.row_id === null ? t('xp_unlinked') : mRowText(m) }));
-      const head = { title: (T.title || '') + ' — ' + (c.d.name || '') + ' · ' + t('dw_rev_n', { rev: c.d.rev || 1 }),
+      const legend = listed.map(m => ({ no: m.no, label: mLabelText(m), qty: mQtyText(m), unit: m.qty_unit || '', row: m.row_id === null ? t('xp_unlinked') : mRowText(m) }));
+      const head = { title: (T.title || '') + ' — ' + (c.d.name || '') + ' ' + t('dw_rev_n', { rev: c.d.rev || 1 }),
         date: n.getFullYear() + '-' + pad(n.getMonth() + 1) + '-' + pad(n.getDate()), scale: scaleEl.textContent,
         draft: TenderDraft.isDraft(T.status) ? [TenderDraft.DRAFT_EN, TenderDraft.DRAFT_AR] : null };   // the Excel report's rule and words
       const W = f.w, H = f.h + legendHeight(head, legend);
@@ -1613,13 +1632,13 @@
         await f.paint(g, k);
         g.setTransform(k, 0, 0, k, 0, 0);
         g.save(); g.beginPath(); g.rect(0, 0, f.w, f.h); g.clip();
-        const drawn = tools.drawSavedAt(g, f.toScreen);
+        const drawn = tools.drawSavedAt(g, f.toScreen, more);
         g.restore();
         drawLegend(g, f.h, W, head, legend, new Map(drawn.map(x => [x.no, x.colour])), document.dir === 'rtl');
         const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
         if (!blob) throw new Error(t('tv_export_too_big'));   // the browser could not encode a canvas this size
         const name = pngName(T, c.d);
-        window.__tvExport = { width: cv.width, height: cv.height, w: f.w, h: f.h, k, legend, head, name, toPx: p => { const s = f.toScreen(p); return [s[0] * k, s[1] * k]; } };   // test hook
+        window.__tvExport = { width: cv.width, height: cv.height, w: f.w, h: f.h, k, legend, head, name, drawn: drawn.map(x => ({ id: x.id, no: x.no, colour: x.colour })), toPx: p => { const s = f.toScreen(p); return [s[0] * k, s[1] * k]; } };   // test hook
         saveBlob(blob, name);
       } finally { cv.width = 0; cv.height = 0; }
     }
@@ -1765,6 +1784,8 @@
   // the PNG legend; a measurement's qty and row as the list shows them (the legend uses the same text)
   const listOrder = ms => [...ms.unlinked, ...ms.measurements];
   const mQtyText = m => fin(m.qty) ? fmt2(m.qty) : '—';
+  // the label, else the layer / block it measures (the list and the PNG legend alike)
+  const mLabelText = m => m.label || (m.tool === 'dxf_blocks' ? m.block : m.tool === 'dxf_layer' ? m.layer : '') || '';
   const mRowText = m => [m.row_no, m.row_description].filter(Boolean).join(' — ') + ' (' + (m.row_unit || '—') + ')';
   // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink. onChanged: refresh after
   // an edit (the tab's list and the viewer's overlays, in place); else the tab is drawn again
@@ -1873,7 +1894,7 @@
     };
     const line = (m, last) => h('tr', { 'data-measurement': String(m.id), 'data-row': m.row_id === null ? null : String(m.row_id) },
       h('td', { class: 'num m-no' }, String(noOf.get(m.id))),
-      h('td', { class: 'm-lbl' }, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m), calLine(m)),
+      h('td', { class: 'm-lbl' }, h('span', { dir: 'auto', class: m.label ? null : 'muted' }, mLabelText(m))), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m), calLine(m)),
       h('td', { class: 'num m-qty' }, mQtyText(m)), h('td', { class: 'm-unit' }, m.qty_unit || ''), h('td', null, flags(m)), h('td', { class: 'm-row' }, last(m)), h('td', null, reviewed(m), ' ', edit(m), ' ', del(m)));
     const heads = ['#', t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
     return h('section', { class: 'card', id: 'dw-measurements' }, h('h2', null, t('measurements')),

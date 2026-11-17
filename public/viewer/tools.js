@@ -5,8 +5,10 @@
 //
 //   TVTools.create({ canvas, toScreen(p) -> [sx, sy] | null, toPage(sx, sy) -> p | null, requestDraw(), axisLock, alive(),
 //                    cursor() -> p | null, overlay() -> { saved, cals, region }, onChange(tools), onFinish(kind, data) })
-//   tools.drawSavedAt(ctx, toScreen) -> [{ id, no, colour }]: the saved measurements and calibrations alone (the screen's
-//     own drawing, no shape being drawn) through another projection, e.g. an offscreen export view (batch 4 Task 6)
+//   tools.drawSavedAt(ctx, toScreen, more) -> [{ id, no, colour }]: the saved measurements and calibrations alone (the
+//     screen's own drawing, no shape being drawn) through another projection, e.g. an offscreen export view (batch 4 Task 6);
+//     more: further saved entries after overlay().saved (an export's layer / block / selection measurements)
+//   TVTools.PALETTE: the colours of saved measurements without their own (entry k: PALETTE[k % length])
 //   TVTools.calibrationFor(cals, p): the calibration a point uses, as the server's lib/takeoff/calib.js calibrationFor
 //   TVTools.pathWarnings(pts, closed): [{ code: 'back' | 'sharp', at }] (R15: a path that doubles back on itself; a very
 //     sharp angle), at = the 1-based point number
@@ -20,7 +22,8 @@
 // open. undo() removes the last point, cancel() (Esc) drops the shape and leaves the tool. axisLock (raster): Shift keeps
 // the new point horizontal or vertical to the previous one as displayed (exactly on a page axis: the page is shown turned
 // by 0/90/180/270 only). A saved measurement with a number (overlay().saved[i].no: its number in the measurement list)
-// carries a badge with that number at its first point (batch 4 Task 6).
+// carries a badge with that number at its first point (batch 4 Task 6); an entry with no geom but a point at (a DXF layer,
+// block or selection measurement in an export) is its badge alone.
 'use strict';
 (function () {
 const SAME_PX = 2;          // a click within 2 screen px of the previous point is the same point (the 2nd click of a double-click)
@@ -189,8 +192,11 @@ function create(o) {
   function drawSaved(ctx, ov) {
     const saved = [], cals = [];
     (ov.saved || []).forEach((m, k) => {
-      if (!m.geom) return;
       const colour = m.color || PALETTE[k % PALETTE.length];
+      if (!m.geom) {
+        if (m.at && Number.isInteger(m.no)) { badge(ctx, m.at, m.no, colour); saved.push({ id: m.id, no: m.no, text: m.text || '', colour }); }
+        return;
+      }
       shape(ctx, m.geom, colour, 0.15);
       label(ctx, first(m.geom), m.text, colour);
       if (Number.isInteger(m.no)) badge(ctx, first(m.geom), m.no, colour);
@@ -237,10 +243,11 @@ function create(o) {
     }
     ctx.restore();
   }
-  function drawSavedAt(ctx, toScreen) {
+  function drawSavedAt(ctx, toScreen, more) {
+    const ov = o.overlay ? o.overlay() : {};
     proj = toScreen;
     ctx.save();
-    try { return drawSaved(ctx, o.overlay ? o.overlay() : {}).saved; } finally { ctx.restore(); proj = null; }
+    try { return drawSaved(ctx, { ...ov, saved: [...(ov.saved || []), ...(more || [])] }).saved; } finally { ctx.restore(); proj = null; }
   }
 
   // ---- keys: Enter finishes, Esc cancels; Shift held for the axis lock (and the rubber band) ----
@@ -283,6 +290,6 @@ function create(o) {
   return api;
 }
 
-const TVTools = { create, calibrationFor, pathWarnings };
+const TVTools = { create, calibrationFor, pathWarnings, PALETTE };
 if (typeof module !== 'undefined' && module.exports) module.exports = TVTools; else window.TVTools = TVTools;
 })();
