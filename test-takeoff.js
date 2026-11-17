@@ -329,6 +329,51 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
   assert.deepStrictEqual(C.gatesToConfirm({ incomplete: true, duplicate: false, mixed_blocks: true }, { incomplete: 1, duplicate: 0, mixed: 1 }), []);
   assert.deepStrictEqual(C.item(m(13), { reason: 'confirm_needed', gates: ['duplicate'], new_qty: 8 }), { measurement_id: 13, row_id: 1, tool: 'dxf_layer', label: null, old_qty: 5, new_qty: 8,
     qty_unit: 'm', status: 'blocked', reason: 'confirm_needed', gates: ['duplicate'], options: ['delete', 'confirm'] });
+  // R11 (Task 3): the gate counts on the old drawing (was): a confirmed gate stays confirmed only while it did not grow
+  const n0 = { incomplete: 0, duplicate: 0, mixed_blocks: 0 };
+  assert.deepStrictEqual(C.gatesToConfirm({ ...n0, duplicate: 20 }, { ...flags, duplicate: 1 }, { ...n0, duplicate: 2 }), ['duplicate'], '2 → 20 duplicates');
+  assert.deepStrictEqual(C.gatesToConfirm({ incomplete: 3, duplicate: 2, mixed_blocks: 2 }, { incomplete: 1, duplicate: 1, mixed: 1 }, { incomplete: 3, duplicate: 2, mixed_blocks: 2 }), [], 'unchanged');
+  assert.deepStrictEqual(C.gatesToConfirm({ incomplete: 1, duplicate: 1, mixed_blocks: 0 }, { incomplete: 1, duplicate: 1, mixed: 0 }, { incomplete: 4, duplicate: 0, mixed_blocks: 0 }), ['duplicate'], 'fewer is fine');
+  assert.deepStrictEqual(C.gatesToConfirm({ ...n0, mixed_blocks: 3 }, { ...flags, mixed: 1 }, { ...n0, mixed_blocks: 2 }), ['mixed_blocks']);
+  // an unconfirmed gate needs confirm whatever its old count
+  assert.deepStrictEqual(C.gatesToConfirm({ ...n0, incomplete: 1 }, flags, { ...n0, incomplete: 1 }), ['incomplete']);
+  // the item shows the old and new counts of the gates it lists
+  assert.deepStrictEqual(C.item(m(13), { reason: 'confirm_needed', gates: ['duplicate'], gate_counts: { duplicate: { old: 2, new: 20 } }, new_qty: 8 }), { measurement_id: 13, row_id: 1, tool: 'dxf_layer',
+    label: null, old_qty: 5, new_qty: 8, qty_unit: 'm', status: 'blocked', reason: 'confirm_needed', gates: ['duplicate'], gate_counts: { duplicate: { old: 2, new: 20 } }, options: ['delete', 'confirm'] });
+  // Task 3: a resolution sent with accept is checked against the item it resolves (null: valid). R12 shapes for relink.
+  {
+    const R = C.resolutionError;
+    const lay = C.item(asph, C.layerMatch(layers, asph)), blkI = C.item(b2, C.blockMatch(layers, b2));
+    const selI = C.item(sel, { reason: 'geometry_changed', keep_matched_qty: 4 }), conf = C.item(m(13), { reason: 'confirm_needed', gates: ['duplicate'], new_qty: 8 });
+    const same = C.item(m(1), { new_qty: 5 }), gone = C.item(man, { reason: 'page_missing' });
+    assert.strictEqual(R(lay, { new_qty: null }), 'needs a resolution');
+    assert.strictEqual(R(lay, { resolution: 'delete', new_qty: null }), null);
+    assert.strictEqual(R(lay, { resolution: 'delete', new_qty: 0 }), 'a deleted measurement has new_qty null');
+    assert.strictEqual(R(lay, { resolution: 'relink', to: 'PAVING', new_qty: 100 }), null);
+    assert.strictEqual(R(lay, { resolution: 'relink', to: 'PAVING', new_qty: null }), null, 'qty not known yet: answered by the 409 table');
+    assert.strictEqual(R(lay, { resolution: 'relink', to: 'PAVING', new_qty: 100, confirm: ['duplicate', 'overlap'] }), null);
+    assert.strictEqual(R(lay, { resolution: 'relink', to: 'KERB', new_qty: 1 }), 'relink to must be one of its relink_choices');
+    assert.strictEqual(R(lay, { resolution: 'relink', new_qty: 1 }), 'relink to must be one of its relink_choices');
+    assert.strictEqual(R(lay, { resolution: 'relink', to: { layer: 'PAVING', block: null }, new_qty: 1 }), 'relink to must be one of its relink_choices');
+    assert.strictEqual(R(lay, { resolution: 'keep_matched', new_qty: 1 }), 'cannot be resolved by keep_matched (options: delete, relink)');
+    assert.strictEqual(R(lay, { resolution: 'confirm', new_qty: 1 }), 'cannot be resolved by confirm (options: delete, relink)');
+    assert.strictEqual(R(blkI, { resolution: 'relink', to: { layer: 'PITS', block: 'MH9' }, new_qty: 4 }), null);
+    for (const to of ['MH9', { layer: 'PITS' }, { layer: 'PITS', block: 'MH9', nested: 1 }, { layer: 'PITS', block: 'PIT' }, ['PITS', 'MH9'], null])
+      assert.strictEqual(R(blkI, { resolution: 'relink', to, new_qty: 4 }), 'relink to must be one of its relink_choices', JSON.stringify(to));
+    assert.strictEqual(R(selI, { resolution: 'keep_matched', new_qty: 4 }), null);
+    assert.strictEqual(R(selI, { resolution: 'keep_matched', new_qty: 4, confirm: ['overlap'] }), null);
+    assert.strictEqual(R(selI, { resolution: 'keep_matched', to: 'X', new_qty: 4 }), 'to goes with relink only');
+    assert.strictEqual(R(selI, { resolution: 'relink', to: 'X', new_qty: 4 }), 'cannot be resolved by relink (options: delete, keep_matched)');
+    assert.strictEqual(R(C.item(sel, { reason: 'handles_missing', keep_matched_qty: null }), { resolution: 'keep_matched', new_qty: 4 }), 'cannot be resolved by keep_matched (options: delete)');
+    assert.strictEqual(R(conf, { resolution: 'confirm', new_qty: 8 }), null);
+    assert.strictEqual(R(conf, { resolution: 'confirm', new_qty: 8, confirm: ['duplicate'] }), 'confirm goes with relink or keep_matched (resolution confirm confirms the gates of the item)');
+    assert.strictEqual(R(conf, { resolution: 'delete', new_qty: null, confirm: ['duplicate'] }), 'confirm goes with relink or keep_matched (resolution confirm confirms the gates of the item)');
+    assert.strictEqual(R(gone, { resolution: 'delete', new_qty: null }), null);
+    assert.strictEqual(R(same, { new_qty: 5 }), null);
+    assert.strictEqual(R(same, { resolution: 'delete', new_qty: null }), 'is not blocked: send it without a resolution');
+    assert.strictEqual(R(same, { new_qty: 5, to: 'KERB' }), 'to and confirm go with a resolution');
+    assert.strictEqual(R(same, { new_qty: 5, confirm: [] }), 'to and confirm go with a resolution');
+  }
   // R9: a shape off the new page, or a qty that cannot be recomputed → blocked, delete only
   for (const reason of ['off_page', 'cannot_recompute']) {
     assert.deepStrictEqual(C.item(man, { reason }), { measurement_id: 7, row_id: 1, tool: 'manual', label: 'Fake line', old_qty: 2, new_qty: null, qty_unit: 'm', status: 'blocked', reason, options: ['delete'] });

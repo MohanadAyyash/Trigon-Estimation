@@ -2186,6 +2186,11 @@ server.listen(0, async () => {
         return { s: r.status, j: await r.json().catch(() => null) };
       };
       const PENDING = 'a replacement is pending: accept or cancel it first', IS_PENDING = 'this drawing is a pending replacement: accept or cancel it first';
+      // Task 3
+      const REPLACED = 'this drawing has been replaced by a newer version: it is kept as history only', REVIEW = 'the measured quantities changed: review the changes again';
+      const ACCEPT = (did, b, ck = qs) => call('POST', `drawings/${did}/accept`, b, ck);
+      // the reviewed table: every item with the qty shown, plus the resolutions by measurement id
+      const expOf = (items, o = {}) => items.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty, ...(o[x.measurement_id] || {}) }));
       const nPending = () => db.prepare('SELECT COUNT(*) n FROM drawings WHERE pending=1').get().n;
       const dRow = id => ({ ...db.prepare('SELECT * FROM drawings WHERE id=?').get(id) });
       // v1 (mm): KERB a 5000 line, ASPHALT a 10000 square, MH one MH1, EDGE E1 (1000) and E2 (2000).
@@ -2386,8 +2391,9 @@ server.listen(0, async () => {
         const gc = await ok(call('GET', `drawings/${g2.j.id}/compare`, null, viewer), 'compare gates');
         const gi = new Map(gc.items.map(x => [x.measurement_id, x]));
         assert.deepStrictEqual(gi.get(gK.id), { measurement_id: gK.id, row_id: r3, tool: 'dxf_layer', label: null, old_qty: 5, new_qty: 10, qty_unit: 'm', status: 'blocked', reason: 'confirm_needed',
-          gates: ['duplicate'], options: ['delete', 'confirm'] });
+          gates: ['duplicate'], gate_counts: { duplicate: { old: 0, new: 1 } }, options: ['delete', 'confirm'] });
         assert.deepStrictEqual([gi.get(gE.id).status, gi.get(gE.id).reason, gi.get(gE.id).gates, gi.get(gE.id).new_qty, gi.get(gE.id).options], ['blocked', 'confirm_needed', ['incomplete'], 3, ['delete', 'confirm']]);
+        assert.deepStrictEqual(gi.get(gE.id).gate_counts, { incomplete: { old: 0, new: 1 } }, 'R11: old and new counts');
         assert.deepStrictEqual([gi.get(gS.id).status, gi.get(gS.id).new_qty], ['same', 3]);
         assert.deepStrictEqual([gi.get(gW.id).status, gi.get(gW.id).new_qty], ['same', 1], 'confirmed at creation: no gate');
         await ok(call('DELETE', `tenders/${T3}`, null, qs), 'tidy');
@@ -2514,6 +2520,295 @@ server.listen(0, async () => {
         // R10: its page 2 has no old counterpart: listed as new (information only)
         await ok(call('POST', `drawings/${ni.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages');
         assert.deepStrictEqual(await ok(call('GET', `drawings/${ni.j.id}/compare`, null, viewer), 'compare'), { ready: true, needs_units: false, new_pages: [2], items: [], totals: { rows: [] } });
+
+        // ---- Task 3: accept the PDF replacement. q1 (off the new page) and q2 (its page is gone) are deleted; q3 moves to
+        // the new page 1 with a copy of its page's calibrations (calibration_id remapped), same qty, flagged for review
+        c = await ok(call('GET', `drawings/${NP}/compare`, null, viewer), 'compare pdf');
+        const rowQ = id => db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(id).qty;
+        db.prepare('UPDATE calibrations SET verify_pct=0.4 WHERE id=?').run(cal1.id);   // verified on the old page
+        const rM0 = rowQ(rM), calsP1 = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(P1).map(x => ({ ...x }));
+        assert.ok(calsP1.length >= 1);
+        const pdfDel = { [q1.id]: { resolution: 'delete', new_qty: null }, [q2.id]: { resolution: 'delete', new_qty: null } };
+        r = await ACCEPT(NP, { expect: expOf(c.items) });
+        assert.strictEqual(r.s, 400); assert.strictEqual(r.j.error, `blocked items need a resolution: ${q1.id}, ${q2.id}`);
+        let acc = await ok(ACCEPT(NP, { expect: expOf(c.items, pdfDel) }), 'accept pdf');
+        assert.deepStrictEqual(acc, { id: NP, replaced: P1, kept: 1, deleted: 2, relinked: 0, kept_matched: 0, confirmed: 0, review: 1, rows: [{ row_id: rM, qty: rowQ(rM) }] });
+        rel(rowQ(rM), rM0 - q1.qty - q2.qty, 'the row loses the deleted measurements only');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM measurements WHERE id IN (?, ?)').get(q1.id, q2.id).n, 0);
+        const m3 = db.prepare('SELECT * FROM measurements WHERE id=?').get(q3.id);
+        assert.deepStrictEqual([m3.drawing_id, m3.qty, m3.review_needed], [NP, q3.qty, 1]);
+        const calsNP = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(NP);
+        const strip = x => { const { id, drawing_id, ...rest } = x; return rest; };
+        assert.deepStrictEqual(calsNP.map(strip), calsP1.map(x => ({ ...strip(x), verify_pct: null })), 'the old page 1 calibrations are copied to the new page 1, to be verified there');
+        assert.strictEqual(m3.calibration_id, calsNP[calsP1.findIndex(x => x.id === q3.calibration_id)].id, 'calibration_id remapped to the copy');
+        assert.deepStrictEqual(db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(P1).map(x => ({ ...x })), calsP1, 'the old page keeps its calibrations (history)');
+        assert.deepStrictEqual([dRow(P1).replaced_by, dRow(P2).replaced_by, dRow(NP).pending], [NP, NP, 0]);
+        assert.deepStrictEqual(audits('replace_accept').at(-1), { replaced: P1, by: NP, kept: 1, deleted: 2, relinked: 0, kept_matched: 0, confirmed: 0, review: 1, changed_rows: 1 });
+        // the old pages are history: no measuring, calibrating, verifying, units; the new page measures; its file is served
+        for (const [what, p] of [['measure page 2', measure({ row_id: rNr, tool: 'manual', geom: { tool: 'count', pts: [[5, 5]] } }, P2)],
+          ['calibrate page 1', call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 3, unit: 'm' }, qs)],
+          ['verify', call('POST', `drawings/${P1}/calibrations/${cal1.id}/verify`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs)],
+          ['delete calibration', call('DELETE', `drawings/${P1}/calibrations/${cal1.id}`, null, qs)]]) {
+          const x = await p;
+          assert.strictEqual(x.s, 409, what + ': ' + JSON.stringify(x.j)); assert.strictEqual(x.j.error, REPLACED, what);
+        }
+        assert.strictEqual((await fetch(base + `drawings/${P1}/file`, { headers: { cookie: viewer } })).status, 200, 'the old file is served');
+        const onNew = await mOk({ row_id: rNr, tool: 'manual', geom: { tool: 'count', pts: [[OFFSET_PAGE.x0 + 5, OFFSET_PAGE.y0 + 5]] } }, NP);
+        await ok(call('DELETE', `measurements/${onNew.id}`, null, qs), 'tidy');
+        r = await ACCEPT(NP, { expect: [] });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'this drawing is not a pending replacement');
+
+        // ---- Task 3: cancel = DELETE on the pending row: removes that row and its page rows only; the old one is measurable again
+        const cnt = { row_id: rNr, tool: 'manual', geom: { tool: 'count', pts: [[5, 5]] } };
+        r = await measure(cnt, im.j.id);
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, PENDING);
+        assert.strictEqual((await call('DELETE', `drawings/${ni.j.id}`, null, viewer)).s, 403);
+        r = await call('DELETE', `drawings/${NB2}`, null, qs);
+        assert.strictEqual(r.s, 400); assert.strictEqual(r.j.error, 'cancel the whole new version: use its first page');
+        r = await call('DELETE', `drawings/${B1}`, null, qs);
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'only a pending new version can be cancelled');
+        const nDraw = db.prepare('SELECT COUNT(*) n FROM drawings').get().n, niRows = db.prepare('SELECT id FROM drawings WHERE id=? OR parent_id=?').all(ni.j.id, ni.j.id).length;
+        assert.strictEqual(niRows, 2);
+        assert.deepStrictEqual(await ok(call('DELETE', `drawings/${ni.j.id}`, null, qs), 'cancel'), { ok: 1 });
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings').get().n, nDraw - 2, 'the pending row and its page row only');
+        assert.deepStrictEqual(audits('replace_cancel').at(-1), { replaces: im.j.id, pages: 2 });
+        assert.ok(dRow(im.j.id).id, 'the old drawing stays'); assert.strictEqual(dRow(im.j.id).replaced_by, null);
+        const again = await mOk(cnt, im.j.id);
+        await ok(call('DELETE', `measurements/${again.id}`, null, qs), 'tidy');
+        assert.ok(fs.existsSync(path.join(DDIR, dRow(im.j.id).sha256 + '.png')), 'files stay (shared by sha256)');
+        await ok(call('DELETE', `drawings/${NB1}`, null, qs), 'cancel 2 pages');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE id IN (?, ?)').get(NB1, NB2).n, 0);
+        assert.strictEqual(nPending(), 1, 'only the DXF replacement N is still pending');
+      }
+
+      // ---- batch 4 Task 3: accept the DXF replacement N of D1 (R18: only the reviewed table is applied) ---------------
+      {
+        const rowQ = id => db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(id).qty;
+        const mRow = id => db.prepare('SELECT * FROM measurements WHERE id=?').get(id);
+        c = await cmp();
+        const items = new Map(c.items.map(x => [x.measurement_id, x]));
+        assert.deepStrictEqual(c.items.map(x => [x.measurement_id, x.status]), [[mLayer.id, 'same'], [mArea.id, 'blocked'], [mBlk.id, 'changed'], [mSel.id, 'blocked'], [mMan.id, 'review']]);
+        const s4 = snap(), nAcc = audits('replace_accept').length;
+        // refusals: a viewer; no expect (400); malformed bodies; a duplicate id
+        assert.strictEqual((await ACCEPT(N, { expect: expOf(c.items) }, viewer)).s, 403);
+        r = await ACCEPT(N, {});
+        assert.strictEqual(r.s, 400); assert.strictEqual(r.j.error, 'accept needs expect: the reviewed table [{ measurement_id, new_qty, resolution?, to?, confirm? }]');
+        for (const b of [{ expect: expOf(c.items), relink: {} }, { expect: 'x' }, { expect: [{ measurement_id: mLayer.id }] }, { expect: [{ measurement_id: mLayer.id, new_qty: '5' }] },
+          { expect: [{ measurement_id: mLayer.id, new_qty: 5, resolution: 'drop' }] }, { expect: [{ measurement_id: mLayer.id, new_qty: 5, confirm: ['nope'] }] },
+          { expect: [{ measurement_id: mLayer.id, new_qty: 5, confirm: ['overlap', 'overlap'] }] }, { expect: [{ measurement_id: mLayer.id, new_qty: 5, to: 7 }] },
+          { expect: [{ measurement_id: mLayer.id, new_qty: 5, extra: 1 }] }, { expect: [...expOf(c.items), expOf(c.items)[0]] }]) {
+          r = await ACCEPT(N, b);
+          assert.strictEqual(r.s, 400, JSON.stringify(b) + ' → ' + JSON.stringify(r.j));
+        }
+        // blocked items without a resolution → 400 naming them, with the fresh table
+        r = await ACCEPT(N, { expect: expOf(c.items) });
+        assert.strictEqual(r.s, 400); assert.strictEqual(r.j.error, `blocked items need a resolution: ${mArea.id}, ${mSel.id}`);
+        assert.deepStrictEqual(r.j.items, c.items);
+        // a resolution the item does not offer → 400 naming the measurement (R12: relink only to its relink_choices)
+        const delA = { resolution: 'delete', new_qty: null };
+        for (const [o, msg] of [
+          [{ [mArea.id]: { resolution: 'keep_matched' }, [mSel.id]: delA }, `measurement ${mArea.id}: cannot be resolved by keep_matched (options: delete, relink)`],
+          [{ [mArea.id]: { resolution: 'relink', to: 'KERB' }, [mSel.id]: delA }, `measurement ${mArea.id}: relink to must be one of its relink_choices`],
+          [{ [mArea.id]: delA, [mSel.id]: { resolution: 'relink', to: 'EDGE' } }, `measurement ${mSel.id}: cannot be resolved by relink (options: delete, keep_matched)`],
+          [{ [mArea.id]: delA, [mSel.id]: { resolution: 'confirm' } }, `measurement ${mSel.id}: cannot be resolved by confirm (options: delete, keep_matched)`],
+          [{ [mArea.id]: delA, [mSel.id]: delA, [mLayer.id]: delA }, `measurement ${mLayer.id}: is not blocked: send it without a resolution`]]) {
+          r = await ACCEPT(N, { expect: expOf(c.items, o) });
+          assert.strictEqual(r.s, 400, JSON.stringify(r.j)); assert.strictEqual(r.j.error, msg);
+        }
+        assert.strictEqual(snap(), s4, 'nothing changed');
+        // relink / keep_matched whose qty is not known yet (null): 409 with the fresh table and what each resolution gives
+        r = await ACCEPT(N, { expect: expOf(c.items, { [mArea.id]: { resolution: 'relink', to: 'PAVING', new_qty: null }, [mSel.id]: { resolution: 'keep_matched', new_qty: null } }) });
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, REVIEW); assert.deepStrictEqual(r.j.items, c.items);
+        assert.deepStrictEqual(r.j.resolved, [{ measurement_id: mArea.id, resolution: 'relink', to: 'PAVING', new_qty: mArea.qty, gates: [] },
+          { measurement_id: mSel.id, resolution: 'keep_matched', new_qty: items.get(mSel.id).keep_matched_qty, gates: [] }]);
+        const good = expOf(c.items, { [mArea.id]: { resolution: 'relink', to: 'PAVING', new_qty: mArea.qty }, [mSel.id]: { resolution: 'keep_matched', new_qty: items.get(mSel.id).keep_matched_qty } });
+        // stale tables: a measurement left out, a qty that differs → 409, nothing changed
+        r = await ACCEPT(N, { expect: good.slice(1) });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, REVIEW); assert.deepStrictEqual(r.j.items, c.items);
+        r = await ACCEPT(N, { expect: good.map(x => x.measurement_id === mBlk.id ? { ...x, new_qty: 1 } : x) });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, REVIEW);
+        assert.strictEqual(snap(), s4, 'nothing changed'); assert.strictEqual(audits('replace_accept').length, nAcc);
+        // the race: the new version's units change between the async comparison and the tx → 409 with the fresh comparison
+        let raced = null;
+        ctx.drawings._hooks.beforeAcceptTx = async () => { if (!raced) raced = await call('PUT', `drawings/${N}/units`, { units: 'cm' }, qs); };
+        try { r = await ACCEPT(N, { expect: good }); }
+        finally { ctx.drawings._hooks.beforeAcceptTx = null; }
+        assert.ok(raced, 'the hook ran'); assert.strictEqual(raced.s, 200, JSON.stringify(raced.j));
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'the drawings changed while the replacement was compared: review the changes again');
+        rel(r.j.items.find(x => x.measurement_id === mLayer.id).new_qty, 50, 'the fresh table: kerb in cm');
+        assert.strictEqual(snap(), s4, 'nothing changed'); assert.strictEqual(dRow(N).pending, 1); assert.strictEqual(audits('replace_accept').length, nAcc);
+        await ok(call('PUT', `drawings/${N}/units`, { units: 'mm' }, qs), 'units back to mm');
+        // accept: one tx; kept measurements move to N with the reviewed quantities
+        const before = { rM: rowQ(rM) };
+        const acc = await ok(ACCEPT(N, { expect: good }), 'accept');
+        assert.deepStrictEqual(acc, { id: N, replaced: D1, kept: 5, deleted: 0, relinked: 1, kept_matched: 1, confirmed: 0, review: 1,
+          rows: [{ row_id: rM, qty: rowQ(rM) }, { row_id: rM2, qty: rowQ(rM2) }, { row_id: rNr, qty: rowQ(rNr) }] });
+        for (const x of [mLayer, mArea, mBlk, mSel, mMan]) assert.strictEqual(mRow(x.id).drawing_id, N, 'moved ' + x.id);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM measurements WHERE drawing_id=?').get(D1).n, 0);
+        // relink: the new layer, its qty and base; same/changed: the compared qty; manual: unchanged, flagged for review
+        assert.deepStrictEqual([mRow(mArea.id).layer, mRow(mArea.id).qty, mRow(mArea.id).base], ['PAVING', mArea.qty, mArea.qty]);
+        assert.deepStrictEqual([mRow(mBlk.id).qty, mRow(mBlk.id).base, mRow(mBlk.id).handles_count], [2, 2, 2]);
+        assert.strictEqual(mRow(mLayer.id).qty, mLayer.qty);
+        assert.deepStrictEqual([mRow(mMan.id).qty, mRow(mMan.id).review_needed], [mMan.qty, 1]);
+        assert.deepStrictEqual([mLayer, mArea, mBlk, mSel].map(x => mRow(x.id).review_needed), [0, 0, 0, 0]);
+        // keep_matched: the handles are the matched subset (E2, its geomKey), the qty and the summary from the new cache
+        assert.deepStrictEqual(db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid').all(mSel.id).map(x => ({ ...x })), [{ handle: 'E2', geom_key: keys[1].geom_key }]);
+        const ks = mRow(mSel.id);
+        assert.deepStrictEqual([ks.qty, ks.handles_count, JSON.parse(ks.selection_summary).by_layer], [items.get(mSel.id).keep_matched_qty, 1, { EDGE: 1 }]);
+        // rows: kerb row loses E1 (1 m); paving the same 100; manholes 1 → 2
+        rel(rowQ(rM), before.rM - 1, 'kerb row'); rel(rowQ(rM2), mArea.qty, 'paving row'); assert.strictEqual(rowQ(rNr), db.prepare('SELECT SUM(qty) s FROM measurements WHERE row_id=?').get(rNr).s);
+        assert.deepStrictEqual([dRow(D1).replaced_by, dRow(N).pending, dRow(N).replaces_id], [N, 0, D1]);
+        // the audit: counts only
+        assert.deepStrictEqual(audits('replace_accept').at(-1), { replaced: D1, by: N, kept: 5, deleted: 0, relinked: 1, kept_matched: 1, confirmed: 0, review: 1, changed_rows: 3 });
+        // the old drawing is history: listed, its file and layers readable, nothing measured, relinked, rescaled or replaced
+        list = await ok(call('GET', `tenders/${T}/drawings`, null, viewer), 'list');
+        assert.deepStrictEqual(list.filter(x => x.id === D1 || x.id === N).map(x => [x.id, x.replaced_by, x.pending_replacement]), [[D1, N, null], [N, null, null]]);
+        assert.strictEqual((await fetch(base + `drawings/${D1}/file`, { headers: { cookie: viewer } })).status, 200);
+        await ok(call('GET', `drawings/${D1}/layers`, null, viewer), 'old layers');
+        const s5 = snap();
+        for (const [what, p] of [['layer', measure({ row_id: rM, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length' })],
+          ['selection', measure({ row_id: rM, tool: 'dxf_selection', metric: 'open_length', handles: ['E2'] })],
+          ['manual', measure({ row_id: rM, tool: 'manual', geom: { tool: 'line', pts: [[0, 0], [0, 500]] } })],
+          ['units', call('PUT', `drawings/${D1}/units`, { units: 'cm' }, qs)]]) {
+          const x = await p;
+          assert.strictEqual(x.s, 409, what + ': ' + JSON.stringify(x.j)); assert.strictEqual(x.j.error, REPLACED, what);
+        }
+        r = await replace(D1, 'Fake site plan C', V2);
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'this drawing has been replaced already: replace its newest version');
+        assert.strictEqual(snap(), s5);
+        // the accepted version is a normal drawing: compared no more, measured
+        r = await call('GET', `drawings/${N}/compare`, null, viewer);
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'this drawing is not a pending replacement');
+        r = await ACCEPT(N, { expect: good });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'this drawing is not a pending replacement');
+        const onN = await mOk({ row_id: rNr, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' }, N);
+        await ok(call('DELETE', `measurements/${onN.id}`, null, qs), 'tidy');
+
+        // mark reviewed: clears review_needed (admin/qs, draft); audited once
+        r = await call('POST', `measurements/${mMan.id}/reviewed`, null, viewer);
+        assert.strictEqual(r.s, 403);
+        assert.strictEqual((await call('POST', 'measurements/999999/reviewed', null, qs)).s, 404);
+        const nRev = audits('measure_reviewed').length;
+        assert.deepStrictEqual(await ok(call('POST', `measurements/${mMan.id}/reviewed`, null, qs), 'reviewed'), { ok: 1, id: mMan.id, review_needed: 0 });
+        assert.strictEqual(mRow(mMan.id).review_needed, 0);
+        assert.deepStrictEqual(audits('measure_reviewed').slice(nRev), [{ drawing_id: N, row_id: rM, tool: 'manual' }]);
+        await ok(call('POST', `measurements/${mMan.id}/reviewed`, null, qs), 'again');
+        assert.strictEqual(audits('measure_reviewed').length, nRev + 1, 'nothing to clear: no audit');
+        db.prepare('UPDATE measurements SET review_needed=1 WHERE id=?').run(mMan.id);   // the Rev below copies the flag
+
+        // a Rev copies the accepted chain (replaced_by / replaces_id remapped, the review flag kept); no pending row exists
+        db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
+        try {
+          const rv = await ok(call('POST', `tenders/${T}/revise`, null, qs), 'revise');
+          const cp = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(rv.id);
+          const src = db.prepare('SELECT * FROM drawings WHERE tender_id=? AND pending=0 ORDER BY id').all(T);
+          assert.strictEqual(cp.length, src.length);
+          const map = new Map(src.map((x, i) => [x.id, cp[i].id]));
+          for (let i = 0; i < src.length; i++) {
+            assert.strictEqual(cp[i].replaced_by, src[i].replaced_by === null ? null : map.get(src[i].replaced_by), 'replaced_by ' + src[i].id);
+            assert.strictEqual(cp[i].replaces_id, src[i].replaces_id === null ? null : map.get(src[i].replaces_id), 'replaces_id ' + src[i].id);
+            assert.strictEqual(cp[i].pending, 0);
+          }
+          assert.deepStrictEqual([cp[0].replaced_by, cp.find(x => x.id === map.get(N)).replaces_id], [map.get(N), map.get(D1)]);
+          const cm = db.prepare('SELECT drawing_id, review_needed, label FROM measurements WHERE tender_id=? AND tool=? ORDER BY id').all(rv.id, 'manual').find(x => x.label === 'Fake drawn edge');
+          assert.deepStrictEqual([cm.drawing_id, cm.review_needed], [map.get(N), 1]);
+          // the copied old drawing is history in the Rev too
+          r = await call('POST', `drawings/${map.get(D1)}/measurements`, { row_id: [...db.prepare('SELECT id FROM tender_rows WHERE tender_id=?').all(rv.id)][0].id, tool: 'manual', geom: { tool: 'line', pts: [[0, 0], [0, 5]] } }, qs);
+          assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, REPLACED);
+          await ok(call('DELETE', `tenders/${rv.id}`, null, qs), 'tidy rev');
+        } finally { db.prepare("UPDATE tenders SET status='draft' WHERE id=?").run(T); }
+      }
+
+      // Task 3: an imported row whose measured total would go below 0 at accept → 400, the whole accept rolled back
+      {
+        const { writeXlsx } = require('./lib/xlsx.js');
+        const TN = (await ok(call('POST', 'tenders', { title: 'Test Revisions Negative', kind: 'rta' }, qs), 'tender')).id;
+        const BOQ = { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Fake imported kerb', 'm', 50]] }]).toString('base64'),
+          sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } };
+        await ok(call('POST', `tenders/${TN}/import`, BOQ, qs), 'import');
+        const rI = (await ok(call('GET', `tenders/${TN}/rows`, null, viewer), 'rows')).find(x => x.description === 'Fake imported kerb').id;
+        const kerbOf = len => dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...tables([layerRec('KERB')]), ...sec('ENTITIES', [...line('RK', 'KERB', 0, 0, len, 0)])]);
+        const g1 = (await upload(TN, 'Fake kerb A', Buffer.from(kerbOf(5000)), qs)).j.id;
+        await waitDone(g1, qs); await ok(call('PUT', `drawings/${g1}/units`, { units: 'mm' }, qs), 'units');
+        const mK = await mOk({ row_id: rI, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length' }, g1);
+        await mOk({ row_id: rI, tool: 'manual', deduct: true, geom: { tool: 'line', pts: [[0, 100], [4000, 100]] } }, g1);   // −4 m: 5 − 4 = 1
+        const g2 = (await replace(g1, 'Fake kerb B', Buffer.from(kerbOf(3000)))).j.id;
+        await waitDone(g2, qs); await ok(call('PUT', `drawings/${g2}/units`, { units: 'mm' }, qs), 'units');
+        const nc = await ok(call('GET', `drawings/${g2}/compare`, null, viewer), 'compare');
+        assert.deepStrictEqual(nc.items.map(x => [x.status, x.new_qty]), [['changed', 3], ['review', -4]]);
+        const sN = JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TN), db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TN),
+          db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY id').all(TN)]), nAcc2 = audits('replace_accept').length;
+        r = await ACCEPT(g2, { expect: expOf(nc.items) });
+        assert.strictEqual(r.s, 400, JSON.stringify(r.j)); assert.match(r.j.error, /deductions exceed/);
+        assert.strictEqual(JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TN), db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TN),
+          db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY id').all(TN)]), sN, 'rolled back');
+        assert.strictEqual(audits('replace_accept').length, nAcc2);
+        assert.strictEqual(mK.qty, 5);
+        await ok(call('DELETE', `tenders/${TN}`, null, qs), 'tidy');
+      }
+
+      // Task 3: R11 and the gates of a resolution (R7). v1: ASPHALT and PAVING areas, EDGE E1 + E2, TWIN two identical lines.
+      // v2: ASPHALT gone, ASPH2 two identical squares (a duplicate), E1 moved, TWIN a third identical line (2 → 3 copies).
+      {
+        const TG = (await ok(call('POST', 'tenders', { title: 'Test Revisions Resolution Gates', kind: 'rta' }, qs), 'tender')).id;
+        const rgM = (await ok(call('POST', `tenders/${TG}/rows`, { description: 'Fake edging', unit: 'm' }, qs), 'row')).id;
+        const rgA = (await ok(call('POST', `tenders/${TG}/rows`, { description: 'Fake surfacing', unit: 'm2' }, qs), 'row')).id;
+        const gv = v2 => dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...tables([layerRec('ASPHALT'), layerRec('ASPH2'), layerRec('PAVING'), layerRec('EDGE'), layerRec('TWIN')]),
+          ...sec('ENTITIES', [...(v2 ? [...lwp('Q1', sq(40000, 0, 2000), true, 'ASPH2'), ...lwp('Q2', sq(40000, 0, 2000), true, 'ASPH2')] : lwp('RA', sq(0, 0, 10000), true, 'ASPHALT')),
+            ...lwp('RP', sq(20000, 0, 5000), true, 'PAVING'),
+            ...(v2 ? line('E1', 'EDGE', 500, 500, 1500, 500) : line('E1', 'EDGE', 0, 0, 1000, 0)), ...line('E2', 'EDGE', 0, 100, 2000, 100),
+            ...line('W1', 'TWIN', 0, 0, 0, 500), ...line('W2', 'TWIN', 0, 0, 0, 500), ...(v2 ? line('W3', 'TWIN', 0, 0, 0, 500) : [])])]);
+        const g1 = (await upload(TG, 'Fake gates A', Buffer.from(gv(false)), qs)).j.id;
+        await waitDone(g1, qs); await ok(call('PUT', `drawings/${g1}/units`, { units: 'mm' }, qs), 'units');
+        const gA = await mOk({ row_id: rgA, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'area' }, g1);
+        const gP = await mOk({ row_id: rgA, tool: 'dxf_layer', layer: 'PAVING', metric: 'area' }, g1);
+        const gX = await mOk({ row_id: rgM, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'closed_perimeter' }, g1);
+        const gS = await mOk({ row_id: rgM, tool: 'dxf_selection', metric: 'open_length', handles: ['E1', 'E2'] }, g1);
+        const gS2 = await mOk({ row_id: rgM, tool: 'dxf_selection', metric: 'open_length', handles: ['E2'] }, g1);   // overlaps gS (confirmed)
+        const gW = await mOk({ row_id: rgM, tool: 'dxf_layer', layer: 'TWIN', metric: 'open_length', confirm_duplicate: true }, g1);
+        const g2 = (await replace(g1, 'Fake gates B', Buffer.from(gv(true)))).j.id;
+        await waitDone(g2, qs); await ok(call('PUT', `drawings/${g2}/units`, { units: 'mm' }, qs), 'units');
+        const gc = await ok(call('GET', `drawings/${g2}/compare`, null, viewer), 'compare');
+        const gi = new Map(gc.items.map(x => [x.measurement_id, x]));
+        assert.deepStrictEqual(gc.items.map(x => [x.measurement_id, x.status, x.reason ?? null]), [[gA.id, 'blocked', 'layer_empty'], [gP.id, 'same', null], [gX.id, 'blocked', 'layer_empty'],
+          [gS.id, 'blocked', 'geometry_changed'], [gS2.id, 'same', null], [gW.id, 'blocked', 'confirm_needed']]);
+        assert.deepStrictEqual(gi.get(gA.id).relink_choices, ['ASPH2', 'PAVING']);
+        // R11: TWIN was confirmed with its duplicates; it has more now → confirm_needed again, with the old and new counts
+        const tw = gi.get(gW.id);
+        assert.deepStrictEqual([tw.gates, tw.options, Object.keys(tw.gate_counts)], [['duplicate'], ['delete', 'confirm'], ['duplicate']]);
+        assert.ok(tw.gate_counts.duplicate.old > 0 && tw.gate_counts.duplicate.new > tw.gate_counts.duplicate.old, JSON.stringify(tw.gate_counts));
+        rel(tw.new_qty, 1.5, 'three copies of 0.5 m');
+        const base3 = { [gX.id]: { resolution: 'delete', new_qty: null }, [gW.id]: { resolution: 'confirm' } };
+        // the gates of a resolution: relink to ASPH2 brings its duplicate; keep_matched E2 overlaps gS2 on the row
+        r = await ACCEPT(g2, { expect: expOf(gc.items, { ...base3, [gA.id]: { resolution: 'relink', to: 'ASPH2', new_qty: null }, [gS.id]: { resolution: 'keep_matched', new_qty: null } }) });
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, REVIEW);
+        assert.deepStrictEqual(r.j.resolved.map(x => [x.measurement_id, x.resolution, x.to, x.gates]), [[gA.id, 'relink', 'ASPH2', ['duplicate']], [gX.id, 'delete', undefined, []],
+          [gS.id, 'keep_matched', undefined, ['overlap']], [gW.id, 'confirm', undefined, ['duplicate']]]);
+        rel(r.j.resolved[0].new_qty, 8, 'two 4 m2 squares'); assert.strictEqual(r.j.resolved[1].new_qty, null); rel(r.j.resolved[2].new_qty, 2, 'E2');
+        // relink to PAVING: gP already measures it on the row → overlap
+        r = await ACCEPT(g2, { expect: expOf(gc.items, { ...base3, [gA.id]: { resolution: 'relink', to: 'PAVING', new_qty: null }, [gS.id]: { resolution: 'keep_matched', new_qty: 2 } }) });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j.resolved[0], { measurement_id: gA.id, resolution: 'relink', to: 'PAVING', new_qty: gP.qty, gates: ['overlap'] });
+        // the right quantities but the gates not confirmed → 409, nothing changed
+        const sG = JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TG), db.prepare('SELECT * FROM measurement_handles ORDER BY rowid').all(),
+          db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TG)]);
+        const exact = { ...base3, [gA.id]: { resolution: 'relink', to: 'PAVING', new_qty: gP.qty }, [gS.id]: { resolution: 'keep_matched', new_qty: r.j.resolved[2].new_qty } };
+        r = await ACCEPT(g2, { expect: expOf(gc.items, exact) });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'confirm the checks of the chosen resolutions');
+        assert.deepStrictEqual(r.j.resolved.filter(x => x.gates.length).map(x => [x.measurement_id, x.gates]), [[gA.id, ['overlap']], [gS.id, ['overlap']], [gW.id, ['duplicate']]]);
+        assert.strictEqual(JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TG), db.prepare('SELECT * FROM measurement_handles ORDER BY rowid').all(),
+          db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TG)]), sG, 'nothing changed');
+        // confirmed → accepted: the flags record what was confirmed
+        exact[gA.id].confirm = ['overlap']; exact[gS.id].confirm = ['overlap'];
+        const ga = await ok(ACCEPT(g2, { expect: expOf(gc.items, exact) }), 'accept gates');
+        assert.deepStrictEqual([ga.kept, ga.deleted, ga.relinked, ga.kept_matched, ga.confirmed], [5, 1, 1, 1, 1]);
+        const gRow = id => db.prepare('SELECT * FROM measurements WHERE id=?').get(id);
+        assert.deepStrictEqual([gRow(gA.id).layer, gRow(gA.id).qty, gRow(gA.id).duplicate], ['PAVING', gP.qty, 0]);
+        assert.deepStrictEqual([gRow(gW.id).duplicate, gRow(gW.id).drawing_id], [1, g2]); rel(gRow(gW.id).qty, 1.5, 'TWIN confirmed');
+        assert.strictEqual(gRow(gX.id), undefined, 'deleted');
+        assert.deepStrictEqual(db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=?').all(gS.id).map(x => x.handle), ['E2']);
+        assert.deepStrictEqual(audits('replace_accept').at(-1), { replaced: g1, by: g2, kept: 5, deleted: 1, relinked: 1, kept_matched: 1, confirmed: 1, review: 0, changed_rows: 2 });
+        await ok(call('DELETE', `tenders/${TG}`, null, qs), 'tender delete removes everything');
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE tender_id=?').get(TG).n, 0);
       }
     }
 

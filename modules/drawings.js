@@ -127,7 +127,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const pendingFor = d => db.prepare('SELECT id FROM drawings WHERE replaces_id=? AND pending=1 AND parent_id IS NULL').get(d.parent_id ?? d.id) || null;
   const notReplacing = d => { if (pendingFor(d)) bad('a replacement is pending: accept or cancel it first', 409); };
   const notPending = d => { if (d.pending) bad('this drawing is a pending replacement: accept or cancel it first', 409); };
-  const canMeasure = d => { notPending(d); notReplacing(d); };
+  // an accepted replacement keeps the old drawing (every page row of it) as read-only history
+  const notReplaced = d => { if (d.replaced_by !== null) bad('this drawing has been replaced by a newer version: it is kept as history only', 409); };
+  const canMeasure = d => { notPending(d); notReplacing(d); notReplaced(d); };
 
   // ---- hooks for tenders.js (R1). Callers run them inside their own transaction. ------------------------------
   const hasMeasurements = rowId => !!db.prepare('SELECT 1 FROM measurements WHERE row_id=? LIMIT 1').get(rowId);
@@ -203,7 +205,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // test hook: hooks.beforeUnitTx(attempt), when a test sets it, runs (awaited) between a unit change's async recomputation
   // and its tx, so a test can change measurements inside that window. null (nothing runs) unless a test sets it.
   // hooks.beforeMeasureTx (same idea): runs between a layer/block measurement's summary read and its tx.
-  const hooks = { beforeUnitTx: null, beforeMeasureTx: null };
+  // hooks.beforeAcceptTx (same idea): runs between a replacement accept's async comparison and its tx.
+  const hooks = { beforeUnitTx: null, beforeMeasureTx: null, beforeAcceptTx: null };
   // R8: a tender with a drawing replacement waiting for accept or cancel is not submitted or approved (tenders.js)
   const hasPendingReplacement = tid => !!db.prepare('SELECT 1 FROM drawings WHERE tender_id=? AND pending=1 LIMIT 1').get(tid);
   ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, hasPendingReplacement, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
@@ -762,7 +765,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         mustDraft(tenderRow(t.id));
         const cur = drawingRow(d.id);
         if (!cur || cur.status !== 'ready') bad(`drawing is ${cur ? cur.status : 'gone'}: units can be set once it is ready`, 409);
-        notReplacing(cur);   // the pending one itself takes its units (needed for the compare)
+        notReplacing(cur); notReplaced(cur);   // the pending one itself takes its units (needed for the compare)
         if (cur.units !== before.units || cur.sha256 !== before.sha256 || unitInputs(d.id) !== seen) return null;
         const body = error => ({ error, from: cur.units, to: b.units, changes: listed(changes) });
         if (changes.length && !apply) conflictBody(body('unit change changes measured quantities'));
@@ -790,21 +793,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // and was never confirmed blocks the item (confirm_needed, R7). A manual shape on a PDF page or an image must lie on
   // the new page (onPage's bounds, R12/R16), else off_page (R9). A qty that cannot be recomputed blocks its item only
   // (cannot_recompute, R9). What matches and the status, reason and options come from lib/takeoff/compare.js.
-  // a matched DXF item: its new qty, or blocked confirm_needed when a gate fires now that it never confirmed (R7)
-  const gated = (m, now, new_qty) => {
-    const gates = compare.gatesToConfirm(now, m);
-    return gates.length ? { reason: 'confirm_needed', gates, new_qty } : { new_qty };
+  // R11: the gate counts of a layer or block measurement (from layerGates) and of a selection (selectionGates on its worker
+  // totals), the same on the old and the new drawing; a gate fires when its count is > 0
+  const NO_GATES = { incomplete: 0, duplicate: 0, mixed_blocks: 0 };
+  const layerCounts = g => ({ incomplete: g.incomplete ? g.incomplete.area_excluded + g.incomplete.approx + g.incomplete.dropped : 0, duplicate: g.duplicates, mixed_blocks: 0 });
+  const selCounts = (sel, g) => ({ incomplete: sel.dropped + sel.area_null + sel.approx, duplicate: g.duplicates, mixed_blocks: g.mixed ? Object.keys(g.mixed).length : 0 });
+  // a matched DXF item (q: its new { qty, base, handles_count? }): its new qty, or blocked confirm_needed when a gate fires
+  // now that it never confirmed (R7) or whose count grew since the old drawing (R11: now / was are gate counts), with both
+  const gated = (m, now, was, q) => {
+    const gates = compare.gatesToConfirm(now, m, was), out = { new_qty: q.qty, base: q.base, handles_count: q.handles_count };
+    return gates.length ? { reason: 'confirm_needed', gates, gate_counts: Object.fromEntries(gates.map(g => [g, { old: was[g], new: now[g] }])), ...out } : out;
   };
-  async function compareReplacement(nd) {
+  const pendingTop = d => { if (!d.pending || d.parent_id !== null || d.replaces_id === null) bad('this drawing is not a pending replacement', 409); };
+  // { body: the compare table, plan: measurement id → { m: its row, x: what compare.item was built from (with the new
+  // base; keep: the matched subset's totals) }, old, lt: the new layer table (DXF), newPages: page → row (PDF/image) }
+  async function compareFull(nd) {
     const old = drawingRow(nd.replaces_id);
     if (!old) bad('the drawing this version replaces is missing', 409);
-    const result = (ready, items, extra = {}) => ({ ready, ...extra, items, totals: { rows: compare.rowTotals(items) } });
-    const items = [];
+    let lt = null, newPages = null;
+    const items = [], plan = new Map();
+    const result = (ready, its, extra = {}) => ({ body: { ready, ...extra, items: its, totals: { rows: compare.rowTotals(its) } }, plan, old, lt, newPages });
     // one item: r() gives its compare.item input; a rescale failure blocks this item only
     const add = async (m, r) => {
       let x;
       try { x = await r(); } catch (e) { if (!e.rescale) throw e; x = { reason: 'cannot_recompute' }; }
       items.push(compare.item(m, x));
+      plan.set(m.id, { m, x });
     };
     if (nd.kind === 'dxf') {
       // the units are pre-filled from the old drawing's (old_units); the user confirms them on the new one
@@ -813,16 +827,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (nd.status !== 'ready') return result(false, [], units);
       if (nd.units === null) return result(true, [], units);
       const f = UNIT_TO_M[nd.units];
-      let lt = null;
+      let olt = null;
       const newTable = async () => lt || (lt = scaledTable((await readSummary(nd.sha256)).raw, nd.units));
+      const oldTable = async () => olt || (olt = scaledTable((await readSummary(old.sha256)).raw, old.units));
       for (const m of db.prepare('SELECT * FROM measurements WHERE drawing_id=? ORDER BY id').all(old.id)) {
         await add(m, async () => {
-          if (m.tool === 'manual') return { review: true, new_qty: m.metric === 'count' ? m.qty : manualRescale(m, { scale: f }).qty };
+          if (m.tool === 'manual') {
+            const q = m.metric === 'count' ? { qty: m.qty, base: m.base } : manualRescale(m, { scale: f });
+            return { review: true, new_qty: q.qty, base: q.base };
+          }
           if (m.tool === 'dxf_layer' || m.tool === 'dxf_blocks') {
             const t = await newTable(), x = (m.tool === 'dxf_layer' ? compare.layerMatch : compare.blockMatch)(t.layers, m);
             if (x.base === undefined) return x;
-            const g = layerGates(t, t.layers.find(l => l.layer === m.layer), m);
-            return gated(m, { incomplete: !!g.incomplete, duplicate: g.duplicates > 0, mixed_blocks: false }, dxfRescale(m, x.base).qty);
+            const ot = await oldTable(), ol = ot.layers.find(l => l.layer === m.layer), nl = t.layers.find(l => l.layer === m.layer);
+            // handles_count as the create path stores it: the layer's entities, or the block count
+            return gated(m, layerCounts(layerGates(t, nl, m)), ol ? layerCounts(layerGates(ot, ol, m)) : NO_GATES,
+              { ...dxfRescale(m, x.base), handles_count: m.tool === 'dxf_layer' ? nl.entities : x.base });
           }
           if (m.tool === 'dxf_selection') return compareSelection(m, old, nd, f);
           return cannotRescale(m);
@@ -832,7 +852,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     // PDF / image: page n of the old file is page n of the new one
     if (nd.status !== 'ready') return result(false, [], { needs_units: false, new_pages: [] });
-    const newPages = new Map(db.prepare('SELECT * FROM drawings WHERE id=? OR parent_id=? ORDER BY page').all(nd.id, nd.id).map(x => [x.page, x]));
+    newPages = new Map(db.prepare('SELECT * FROM drawings WHERE id=? OR parent_id=? ORDER BY page').all(nd.id, nd.id).map(x => [x.page, x]));
     const oldPages = new Set(db.prepare('SELECT page FROM drawings WHERE id=? OR parent_id=?').all(old.id, old.id).map(x => x.page));
     for (const m of db.prepare(`SELECT m.*, d.page AS on_page FROM measurements m JOIN drawings d ON d.id=m.drawing_id
       WHERE d.id=? OR d.parent_id=? ORDER BY m.id`).all(old.id, old.id)) {
@@ -844,13 +864,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         try { pts = manual.points(g); } catch (e) { /* unreadable: below */ }
         if (!pts) return cannotRescale(m);
         if (!(page.page_w > 0) || !(page.page_h > 0) || !pts.every(p => inPage(page, p))) return { reason: 'off_page' };
-        let qty = m.qty;
+        let q = { qty: m.qty, base: m.base };
         if (m.metric !== 'count') {
           const c = m.calibration_id === null ? null : db.prepare('SELECT scale FROM calibrations WHERE id=? AND drawing_id=?').get(m.calibration_id, m.drawing_id);
           if (!c) cannotRescale(m);
-          qty = manualRescale(m, c).qty;
+          q = manualRescale(m, c);
         }
-        return { review: true, new_qty: qty };
+        return { review: true, new_qty: q.qty, base: q.base };
       });
     }
     // R10: pages of the new file with no old counterpart (information only)
@@ -859,33 +879,247 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // a selection on the new drawing: each stored handle must be there with its stored geomKey (compare.selectionMatch).
   // All matched (and the same number of entities used) → its total on the new cache, gated like a new selection
   // (selectionGates: incomplete, duplicates within it, mixed blocks); otherwise blocked, with the qty of the handles that
-  // still match (keep_matched_qty; null when none; Task 3 gates the subset when it is kept). A stored row without a
-  // geomKey (saved before batch 2) takes its key from the old drawing's cache when that cache gives the stored selection
-  // back exactly; otherwise it never matches. Nothing is written.
+  // still match (keep_matched_qty, null when none; keep: its totals, which accept stores and gates when it is kept). A
+  // stored row without a geomKey (saved before batch 2) takes its key from the old drawing's cache when that cache gives
+  // the stored selection back exactly; otherwise it never matches. The same old totals give the gate counts on the old
+  // drawing (R11; when the old cache cannot vouch for the selection, every gate that fires counts as grown). Nothing is
+  // written.
   async function compareSelection(m, old, nd, f) {
     const stored = db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid').all(m.id).map(h => ({ ...h }));
     const handles = stored.map(h => h.handle), total = hs => totalSelection(nd.sha256, hs, m.metric, !!m.nested);
-    if (stored.some(h => h.geom_key === null)) {
+    const oldTotal = async () => {
       let o = null;
       try { o = await totalSelection(old.sha256, handles, m.metric, !!m.nested); } catch (e) { if (!e.status) throw e; }
-      if (o && !o.unknown && o.used === m.handles_count) {
-        const k = new Map(o.used_handles.map((h, i) => [h, o.used_keys[i]]));
-        for (const h of stored) if (h.geom_key === null && k.has(h.handle)) h.geom_key = k.get(h.handle);
-      }
+      return o && !o.unknown && o.used === m.handles_count ? o : null;
+    };
+    const legacy = stored.some(h => h.geom_key === null);
+    let o = legacy ? await oldTotal() : null;
+    if (o) {
+      const k = new Map(o.used_handles.map((h, i) => [h, o.used_keys[i]]));
+      for (const h of stored) if (h.geom_key === null && k.has(h.handle)) h.geom_key = k.get(h.handle);
     }
     const sel = await total(handles);
     const x = compare.selectionMatch(stored, new Map(sel.used_handles.map((h, i) => [h, sel.used_keys[i]])), sel.unknown);
     if (x.all && sel.used === m.handles_count) {
-      const g = selectionGates(sel);
+      if (!legacy) o = await oldTotal();
       // duplicates with other selections on the row (crossDuplicates) are by geomKey: unchanged when every key matches
-      return gated(m, { incomplete: g.incomplete, duplicate: g.duplicates > 0, mixed_blocks: g.mixed !== null }, dxfRescale(m, selectionBase(sel.base, m.metric, f)).qty);
+      return gated(m, selCounts(sel, selectionGates(sel)), o ? selCounts(o, selectionGates(o)) : NO_GATES, dxfRescale(m, selectionBase(sel.base, m.metric, f)));
     }
     let keep = null;
     if (x.matched.length) {
       const k = await total(x.matched);
-      if (k.used) keep = dxfRescale(m, selectionBase(k.base, m.metric, f)).qty;
+      if (k.used) keep = { total: k, ...dxfRescale(m, selectionBase(k.base, m.metric, f)) };
     }
-    return { reason: x.reason || 'geometry_changed', keep_matched_qty: keep };
+    return { reason: x.reason || 'geometry_changed', keep_matched_qty: keep ? keep.qty : null, keep };
+  }
+
+  // ---- POST /drawings/:newId/accept { expect } (spec 6.5, Task 3): the reviewed table is applied in one tx (R18) ---------
+  // expect lists every item of the compare table once: { measurement_id, new_qty, resolution?, to?, confirm? }.
+  // - new_qty: the qty the measurement has after accept (null for delete; null for relink / keep_matched while that qty
+  //   is not known yet: the 409 lists it in `resolved`).
+  // - resolution, only on a blocked item and one of its options: delete | relink (to: one of its relink_choices, R12) |
+  //   keep_matched | confirm (confirms the item's gates).
+  // - confirm, with relink / keep_matched only: the checks that fire on the new content (incomplete, duplicate,
+  //   mixed_blocks, overlap with the other measurements of the row; R7), e.g. { resolution: 'relink', to: 'PAVING',
+  //   new_qty: 25, confirm: ['overlap'] }. The 409 lists the ones each resolution needs (resolved[].gates).
+  // 400: a malformed body, a blocked item without a resolution, a resolution the item does not offer. 409 with the fresh
+  // table: another id set or qty (R18), unconfirmed checks, or the drawings changed while the comparison ran.
+  const RESOLUTIONS = ['delete', 'relink', 'keep_matched', 'confirm'], CHECKS = ['incomplete', 'duplicate', 'mixed_blocks', 'overlap'];
+  const REVIEW_AGAIN = 'the measured quantities changed: review the changes again';
+  function cleanAccept(b) {
+    for (const k of Object.keys(b)) if (k !== 'expect') bad('unknown field: ' + k);
+    if (!Array.isArray(b.expect)) bad('accept needs expect: the reviewed table [{ measurement_id, new_qty, resolution?, to?, confirm? }]');
+    if (b.expect.length > 100000) bad('expect is too long');
+    const out = new Map();
+    for (const x of b.expect) {
+      if (!x || typeof x !== 'object' || Array.isArray(x)) bad('each expect entry must be { measurement_id, new_qty, resolution?, to?, confirm? }');
+      for (const k of Object.keys(x)) if (!['measurement_id', 'new_qty', 'resolution', 'to', 'confirm'].includes(k)) bad('unknown field in expect: ' + k);
+      if (!Number.isInteger(x.measurement_id) || x.measurement_id <= 0) bad('expect measurement_id must be a measurement id');
+      if (x.new_qty !== null && !finNum(x.new_qty)) bad('expect new_qty must be a number (null: deleted, or not known yet)');
+      if (x.resolution !== undefined && !RESOLUTIONS.includes(x.resolution)) bad('resolution must be one of ' + RESOLUTIONS.join(', '));
+      if (x.to !== undefined && typeof x.to !== 'string' && !(x.to && typeof x.to === 'object' && !Array.isArray(x.to))) bad('to must be a layer name or { layer, block }');
+      if (x.confirm !== undefined && (!Array.isArray(x.confirm) || x.confirm.some(g => !CHECKS.includes(g)) || new Set(x.confirm).size !== x.confirm.length))
+        bad('confirm must be a list of distinct checks: ' + CHECKS.join(', '));
+      if (out.has(x.measurement_id)) bad('duplicate measurement_id in expect');
+      out.set(x.measurement_id, x);
+    }
+    return out;
+  }
+  // what the comparison read (both drawings and their page rows, the old drawing's measurements, handles and
+  // calibrations): anything changed before the tx → the comparison is stale
+  const acceptInputs = (newId, oldId) => JSON.stringify([
+    db.prepare('SELECT * FROM drawings WHERE id IN (?, ?) OR parent_id IN (?, ?) ORDER BY id').all(newId, oldId, newId, oldId),
+    db.prepare('SELECT m.* FROM measurements m JOIN drawings d ON d.id=m.drawing_id WHERE d.id=? OR d.parent_id=? ORDER BY m.id').all(oldId, oldId),
+    db.prepare(`SELECT h.measurement_id, h.handle, h.geom_key FROM measurement_handles h JOIN measurements m ON m.id=h.measurement_id JOIN drawings d ON d.id=m.drawing_id
+      WHERE d.id=? OR d.parent_id=? ORDER BY h.rowid`).all(oldId, oldId),
+    db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.id=? OR d.parent_id=? ORDER BY c.id').all(oldId, oldId)]);
+  async function acceptReplacement(req, res, d, t, me) {
+    need(me, 'admin', 'qs'); mustDraft(t); pendingTop(d);
+    const expect = cleanAccept(await ctx.readBody(req));
+    const seen = acceptInputs(d.id, d.replaces_id);
+    const nd = drawingRow(d.id);
+    if (!nd) bad('drawing not found', 404);
+    pendingTop(nd);
+    const full = await compareFull(nd);   // async (summaries, workers): checked against `seen` inside the tx
+    if (hooks.beforeAcceptTx) await hooks.beforeAcceptTx();
+    const out = tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = drawingRow(d.id);
+      if (!cur) bad('drawing not found', 404);
+      pendingTop(cur);
+      if (acceptInputs(d.id, d.replaces_id) !== seen) return null;
+      return applyAccept(cur, full, expect, t, me);
+    });
+    if (out) return reply(res, 200, out);
+    const cur = drawingRow(d.id);
+    if (!cur) bad('drawing not found', 404);
+    pendingTop(cur);
+    conflictBody({ error: 'the drawings changed while the replacement was compared: review the changes again', ...(await compareFull(cur)).body });
+  }
+  // inside the tx, with the comparison `full` still current
+  function applyAccept(nd, full, expect, t, me) {
+    const { body, plan, old, lt, newPages } = full, items = body.items;
+    if (!body.ready) conflictBody({ error: 'the new version is not ready yet: accept it once it is', ...body });
+    if (body.needs_units) conflictBody({ error: 'confirm the units of the new version first', ...body });
+    if (items.length !== expect.size || items.some(it => !expect.has(it.measurement_id))) conflictBody({ error: REVIEW_AGAIN, ...body });
+    const missing = items.filter(it => it.status === 'blocked' && expect.get(it.measurement_id).resolution === undefined).map(it => it.measurement_id);
+    if (missing.length) failBody(400, { error: 'blocked items need a resolution: ' + missing.join(', '), ids: missing, ...body });
+    for (const it of items) {
+      const why = compare.resolutionError(it, expect.get(it.measurement_id));
+      if (why) failBody(400, { error: `measurement ${it.measurement_id}: ${why}`, ...body });
+    }
+    // PDF/image: the old pages' calibrations are copied to the page of the same number (to be verified there again)
+    const cmap = new Map();
+    if (nd.kind !== 'dxf') {
+      const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)');
+      for (const c of db.prepare('SELECT c.*, d.page AS on_page FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.id=? OR d.parent_id=? ORDER BY c.id').all(old.id, old.id)) {
+        const np = newPages.get(c.on_page);
+        if (np) cmap.set(c.id, Number(insC.run(np.id, c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.created, c.created_by).lastInsertRowid));
+      }
+    }
+    const set = (id, f) => { const ks = Object.keys(f); db.prepare(`UPDATE measurements SET ${ks.map(k => k + '=?').join(', ')} WHERE id=?`).run(...ks.map(k => f[k]), id); };
+    const counts = { kept: 0, deleted: 0, relinked: 0, kept_matched: 0, confirmed: 0, review: 0 };
+    const rows = [], resolved = [], checked = [], qtyOf = new Map();
+    // 1. every measurement: deleted, or moved to the new drawing (its page) with its new content
+    for (const it of items) {
+      const e = expect.get(it.measurement_id), { m, x } = plan.get(it.measurement_id);
+      if (m.row_id !== null && !rows.includes(m.row_id)) rows.push(m.row_id);
+      if (e.resolution === 'delete') {
+        db.prepare('DELETE FROM measurement_handles WHERE measurement_id=?').run(m.id);
+        db.prepare('DELETE FROM measurements WHERE id=?').run(m.id);
+        counts.deleted++;
+        resolved.push({ measurement_id: m.id, resolution: 'delete', new_qty: null, gates: [] });
+        continue;
+      }
+      counts.kept++;
+      const page = nd.kind === 'dxf' ? nd : newPages.get(m.on_page);
+      if (!page) bad(`measurement ${m.id}: its page is not in the new version`, 409);   // page_missing: delete only
+      if (m.calibration_id !== null && !cmap.has(m.calibration_id)) bad(`measurement ${m.id}: its calibration is not on its page`, 409);
+      const moved = { drawing_id: page.id, calibration_id: m.calibration_id === null ? null : cmap.get(m.calibration_id) };
+      if (m.tool === 'manual') { moved.review_needed = 1; counts.review++; }
+      let qty;
+      if (e.resolution === 'relink') {
+        const r = relinkTo(m, e.to, lt);
+        set(m.id, { ...moved, ...r.set });
+        checked.push({ e, mv: { ...m, ...r.set }, fired: r.fired });
+        qty = r.set.qty; counts.relinked++;
+      } else if (e.resolution === 'keep_matched') {
+        const k = x.keep, sel = k.total, g = selectionGates(sel);
+        const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, skipped: sel.skipped, ...(m.metric === 'count' ? { nested: !!m.nested, blocks: sel.blocks } : {}) });
+        set(m.id, { ...moved, qty: k.qty, base: k.base, handles_count: sel.used, selection_summary: summary });
+        db.prepare('DELETE FROM measurement_handles WHERE measurement_id=?').run(m.id);
+        const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) VALUES(?,?,?)');
+        for (let i = 0; i < sel.used_handles.length; i++) insH.run(m.id, sel.used_handles[i], sel.used_keys[i]);
+        const sv = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(g.counted.map(c => c.layer + '\0' + c.block)) };
+        checked.push({ e, mv: { ...m, sel: sv }, fired: [...(g.incomplete ? ['incomplete'] : []), ...(g.duplicates > 0 ? ['duplicate'] : []), ...(g.mixed ? ['mixed_blocks'] : [])] });
+        qty = k.qty; counts.kept_matched++;
+      } else {
+        // same / changed / review, or confirm: the compared qty; a confirmation records its gates on the measurement
+        const conf = e.resolution === 'confirm' ? Object.fromEntries(it.gates.map(g => [g === 'mixed_blocks' ? 'mixed' : g, 1])) : {};
+        set(m.id, { ...moved, qty: x.new_qty, base: x.base, ...(x.handles_count !== undefined ? { handles_count: x.handles_count } : {}), ...conf });
+        qty = x.new_qty;
+        if (e.resolution === 'confirm') { counts.confirmed++; resolved.push({ measurement_id: m.id, resolution: 'confirm', new_qty: qty, gates: it.gates }); }
+      }
+      qtyOf.set(m.id, qty);
+    }
+    // 2. relink / keep_matched: the checks on the new content, against the row as it is now (R7): overlap with the other
+    // measurements of the row (and, for a selection, exact copies held by other selections); the flags record them
+    for (const gt of checked) {
+      const mv = gt.mv, fired = new Set(gt.fired);
+      if (mv.row_id !== null) {
+        if (overlapCount(mv, nd.sha256, t.id, mv.id)) fired.add('overlap');
+        if (mv.tool === 'dxf_selection' && crossDuplicates(mv, nd.sha256, t.id, mv.id)) fired.add('duplicate');
+      }
+      gt.gates = CHECKS.filter(g => fired.has(g));
+      set(mv.id, { incomplete: fired.has('incomplete') ? 1 : 0, duplicate: fired.has('duplicate') ? 1 : 0, ...(mv.tool === 'dxf_selection' ? { mixed: fired.has('mixed_blocks') ? 1 : 0 } : {}) });
+    }
+    for (const gt of checked) resolved.push({ measurement_id: gt.mv.id, resolution: gt.e.resolution, ...(gt.e.to !== undefined ? { to: gt.e.to } : {}), new_qty: qtyOf.get(gt.mv.id), gates: gt.gates });
+    const order = new Map(items.map((it, i) => [it.measurement_id, i]));
+    resolved.sort((a, b) => order.get(a.measurement_id) - order.get(b.measurement_id));
+    // 3. R18: every qty as reviewed, every check of a resolution confirmed (else 409: the tx rolls back)
+    if (items.some(it => { const e = expect.get(it.measurement_id); return e.resolution !== 'delete' && (e.new_qty === null || !sameQty(e.new_qty, qtyOf.get(it.measurement_id))); }))
+      conflictBody({ error: REVIEW_AGAIN, ...body, resolved });
+    if (checked.some(gt => gt.gates.some(g => !(gt.e.confirm || []).includes(g)))) conflictBody({ error: 'confirm the checks of the chosen resolutions', ...body, resolved });
+    // 4. the rows (an imported row keeps its client qty; its measured total must not go below 0), then the drawings
+    const rowQty = rows.map(r => ({ row_id: r, qty: recompute(r) }));
+    db.prepare('UPDATE drawings SET pending=0 WHERE id=? OR parent_id=?').run(nd.id, nd.id);
+    for (const o of db.prepare('SELECT id, page FROM drawings WHERE id=? OR parent_id=?').all(old.id, old.id))
+      db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(o.id === old.id || !newPages ? nd.id : (newPages.get(o.page) || nd).id, o.id);
+    audit(me, 'replace_accept', 'drawings', nd.id, { replaced: old.id, by: nd.id, ...counts, changed_rows: rows.length });
+    return { id: nd.id, replaced: old.id, ...counts, rows: rowQty };
+  }
+  // a layer or block measurement relinked to `to` (one of its relink_choices) on the new layer table: what is stored
+  // (by the creation code: base from the table, dxfQty) and the gates that fire there (layerGates)
+  function relinkTo(m, to, lt) {
+    const layer = m.tool === 'dxf_layer' ? to : to.layer, block = m.tool === 'dxf_layer' ? null : to.block;
+    const l = lt.layers.find(x => x.layer === layer);
+    if (!l) bad(`measurement ${m.id}: layer ${layer} is not in the new version`, 409);
+    let base, handles;
+    if (m.tool === 'dxf_layer') { base = l[m.metric]; handles = l.entities; }
+    else { const b = (l.blocks || []).find(x => x.name === block); base = b ? b.top + (m.nested ? b.nested : 0) : null; handles = base; }
+    const q = dxfRescale(m, base), g = layerGates(lt, l, { ...m, layer, block });
+    return { set: { layer, block, qty: q.qty, base: q.base, handles_count: handles }, fired: [...(g.incomplete ? ['incomplete'] : []), ...(g.duplicates > 0 ? ['duplicate'] : [])] };
+  }
+
+  // DELETE /drawings/:newId while pending = cancel the replacement: that row and its page rows go (nothing is measured or
+  // calibrated on them); the old drawing is measurable again. Files stay (shared by sha256, as on tender delete).
+  function cancelReplacement(res, d, t, me) {
+    need(me, 'admin', 'qs'); mustDraft(t);
+    if (!d.pending) bad('only a pending new version can be cancelled', 409);
+    if (d.parent_id !== null) bad('cancel the whole new version: use its first page');
+    tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = drawingRow(d.id);
+      if (!cur || !cur.pending) bad('only a pending new version can be cancelled', 409);
+      const ids = db.prepare('SELECT id FROM drawings WHERE id=? OR parent_id=?').all(cur.id, cur.id).map(x => x.id), marks = ids.map(() => '?').join(',');
+      // never drop a quantity silently (the guards keep these at 0)
+      if (db.prepare(`SELECT 1 FROM measurements WHERE drawing_id IN (${marks}) UNION ALL SELECT 1 FROM calibrations WHERE drawing_id IN (${marks}) LIMIT 1`).get(...ids, ...ids))
+        bad('the new version has measurements or calibrations: it cannot be cancelled', 409);
+      db.prepare(`DELETE FROM drawings WHERE id IN (${marks})`).run(...ids);
+      audit(me, 'replace_cancel', 'drawings', cur.id, { replaces: cur.replaces_id, pages: ids.length });
+    });
+    return reply(res, 200, { ok: 1 });
+  }
+
+  // POST /measurements/:id/reviewed: clears review_needed (set on manual measurements carried to a new version)
+  function markReviewed(res, parts, me) {
+    need(me, 'admin', 'qs');
+    const m = idOf(parts[1]) === null ? null : db.prepare('SELECT * FROM measurements WHERE id=?').get(idOf(parts[1]));
+    const t = m ? tenderRow(m.tender_id) : null;
+    if (!m || !t) bad('measurement not found', 404);
+    mustDraft(t);
+    tx(() => {
+      mustDraft(tenderRow(t.id));
+      const cur = db.prepare('SELECT * FROM measurements WHERE id=?').get(m.id);
+      if (!cur) bad('measurement not found', 404);
+      const d = drawingRow(cur.drawing_id);
+      if (d) canMeasure(d);
+      if (cur.review_needed) {
+        db.prepare('UPDATE measurements SET review_needed=0 WHERE id=?').run(cur.id);
+        audit(me, 'measure_reviewed', 'measurements', cur.id, { drawing_id: cur.drawing_id, row_id: cur.row_id, tool: cur.tool });
+      }
+    });
+    return reply(res, 200, { ok: 1, id: m.id, review_needed: 0 });
   }
 
   // the file's download name: the drawing name with its extension, percent-encoded (RFC 5987/8187: ' ( ) * too), so no
@@ -954,14 +1188,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (sub === 'file' && parts.length === 3 && method === 'GET') return serveFile(req, res, d, me);
     if (sub === 'pages' && parts.length === 3 && method === 'POST') return registerPages(req, res, d, t, me);
     if (sub === 'calibrations' && parts.length >= 3 && parts.length <= 5) return calibrationApi(req, res, parts, d, t, me);
-    if (sub === 'units' && parts.length === 3 && method === 'PUT') { need(me, 'admin', 'qs'); mustDraft(t); dxfOnly(); notReplacing(d); return setUnits(req, res, d, t, me); }
+    if (sub === 'units' && parts.length === 3 && method === 'PUT') { need(me, 'admin', 'qs'); mustDraft(t); dxfOnly(); notReplacing(d); notReplaced(d); return setUnits(req, res, d, t, me); }
     if (sub === 'measurements' && parts.length === 3 && method === 'POST') return createMeasurement(req, res, d, t, me);
     if (sub === 'replace' && parts.length === 3 && method === 'POST') { need(me, 'admin', 'qs'); mustDraft(t); return upload(req, res, url, t, me, replaceable(d.id)); }
     if (sub === 'compare' && parts.length === 3 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer');
-      if (!d.pending || d.parent_id !== null || d.replaces_id === null) bad('this drawing is not a pending replacement', 409);
-      return reply(res, 200, await compareReplacement(d));
+      pendingTop(d);
+      return reply(res, 200, (await compareFull(d)).body);
     }
+    if (sub === 'accept' && parts.length === 3 && method === 'POST') return acceptReplacement(req, res, d, t, me);
+    if (sub === undefined && parts.length === 2 && method === 'DELETE') return cancelReplacement(res, d, t, me);
     return false;
   }
 
@@ -1504,6 +1740,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     if (parts[0] === 'measurements' && parts.length === 2) return measurementApi(req, res, parts, me);
     if (parts[0] === 'measurements' && parts.length === 3 && parts[2] === 'handles' && method === 'GET') return measurementHandles(res, parts, me);
+    if (parts[0] === 'measurements' && parts.length === 3 && parts[2] === 'reviewed' && method === 'POST') return markReviewed(res, parts, me);
     if (parts[0] === 'tenders' && parts[2] === 'drawings' && parts.length === 3) {
       const t = tenderRow(idOf(parts[1]));
       if (!t) bad('tender not found', 404);
