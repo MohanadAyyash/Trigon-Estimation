@@ -173,35 +173,47 @@ function create(o) {
     ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fillRect(s[0] + 6, s[1] - 18, w + 6, 16);
     ctx.fillStyle = colour; ctx.fillText(text, s[0] + 9, s[1] - 6);
   }
-  // the measurement list's number, white on the measurement's colour, up and before its first point
-  function badge(ctx, p, no, colour) {
+  // the measurement list's number, white on the measurement's colour, up and before its first point; placed: the badges
+  // already drawn in this pass ([{ x, y, r }], CSS px): a badge that would touch one moves sideways by its width until clear,
+  // so badges sharing a point form a row: to the left while it stays inside the frame (x ≥ r), then to the right -> its
+  // centre { x, y, r }
+  function badge(ctx, p, no, colour, placed) {
     const s = S(p);
-    if (!s) return;
+    if (!s) return null;
     const text = String(no);
     ctx.font = 'bold 11px "Segoe UI", Tahoma, Arial, sans-serif';
-    const r = Math.max(8, ctx.measureText(text).width / 2 + 4), cx = s[0] - r - 3, cy = s[1] - r - 3;
+    const r = Math.max(8, ctx.measureText(text).width / 2 + 4), cy = s[1] - r - 3;
+    const x0 = s[0] - r - 3, d = 2 * r + 2, hit = x => placed.some(b => Math.hypot(b.x - x, b.y - cy) < b.r + r + 2);
+    let cx = x0;
+    for (let n = 1; n < 1000 && hit(cx); n++) cx = x0 - n * d >= r ? x0 - n * d : cx + d;
+    placed.push({ x: cx, y: cy, r });
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
     ctx.fillStyle = colour; ctx.fill();
     ctx.lineWidth = 1.5; ctx.strokeStyle = '#ffffff'; ctx.stroke();
     ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(text, cx, cy + 0.5);
     ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+    return { x: cx, y: cy, r };
   }
   const first = g => g.tool === 'rect' ? g.p1 : g.tool === 'area' ? g.outer[0] : g.pts[0];
   // the saved measurements (with their number badges) and the calibrations: on the screen and in an export alike
+  // Order: filled shapes (area, rect) first, then lines and counts over them (a kerb on a paving edge stays visible), then
+  // every badge on top, in list order. saved: [{ id, no, text, colour, badge: { x, y, r } | null }] in the entries' order.
   function drawSaved(ctx, ov) {
-    const saved = [], cals = [];
-    (ov.saved || []).forEach((m, k) => {
-      const colour = m.color || PALETTE[k % PALETTE.length];
-      if (!m.geom) {
-        if (m.at && Number.isInteger(m.no)) { badge(ctx, m.at, m.no, colour); saved.push({ id: m.id, no: m.no, text: m.text || '', colour }); }
-        return;
-      }
-      shape(ctx, m.geom, colour, 0.15);
-      label(ctx, first(m.geom), m.text, colour);
-      if (Number.isInteger(m.no)) badge(ctx, first(m.geom), m.no, colour);
-      saved.push({ id: m.id, no: Number.isInteger(m.no) ? m.no : null, text: m.text, colour });
-    });
+    const cals = [], list = (ov.saved || []).map((m, k) => ({ m, k, colour: m.color || PALETTE[k % PALETTE.length] }));
+    const filled = x => !!x.m.geom && (x.m.geom.tool === 'area' || x.m.geom.tool === 'rect');
+    for (const x of [...list.filter(filled), ...list.filter(x => !filled(x))]) {
+      if (!x.m.geom) continue;
+      shape(ctx, x.m.geom, x.colour, 0.15);
+      label(ctx, first(x.m.geom), x.m.text, x.colour);
+    }
+    const placed = [], saved = [];
+    for (const { m, colour } of list) {
+      const at = m.geom ? first(m.geom) : m.at;
+      if (!at || (!m.geom && !Number.isInteger(m.no))) continue;
+      const b = Number.isInteger(m.no) ? badge(ctx, at, m.no, colour, placed) : null;
+      saved.push({ id: m.id, no: Number.isInteger(m.no) ? m.no : null, text: m.text || '', colour, badge: b });
+    }
     for (const c of ov.cals || []) {
       ctx.setLineDash([6, 4]);
       if (c.region) { ctx.beginPath(); path(ctx, rectPts([c.region[0], c.region[1]], [c.region[2], c.region[3]]), true); ctx.strokeStyle = REGION; ctx.lineWidth = 1.5; ctx.stroke(); }

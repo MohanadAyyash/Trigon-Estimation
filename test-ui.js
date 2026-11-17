@@ -139,6 +139,7 @@ server.listen(0, async () => {
     await page.waitForSelector('#reprice-preview-box');
     const preview = (await call('GET', `tenders/${full}/price?snapshot=latest`, null, admin)).j;
     const f2 = v => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const iso = s => '\u2066' + s + '\u2069';   // the app's left-to-right isolate (scale equations, dates)
     assert.ok((await page.textContent('#reprice-old')).includes(f2(pr.result.P)), 'preview shows the old P');
     assert.ok((await page.textContent('#reprice-new')).includes(f2(preview.result.P)), 'preview shows the new P');
     assert.notStrictEqual(preview.result.P, pr.result.P);
@@ -1428,7 +1429,7 @@ server.listen(0, async () => {
       await pick(420, 400); await pick(520, 400);
       await page.waitForSelector(DM + ' #cal-form');
       await page.fill('#cal-real', '2'); await page.click('#cal-save');
-      await page.waitForFunction(() => /Region 1: 1 pt = 0\.02 m/.test(document.querySelector('#tl-scale').textContent));
+      await page.waitForFunction(() => /Region 1: 1 pt = 0\.02 m/.test(document.querySelector('#tl-scale').textContent.replace(/[\u2066-\u2069]/g, '')));
       const regCal = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? AND region IS NOT NULL').get(pdfId);
       assert.strictEqual(regCal.scale, 0.02);
       await page.click('#tl-verify'); await pick(420, 350); await pick(520, 350);
@@ -1476,13 +1477,13 @@ server.listen(0, async () => {
       assert.strictEqual(await rowQty(rowM), withLate, 'nothing changed');
       { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'stale apply 409 logged'); errors.splice(i, 1); }
       await page.click('#cal-apply');
-      await page.waitForFunction(() => /Page: 1 pt = 0\.1 m/.test(document.querySelector('#tl-scale').textContent));
+      await page.waitForFunction(() => /Page: 1 pt = 0\.1 m/.test(document.querySelector('#tl-scale').textContent.replace(/[\u2066-\u2069]/g, '')));
       assert.ok(Math.abs(await rowQty(rowM) - withLate * 2) < 1e-9 && Math.abs(await rowQty(rowA) - 96) < 1e-9, 'Apply changed the rows');
       await ok(call('DELETE', 'measurements/' + late.id, null, admin), 'tidy');
       assert.ok(Math.abs(await rowQty(rowM) - beforeM * 2) < 1e-9, 'the reviewed measurements doubled');
       await page.evaluate(() => window.__tvViewer.requestDraw()); await idleM();
       // the scale label drawn on the page is in the user's language (the same words as the scale line)
-      assert.ok((await page.evaluate(() => window.__tvTools.overlayCals())).some(x => x === '1 pt = 0.1 m'), 'overlay scale label');
+      assert.ok((await page.evaluate(() => window.__tvTools.overlayCals())).some(x => x === iso('1 pt = 0.1 m')), 'overlay scale label');
       assert.ok((await page.textContent(`${DM} #dw-measurements tr[data-row="${rowA}"] td.m-formula`)).includes('(0.1 m/pt)²'), 'list follows the new scale');
       // final review M3: a measurement on the region says which region (numbered as the scale line); M4: the edit form
       // unlinks it ("no row", distinct from "no change")
@@ -1512,7 +1513,7 @@ server.listen(0, async () => {
         await openM();
         await page.click('#tl-calibrate'); await pick(100, 100); await pick(200, 100);
         await page.waitForSelector(DM + ' #cal-form'); await page.fill('#cal-real', '5'); await page.click('#cal-save');
-        await page.waitForFunction(() => /Page: 1 pt = 0\.05 m/.test(document.querySelector('#tl-scale').textContent));
+        await page.waitForFunction(() => /Page: 1 pt = 0\.05 m/.test(document.querySelector('#tl-scale').textContent.replace(/[\u2066-\u2069]/g, '')));
         await page.click('#tl-polyline');
         await clickPage(300, 200);
         { const [sx, sy] = await scr(300, 350); await page.keyboard.down('Shift'); await page.mouse.click(sx, sy + 3); await page.keyboard.up('Shift'); }
@@ -1707,7 +1708,7 @@ server.listen(0, async () => {
         if (what) await page.selectOption('#tv-export-what', what);
         const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#tv-export')]);
         const file = fs.readFileSync(await dl.path());
-        const hook = await page.evaluate(q => { const x = window.__tvExport; return { width: x.width, height: x.height, w: x.w, h: x.h, k: x.k, legend: x.legend, head: x.head, drawn: x.drawn, px: q ? q.map(r => x.toPx(r)) : null }; }, p || null);
+        const hook = await page.evaluate(q => { const x = window.__tvExport; return { width: x.width, height: x.height, w: x.w, h: x.h, k: x.k, legend: x.legend, head: x.head, drawn: x.drawn, notDrawn: x.notDrawn, px: q ? q.map(r => x.toPx(r)) : null }; }, p || null);
         return { file, name: dl.suggestedFilename(), hook };
       };
       // the PNG as the browser decodes it: its size and the pixels at the given export points
@@ -1781,7 +1782,13 @@ server.listen(0, async () => {
       const xm5 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'dxf_layer', layer: 'SITE', metric: 'area', row_id: xA, color: '#c000c0', confirm_overlap: true }, admin), 'x layer area');
       const xm6 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count', row_id: xN, color: '#0000e0' }, admin), 'x block count');
       const xm7 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'dxf_selection', handles: ['R1'], metric: 'open_length', row_id: xL, label: 'Fake road' }, admin), 'x selection');
-      const dxfIds = [xm3.id, xm4.id, xm5.id, xm6.id, xm7.id];
+      // fix round 2: two more starting at the square's corner (0, 0), where the layer area's badge sits: a kerb along the left
+      // edge and a rect over it (listed after the kerb, drawn under it); and a layer measurement whose layer is gone
+      const xm8 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'manual', row_id: xL, label: 'Fake kerb', color: '#ff8000', confirm_overlap: true, geom: { tool: 'line', pts: [[0, 0], [0, 10]] } }, admin), 'x kerb');
+      const xm9 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'manual', row_id: xA, label: 'Fake corner', confirm_overlap: true, geom: { tool: 'rect', p1: [0, 0], p2: [4, 3] } }, admin), 'x corner');
+      const xm10 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'dxf_layer', layer: 'SITE', metric: 'closed_perimeter', row_id: xL, confirm_overlap: true }, admin), 'x gone layer');
+      db.prepare("UPDATE measurements SET layer='GONE' WHERE id=?").run(xm10.id);   // as if a later version had dropped the layer
+      const dxfIds = [xm3.id, xm4.id, xm5.id, xm6.id, xm7.id, xm8.id, xm9.id, xm10.id];
       await page.goto(`${origin}/#/tender/${xt}/drawings/${xd}`);
       await page.waitForSelector(`${DX} #tv-panel[data-drawing="${xd}"] #tv-open`);
       await page.click(DX + ' #tv-open');
@@ -1789,10 +1796,11 @@ server.listen(0, async () => {
       await frame();
       const xs2 = (await listShown(DX)).filter(x => dxfIds.includes(x.id));
       assert.deepStrictEqual(xs2.map(x => [x.no, x.label, x.qty, x.unit]), [[3, 'Fake dxf edge', '10.00', 'm'], [4, 'Fake dxf slab', '6.00', 'm2'], [5, 'SITE', '100.00', 'm2'],
-        [6, 'MH1', '1.00', 'nr'], [7, 'Fake road', '10.00', 'm']], 'DXF measurements numbered after the PDF ones; the layer / block as the label');
+        [6, 'MH1', '1.00', 'nr'], [7, 'Fake road', '10.00', 'm'], [8, 'Fake kerb', '10.00', 'm'], [9, 'Fake corner', '12.00', 'm2'], [10, 'GONE', '40.00', 'm']],
+        'DXF measurements numbered after the PDF ones; the layer / block as the label');
       // points: manual line, manual rect edge, outside the drawing, SITE square edge, inside the square, SITE open line, the
       // selected ROAD line, the MH insert
-      const exd = await exportPng(null, [[5, 5], [6, 7.5], [5, -0.3], [0, 2], [2, 8], [12, 5], [14, 5], [16, 5]]);
+      const exd = await exportPng(null, [[5, 5], [6, 7.5], [5, -0.3], [5, 0], [2, 8], [12, 5], [14, 5], [16, 5], [0, 1.5]]);
       assert.strictEqual(exd.name, 'Test UI Export-site-rev1.png', 'DXF file name');
       const [dw0, dh0] = pngSize(exd.file);
       assert.deepStrictEqual([dw0, dh0], [exd.hook.width, exd.hook.height], 'DXF PNG size');
@@ -1805,10 +1813,19 @@ server.listen(0, async () => {
       near(dd.px[4], [54, 26, 54, 255], 'DXF: the measured area filled at 15 %');
       const site = dd.px[5];
       assert.ok(!(Math.abs(site[0] - 192) <= 40 && site[1] <= 60) && site[0] > 150 && site[1] > 150, 'DXF: the open SITE line is not part of the area: ' + JSON.stringify(site));
-      near(dd.px[6], [124, 179, 66, 255], 'DXF: the selected entity in the palette colour after the drawn ones');
+      near(dd.px[6], [216, 27, 96, 255], 'DXF: the selected entity in the palette colour after the 4 drawn ones');
       near(dd.px[7], [0, 0, 224, 255], 'DXF: the insert in the block count colour');
+      near(dd.px[8], [255, 128, 0, 255], 'DXF: the kerb drawn over the rect sharing its edge (lines after areas)');
+      // badges never overlap: three start at (0, 0) and form a row; every pair at least the sum of their radii apart
+      const bs = exd.hook.drawn.map(x => x.badge).filter(Boolean);
+      assert.strictEqual(bs.length, 7, 'a badge for each measurement on the drawing (3..9): ' + JSON.stringify(exd.hook.drawn.map(x => [x.no, !!x.badge])));
+      for (let i = 0; i < bs.length; i++) for (let j = i + 1; j < bs.length; j++)
+        assert.ok(Math.hypot(bs[i].x - bs[j].x, bs[i].y - bs[j].y) >= bs[i].r + bs[j].r, 'badges ' + i + ' and ' + j + ' overlap: ' + JSON.stringify([bs[i], bs[j]]));
+      const corner = exd.hook.drawn.filter(x => [5, 8, 9].includes(x.no)).map(x => x.badge);
+      assert.ok(corner.every(b => Math.abs(b.y - corner[0].y) < 1e-9), 'the badges sharing a point form a row');
+      assert.deepStrictEqual(exd.hook.notDrawn, [10], 'the measurement with nothing on the drawing is noted in the legend');
       // every DXF measurement carries its list number on the image; the legend is the list
-      assert.deepStrictEqual(exd.hook.drawn.map(x => x.no).sort((a, b) => a - b), xs2.map(x => x.no), 'DXF: the numbers drawn = the list numbers');
+      assert.deepStrictEqual(exd.hook.drawn.map(x => x.no).sort((a, b) => a - b), xs2.map(x => x.no).filter(n => n !== 10), 'DXF: the numbers drawn = the list numbers');
       assert.deepStrictEqual(exd.hook.legend, xs2.map(({ id, ...x }) => x), 'DXF legend = list');
       assert.ok(exd.hook.head.scale.includes('1 m = 1 m'), 'DXF scale line: ' + exd.hook.head.scale);
       assert.ok(exd.hook.head.title.endsWith('site Rev 1'), 'title: drawing Rev n: ' + exd.hook.head.title);
@@ -1905,6 +1922,10 @@ server.listen(0, async () => {
       for (const e of x.legend) assert.deepStrictEqual(e, shown.find(s => s.no === e.no), 'Arabic legend entry = list');
       // the layer / block / selection measurements are coloured and numbered on the image (badges), with the list's numbers
       assert.ok(x.drawn.length > 0 && x.drawn.every(d => x.legend.some(e => e.no === d.no)), 'Arabic export: badges with list numbers: ' + JSON.stringify(x.drawn));
+      const ab = x.drawn.map(d => d.badge).filter(Boolean);
+      for (let i = 0; i < ab.length; i++) for (let j = i + 1; j < ab.length; j++)
+        assert.ok(Math.hypot(ab[i].x - ab[j].x, ab[i].y - ab[j].y) >= ab[i].r + ab[j].r, 'Arabic export: badges ' + i + ' and ' + j + ' overlap');
+      assert.ok(ab.every(b => b.x - b.r >= 0), 'Arabic export: every badge inside the frame: ' + JSON.stringify(ab));
       if (process.env.EXPORT_SCREENSHOT) fs.writeFileSync(process.env.EXPORT_SCREENSHOT.replace(/\.png$/, '-ar.png'), f);
     }
     // final review M7: a server refusal of a drawn measurement in Arabic (the raw text is the fallback)

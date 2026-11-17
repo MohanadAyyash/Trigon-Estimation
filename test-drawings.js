@@ -2996,6 +2996,9 @@ server.listen(0, async () => {
       assert.ok(I18N.ar.rp_formula in amt[0] && I18N.ar.rp_qty in amt[0], 'Arabic headings');
       for (const m of all) assert.strictEqual(amt.find(y => y[I18N.ar.rp_id] === m.id)[I18N.ar.rp_formula], TF.formulaText(m, tr('ar')), 'AR formula = the AR list');
       assert.ok(TF.formulaText(all.find(m => m.id === mK.id), tr('ar')).startsWith('طول مفتوح'), 'Arabic words');
+      // the calibration cell in Arabic: plain text, no direction marks (batch 4 Task 6 fix round 2)
+      const axp = tableOf(ar.sheets[2], I18N.ar.rp_drawing).find(x => x[I18N.ar.rp_drawing] === dRow(P1).name && x[I18N.ar.rp_page] === 1);
+      assert.strictEqual(axp[I18N.ar.rp_units_scale], 'الصفحة: 1 نقطة = 0.05 م', 'AR calibration cell: ' + JSON.stringify(axp[I18N.ar.rp_units_scale]));
       // not a draft once approved: no label, no -DRAFT in the name
       db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
       const ap = await get('?lang=en');

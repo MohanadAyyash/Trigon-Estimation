@@ -1300,6 +1300,9 @@
     [/^measurement \d+: (needs a resolution|cannot be resolved by|relink to must be one of|is not blocked|to goes with|to and confirm go with|confirm goes with|a deleted measurement)/, () => t('se_bad_resolution')]];
   const srvMsg = m => { const g = geomMsg(m); if (g !== m) return g; for (const [re, f] of SERVER_MSG) if (re.test(m)) return f(); return m; };
   const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+  // a scale text (tl_scale_*, translated) with its equation "1 <unit> = <scale> <m>" isolated left-to-right (iso), so it reads correctly
+  // inside Arabic text; the i18n strings stay plain (the Excel report uses them too)
+  const isoScale = text => text.replace(/1 \S+ = \S+ \S+/, iso);
   const fmtPct = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');
   // a calibration's verify %, in the warning colour above 1 %
   const verifiedTag = c => fin(c.verify_pct) ? h('span', { class: Math.abs(c.verify_pct) > 1 ? 'pct-warn' : 'pct-ok' }, t('tl_verified', { pct: fmtPct(c.verify_pct) }))
@@ -1395,7 +1398,10 @@
       const c = colourOf.get(e.no);
       if (c) { g.fillStyle = c; g.fillRect(rtl ? W - xs.no - 10 : xs.no, y - 10, 10, 10); }
       g.fillStyle = '#212121';
-      put(String(e.no), xs.no + 14, wNo - 14, y); put(e.label, xs.label, wLabel, y); put(e.qty, xs.qty, wQty, y, 'end'); put(e.unit, xs.unit, wUnit, y); put(e.row, xs.row, wRow, y);
+      put(String(e.no), xs.no + 14, wNo - 14, y); put(e.qty, xs.qty, wQty, y, 'end'); put(e.unit, xs.unit, wUnit, y); put(e.row, xs.row, wRow, y);
+      // nothing of it on the image (e.g. its layer is gone from this drawing): said after the label
+      if (c) put(e.label, xs.label, wLabel, y);
+      else { put(e.label + (e.label ? ' — ' : '') + t('xp_not_drawn'), xs.label, wLabel, y); }
     }
     g.textAlign = 'start'; g.direction = 'inherit';
   }
@@ -1415,11 +1421,11 @@
     const say = (text, cls) => msgEl.replaceChildren(...(text ? [h('p', { class: cls || 'small' }, text)] : []));
 
     function showScale() {
-      if (!raster) { const s = c.dxfScale(); scaleEl.replaceChildren(s ? t('tl_scale_dxf', { u: c.unit, s: fmtScale(s) }) : h('span', { class: 'warn' }, t('tl_units_none'))); return; }
+      if (!raster) { const s = c.dxfScale(); scaleEl.replaceChildren(s ? isoScale(t('tl_scale_dxf', { u: c.unit, s: fmtScale(s) })) : h('span', { class: 'warn' }, t('tl_units_none'))); return; }
       const page = cals.find(x => x.region === null), regs = cals.filter(x => x.region !== null);
       scaleEl.replaceChildren(...(c.calsPrevious && cals.length ? [h('span', { class: 'tag warn-tag', id: 'tl-cals-previous' }, t('tl_cals_previous')), ' '] : []),
-        ...(page ? [t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) }), ' · ', verifiedTag(page), copiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
-        ...regs.flatMap((x, k) => [' — ', t('tl_scale_region', { n: k + 1, u: c.unit, s: fmtScale(x.scale) }), ' · ', verifiedTag(x), copiedTag(x)]));
+        ...(page ? [isoScale(t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) })), ' · ', verifiedTag(page), copiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
+        ...regs.flatMap((x, k) => [' — ', isoScale(t('tl_scale_region', { n: k + 1, u: c.unit, s: fmtScale(x.scale) })), ' · ', verifiedTag(x), copiedTag(x)]));
     }
     // { scale } or { reason }: as the server resolves it (modules/drawings.js createManual)
     const scaleAt = g => {
@@ -1580,7 +1586,7 @@
       onNote: (k, n) => say(k === 'same_point' ? t('tl_same_point') : k === 'drag' ? t('tl_drag_ignored') : t('tl_need_points', { n }), 'warn small'),
       overlay: () => ({
         saved: c.savedOf().map(m => ({ id: m.id, no: m.no, geom: m.geom, color: m.color, text: (m.label ? m.label + ' · ' : '') + (m.metric === 'count' ? fmtQ(m.qty) : fmt2(m.qty)) + ' ' + (m.qty_unit || '') })),
-        cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: t('tl_scale_dxf', { u: c.unit, s: fmtScale(x.scale) }) })) : [],
+        cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: isoScale(t('tl_scale_dxf', { u: c.unit, s: fmtScale(x.scale) })) })) : [],
         region,
       }),
       onChange: () => {
@@ -1638,7 +1644,8 @@
         const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
         if (!blob) throw new Error(t('tv_export_too_big'));   // the browser could not encode a canvas this size
         const name = pngName(T, c.d);
-        window.__tvExport = { width: cv.width, height: cv.height, w: f.w, h: f.h, k, legend, head, name, drawn: drawn.map(x => ({ id: x.id, no: x.no, colour: x.colour })), toPx: p => { const s = f.toScreen(p); return [s[0] * k, s[1] * k]; } };   // test hook
+        window.__tvExport = { width: cv.width, height: cv.height, w: f.w, h: f.h, k, legend, head, name, drawn: drawn.map(x => ({ id: x.id, no: x.no, colour: x.colour, badge: x.badge })),
+          notDrawn: legend.filter(e => !drawn.some(x => x.no === e.no)).map(e => e.no), toPx: p => { const s = f.toScreen(p); return [s[0] * k, s[1] * k]; } };   // test hook
         saveBlob(blob, name);
       } finally { cv.width = 0; cv.height = 0; }
     }

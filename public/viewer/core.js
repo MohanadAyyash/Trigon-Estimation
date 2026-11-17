@@ -315,6 +315,8 @@ function snap(G, R, wx, wy, tol, layerOn) {
 // is its count (rows × cols for an MINSERT). A count takes the top-level markers (kind 2) only; with opts.nested also the
 // nested ones (kind 5), as the server does with nested: true.
 const METRICS = { open_length: 1, closed_perimeter: 1, area: 1, count: 1 };
+// whether an entity of this kind counts for the metric (previewTotal and measurementIndices alike)
+const metricTakes = (kind, metric, nested) => metric === 'count' ? kind === KIND_INSERT || (nested && kind === KIND_NESTED) : metric === 'open_length' ? kind === KIND_OPEN : kind === KIND_CLOSED;
 function previewTotal(R, indices, metric, unitFactor, opts) {
   const nested = !!(opts && opts.nested);
   if (!METRICS[metric]) throw new Error('previewTotal: unknown metric ' + metric);
@@ -322,7 +324,7 @@ function previewTotal(R, indices, metric, unitFactor, opts) {
   let sum = 0, used = 0;
   for (let k = 0; k < indices.length; k++) {
     const i = indices[k], kind = R.kind[i];
-    if (metric === 'count' ? kind !== KIND_INSERT && !(nested && kind === KIND_NESTED) : metric === 'open_length' ? kind !== KIND_OPEN : kind !== KIND_CLOSED) continue;
+    if (!metricTakes(kind, metric, nested)) continue;
     const v = metric === 'area' ? R.area[i] : R.len[i];
     if (v !== v) continue;
     sum += v; used++;
@@ -356,7 +358,6 @@ function previewBlocks(R, indices) {
 function measurementIndices(R, m, handles) {
   if (!METRICS[m.metric]) return new Uint32Array(0);
   const nested = !!m.nested, area = m.metric === 'area';
-  const want = m.metric === 'count' ? k => k === KIND_INSERT || (nested && k === KIND_NESTED) : m.metric === 'open_length' ? k => k === KIND_OPEN : k => k === KIND_CLOSED;
   let take;
   if (m.tool === 'dxf_layer' || m.tool === 'dxf_blocks') {
     const li = R.layers.findIndex(l => l.name === m.layer);
@@ -370,7 +371,7 @@ function measurementIndices(R, m, handles) {
   } else return new Uint32Array(0);
   const out = [];
   for (let i = 0; i < R.n; i++) {
-    if (!want(R.kind[i]) || !take(i)) continue;
+    if (!metricTakes(R.kind[i], m.metric, nested) || !take(i)) continue;
     const v = area ? R.area[i] : R.len[i];
     if (v !== v) continue;
     out.push(i);
