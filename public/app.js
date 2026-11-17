@@ -965,6 +965,13 @@
     [/repeated point/, () => t('tl_e_repeat')], [/has no area|size > 0/, () => t('tl_e_no_area')], [/too small at this scale/, () => t('tl_e_small')]];
   // a shape refusal (the preview's or the server's) in the user's words; any other message as it is
   const geomMsg = m => { for (const [re, f] of GEOM_MSG) if (re.test(m)) return f(); return m; };
+  // the server's calibration and drawn-measurement refusals (modules/drawings.js, tenders.js) in the user's words; a shape
+  // refusal as geomMsg; any other message as it is
+  const SERVER_MSG = [[/overlaps another calibrated region/, () => t('se_overlap')], [/^calibrate this page first$/, () => t('vf_no_cal')],
+    [/ is outside the page /, () => t('se_outside_page')], [/calibration points must lie inside the region/, () => t('cal_inside_region')],
+    [/verify points must lie where this calibration applies/, () => t('vf_one_region')], [/deductions exceed the measured quantity/, () => t('se_deductions')],
+    [/^apply needs expect/, () => t('se_apply_expect')], [/^the measured quantities changed: review the changes again$/, () => t('cal_review_again')]];
+  const srvMsg = m => { const g = geomMsg(m); if (g !== m) return g; for (const [re, f] of SERVER_MSG) if (re.test(m)) return f(); return m; };
   const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
   const fmtPct = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');
   // a calibration's verify %, in the warning colour above 1 %
@@ -1099,8 +1106,12 @@
           catch (e) {
             apply.disabled = false;
             if (g !== gen) msg.replaceChildren(h('p', { class: 'warn' }, t('lk_changed_save_again')));
-            else if (e.status === 409 && e.body && Array.isArray(e.body.changes)) changesTable(e.body.changes, body, true);
-            else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message));
+            else if (e.status === 409 && e.body && Array.isArray(e.body.changes)) {
+              // the fresh list can hold measurements saved meanwhile: read the list again so they show their label and unit
+              try { await c.refreshList(); } catch (e2) { /* shown by id */ }
+              changesTable(e.body.changes, body, true);
+            }
+            else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message)));
           }
         } }, t('cal_apply'));
         msg.replaceChildren(...(again ? [h('p', { id: 'cal-again', class: 'err' }, t('cal_review_again'))] : []), h('p', { class: 'warn' }, t('cal_changes')),
@@ -1130,7 +1141,7 @@
           save.disabled = false;
           if (g !== gen) msg.replaceChildren(h('p', { class: 'warn' }, t('lk_changed_save_again')));
           else if (!isV && e.status === 409 && e.body && Array.isArray(e.body.changes)) changesTable(e.body.changes, body);   // nothing changes before Apply
-          else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message));
+          else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message)));
         }
       } }, isV ? t('vf_save') : t('cal_save'));
       const dist = Math.hypot(p.p2[0] - p.p1[0], p.p2[1] - p.p1[1]);
@@ -1196,7 +1207,7 @@
     const j = e.body || {};
     const selText = isSel && e.status === 409 ? ({ 'already measured on this row': t('tv_r_overlap'), 'layer quantity is incomplete': t('tv_r_incomplete'),
       'possible duplicates on this layer': t('tv_r_duplicates'), 'unit mismatch': t('tv_r_uom'), 'selection contains several blocks': t('tv_r_mixed') })[j.error] : null;
-    msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + (selText || e.message)));
+    msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + (selText || srvMsg(e.message))));
     const mixed = e.status === 409 && j.error === 'selection contains several blocks' && j.blocks && typeof j.blocks === 'object';
     if (mixed) msg.append(h('p', { id: 'lk-blocks', class: 'small muted' }, Object.entries(j.blocks).map(([b, n], k) => [k ? ' · ' : '', h('span', { dir: 'auto' }, b), ' ' + fmtQ(n)])));
     else if (selText) msg.append(h('p', { id: 'lk-counts', class: 'small muted' }, t('tv_server_counts', { dropped: j.dropped || 0, area_null: j.area_null || 0,
@@ -1299,7 +1310,6 @@
         // a refusal of what was sent before a change: no confirm box (it would go out with the new choice)
         if (g !== gen) msg.replaceChildren(h('p', { class: 'warn', id: 'lk-changed' }, t('lk_changed_save_again')));
         else {
-          if (isMan) e.message = geomMsg(e.message);   // a shape the server refuses, in words
           linkRefusal(e, msg, cb.add, isSel, isSel && metric === 'count' && !b.nested && target.hasNested());
         }
         return;
@@ -1351,7 +1361,8 @@
     };
     // which calibration a drawn quantity used (page or region, and its verify %), or the DXF units
     const calLine = m => m.tool !== 'manual' || m.metric === 'count' ? null
-      : m.calibration ? h('div', { class: 'small muted m-cal' }, m.calibration.region ? t('m_cal_region') : t('m_cal_page'), ' · ', verifiedTag(m.calibration))
+      : m.calibration ? h('div', { class: 'small muted m-cal' }, !m.calibration.region ? t('m_cal_page') : fin(m.calibration.region_no) ? t('m_cal_region_n', { n: m.calibration.region_no }) : t('m_cal_region'),
+        ' · ', verifiedTag(m.calibration))
       : m.drawing_kind === 'dxf' ? h('div', { class: 'small muted m-cal' }, t('m_cal_units', { u: m.drawing_units || '—' })) : null;
     const how = m => {
       if (m.tool === 'manual') return manualHow(m);
@@ -1376,7 +1387,8 @@
     function editForm(m, close) {
       const len = m.metric === 'length' || m.metric === 'perimeter', count = m.metric === 'count';
       const numIn = (id, v) => inp(id, v === null || v === undefined ? '' : String(v), { class: 'w-num', inputmode: 'decimal' });
-      const rowSel = sel('ed-row-sel', m.row_id === null ? '' : String(m.row_id), rowOpts(rows)), label = inp('ed-label', m.label || '', { maxlength: 200 });
+      // '' keeps the link as it is; 'none' unlinks (row_id null)
+      const rowSel = sel('ed-row-sel', m.row_id === null ? '' : String(m.row_id), [['', t('ed_row_keep')], ['none', t('ed_row_none')], ...rowOpts(rows).slice(1)]), label = inp('ed-label', m.label || '', { maxlength: 200 });
       const w = len ? numIn('ed-width', m.width) : null, dp = count ? null : numIn('ed-depth', m.depth), fac = numIn('ed-factor', m.factor === 1 ? null : m.factor);
       const deduct = h('input', { type: 'checkbox', id: 'ed-deduct', checked: !!m.deduct });
       const msg = h('div', { id: 'ed-msg' }), cb = confirmBoxes('ed-');
@@ -1396,7 +1408,8 @@
         } catch (e) { msg.replaceChildren(h('p', { class: 'err' }, e.message)); return; }
         const lab = label.value.trim() || null;
         if (lab !== (m.label || null)) b.label = lab;
-        if (rowSel.value && Number(rowSel.value) !== m.row_id) b.row_id = Number(rowSel.value);
+        if (rowSel.value === 'none') { if (m.row_id !== null) b.row_id = null; }
+        else if (rowSel.value && Number(rowSel.value) !== m.row_id) b.row_id = Number(rowSel.value);
         if (deduct.checked !== !!m.deduct) b.deduct = deduct.checked;
         if (!Object.keys(b).length) { msg.replaceChildren(h('p', { class: 'muted' }, t('ed_nothing'))); return; }
         save.disabled = true;
@@ -1420,7 +1433,7 @@
     const del = m => editable ? h('button', { class: 'small danger m-delete', onclick: async ev => {
       if (!confirm(t('m_delete_confirm'))) return;
       ev.target.disabled = true;
-      try { await api('DELETE', 'measurements/' + m.id); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
+      try { await api('DELETE', 'measurements/' + m.id); rerender(); } catch (e) { fail(srvMsg(e.message)); ev.target.disabled = false; }
     } }, t('delete')) : null;
     const relink = m => {
       if (!editable) return null;

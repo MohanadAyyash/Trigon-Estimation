@@ -1052,13 +1052,17 @@ server.listen(0, async () => {
       assert.strictEqual(await rowQty(rowM), beforeM, 'nothing changed before Apply');
       { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 're-calibration 409 logged'); errors.splice(i, 1); }
       // R18: someone measures on the page between the review and Apply: Apply refuses, the fresh list is shown, nothing changed
-      const late = await ok(call('POST', `drawings/${pdfId}/measurements`, { tool: 'manual', row_id: rowM, geom: { tool: 'line', pts: [[100, 550], [200, 550]] } }, admin), 'measured meanwhile');
+      const late = await ok(call('POST', `drawings/${pdfId}/measurements`, { tool: 'manual', row_id: rowM, label: 'Fake late kerb', geom: { tool: 'line', pts: [[100, 550], [200, 550]] } }, admin), 'measured meanwhile');
       const withLate = await rowQty(rowM);
       await page.click('#cal-apply');
       await page.waitForSelector(DM + ' #cal-again');
       assert.ok((await page.textContent('#cal-again')).includes('Review the changes again'), 'review again');
       assert.strictEqual(await page.$$eval('#cal-changes tbody tr', x => x.length), 3, 'the fresh list has the new measurement');
       assert.ok((await page.textContent('#cal-changes')).includes(f2(late.qty * 2)), 'with its before/after');
+      // final review M2: the list was read again first, so the new measurement shows its label and unit (not "#id")
+      { const cells = (await page.$$eval('#cal-changes tbody tr', rs => rs.map(r => [...r.cells].map(c => c.textContent.trim())))).find(x => x[0] === 'Fake late kerb');
+        assert.ok(cells, 'the new measurement by its label: ' + await page.textContent('#cal-changes'));
+        assert.strictEqual(cells[4], 'm', 'and its unit'); assert.ok(!(await page.textContent('#cal-changes')).includes('#' + late.id), 'no "#id"'); }
       assert.strictEqual(await rowQty(rowM), withLate, 'nothing changed');
       { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'stale apply 409 logged'); errors.splice(i, 1); }
       await page.click('#cal-apply');
@@ -1070,6 +1074,25 @@ server.listen(0, async () => {
       // the scale label drawn on the page is in the user's language (the same words as the scale line)
       assert.ok((await page.evaluate(() => window.__tvTools.overlayCals())).some(x => x === '1 pt = 0.1 m'), 'overlay scale label');
       assert.ok((await page.textContent(`${DM} #dw-measurements tr[data-row="${rowA}"] td.m-formula`)).includes('(0.1 m/pt)²'), 'list follows the new scale');
+      // final review M3: a measurement on the region says which region (numbered as the scale line); M4: the edit form
+      // unlinks it ("no row", distinct from "no change")
+      {
+        const rm = await ok(call('POST', `drawings/${pdfId}/measurements`, { tool: 'manual', row_id: rowM, label: 'Fake region kerb', geom: { tool: 'line', pts: [[420, 420], [520, 420]] } }, admin), 'in the region');
+        await page.reload();
+        const RM = `${DM} #dw-measurements tr[data-measurement="${rm.id}"]`;
+        await page.waitForSelector(RM + ' .m-cal');
+        assert.ok((await page.textContent(RM + ' .m-cal')).includes('Region 1 calibration'), 'which region: ' + await page.textContent(RM + ' .m-cal'));
+        await page.click(RM + ' .m-edit');
+        await page.waitForSelector(DM + ' #ed-form');
+        const opts = await page.$$eval('#ed-row-sel option', os => os.map(o => [o.value, o.textContent]));
+        assert.deepStrictEqual(opts.slice(0, 2), [['', '— no change —'], ['none', '— no row (unlink) —']], 'no change and no row: ' + JSON.stringify(opts.slice(0, 3)));
+        assert.strictEqual(await page.inputValue('#ed-row-sel'), String(rowM), 'the current row selected');
+        await page.selectOption('#ed-row-sel', 'none'); await page.click('#ed-save');
+        await page.waitForFunction(id => !document.querySelector('#ed-form') && document.querySelector(`#dw-measurements tr[data-measurement="${id}"]:not([data-row])`), rm.id);
+        assert.strictEqual(db.prepare('SELECT row_id FROM measurements WHERE id=?').get(rm.id).row_id, null, 'unlinked');
+        assert.ok(Math.abs(await rowQty(rowM) - beforeM * 2) < 1e-9, 'the row without it');
+        await ok(call('DELETE', 'measurements/' + rm.id, null, admin), 'tidy');
+      }
       // rotated page 2 (/Rotate 90): a polyline clicked with the mouse; Shift locks it horizontal as displayed, which is
       // exactly vertical on the page; the saved length is the page length × the scale
       {
@@ -1275,6 +1298,27 @@ server.listen(0, async () => {
     assert.strictEqual((await arName.textContent()).trim(), 'أسفلت', 'Arabic layer name in the viewer panel unchanged');
     assert.strictEqual(await arName.getAttribute('dir'), 'auto', 'layer name isolated (dir=auto)');
     assert.ok((await page.textContent('#tv-preview')).includes('معاينة'), 'Arabic preview label');
+    // final review M7: a server refusal of a drawn measurement in Arabic (the raw text is the fallback)
+    {
+      const { makePdf } = require('./test/fixtures/make-takeoff.js');
+      const at = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Arabic refusal' }, admin), 'ar tender')).id;
+      const ar = (await ok(call('POST', `tenders/${at}/rows`, { no: '1', description: 'Test kerb', unit: 'm' }, admin), 'ar row')).id;
+      const u = await fetch(`${base}tenders/${at}/drawings?name=sheet`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: makePdf() });
+      const pid = (await u.json()).id;
+      await ok(call('POST', `drawings/${pid}/pages`, { pages: [{ page: 1, width: 595, height: 842, rotation: 0 }] }, admin), 'ar pages');
+      await ok(call('POST', `drawings/${pid}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, admin), 'ar calibrate');
+      await ok(call('POST', `drawings/${pid}/measurements`, { tool: 'manual', row_id: ar, geom: { tool: 'line', pts: [[0, 100], [100, 100]] } }, admin), 'ar 5 m');
+      const ded = await ok(call('POST', `drawings/${pid}/measurements`, { tool: 'manual', row_id: ar, deduct: true, geom: { tool: 'line', pts: [[0, 200], [20, 200]] } }, admin), 'ar −1 m');
+      const DA = `#drawings[data-tender="${at}"]`;
+      await page.goto(`${origin}/#/tender/${at}/drawings/${pid}`);
+      await page.waitForSelector(`${DA} #dw-measurements tr[data-measurement="${ded.id}"] .m-edit`);
+      await page.click(`${DA} #dw-measurements tr[data-measurement="${ded.id}"] .m-edit`);
+      await page.fill('#ed-factor', '6'); await page.click('#ed-save');
+      await page.waitForSelector('#ed-msg .err');
+      const em = await page.textContent('#ed-msg .err');
+      assert.ok(em.includes(I18N.ar.se_deductions) && !/deductions exceed/.test(em), 'Arabic refusal: ' + em);
+      { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('400')); assert.ok(i >= 0, 'refusal logged'); errors.splice(i, 1); }
+    }
 
     assert.deepStrictEqual(errors, [], 'no console errors');
     await browser.close();

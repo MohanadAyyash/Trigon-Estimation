@@ -1280,6 +1280,9 @@ server.listen(0, async () => {
       assert.strictEqual(f.s, 200); assert.ok(f.b.equals(PDF), 'bytes equal');
       assert.strictEqual(f.h.get('content-type'), 'application/pdf'); assert.strictEqual(f.h.get('cache-control'), 'private, no-cache');
       assert.strictEqual(f.h.get('x-content-type-options'), 'nosniff');
+      // final review M5: never shown as a page of this site (a download, sandboxed); pdf.js and the image viewer fetch it
+      assert.strictEqual(f.h.get('content-disposition'), `attachment; filename="drawing.pdf"; filename*=UTF-8''Plans.pdf`);
+      assert.strictEqual(f.h.get('content-security-policy'), 'sandbox');
       const etag = f.h.get('etag'); assert.ok(etag && etag.includes(psha));
       assert.strictEqual((await getFile(up.j.id, viewer, { 'If-None-Match': etag })).s, 304);
       assert.strictEqual((await getFile(up.j.id, '')).s, 401);
@@ -1330,6 +1333,15 @@ server.listen(0, async () => {
         assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE parent_id=?').get(one.j.id).n, 0);
       }
 
+      {
+        const odd = await upload(T, `Fake "plan" (A)'s* مخطط.pdf`, PDF, qs);
+        assert.strictEqual(odd.s, 202);
+        const o = await getFile(odd.j.id, viewer);
+        assert.strictEqual(o.s, 200);
+        assert.strictEqual(o.h.get('content-disposition'), `attachment; filename="drawing.pdf"; filename*=UTF-8''Fake%20%22plan%22%20%28A%29%27s%2A%20%D9%85%D8%AE%D8%B7%D8%B7.pdf`);
+        db.prepare('DELETE FROM drawings WHERE id=?').run(odd.j.id);
+      }
+
       // images: PNG and JPEG by magic → one ready row with the pixel size; stored as <sha>.png / <sha>.jpg
       const PNG = makePng(64, 48), JPG = jpegHeader(1200, 900);
       for (const [buf, ext, type, w, h] of [[PNG, 'png', 'image/png', 64, 48], [JPG, 'jpg', 'image/jpeg', 1200, 900]]) {
@@ -1340,6 +1352,8 @@ server.listen(0, async () => {
         assert.ok(fs.existsSync(path.join(DDIR, sha256(buf) + '.' + ext)));
         const g = await getFile(u.j.id, viewer);
         assert.strictEqual(g.s, 200); assert.ok(g.b.equals(buf)); assert.strictEqual(g.h.get('content-type'), type);
+        assert.strictEqual(g.h.get('content-disposition'), `attachment; filename="drawing.${ext}"; filename*=UTF-8''Photo%20${ext}.${ext}`);
+        assert.strictEqual(g.h.get('content-security-policy'), 'sandbox');
         assert.strictEqual((await call('POST', `drawings/${u.j.id}/pages`, { pages: [pages[0]] }, qs)).s, 400, 'pages apply to a PDF');
         assert.strictEqual((await call('GET', `drawings/${u.j.id}/layers`, null, qs)).s, 400, 'no layers for an image');
       }
@@ -1524,6 +1538,18 @@ server.listen(0, async () => {
         const x = await call('POST', vpath(pageId), b, qs);
         assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, re);
         assert.strictEqual(calRows(P1).find(c => c.id === pageId).verify_pct, pctBefore, 'verify_pct unchanged');
+      }
+      // final review M1: both verify points must resolve to the calibration verified (the page outside every region, a
+      // region inside it); nothing stored on a refusal
+      {
+        const pctOf = id => calRows(P1).find(c => c.id === id).verify_pct, before = [pctOf(pageId), pctOf(regA.id)];
+        for (const [cid, b] of [[pageId, { p1: [150, 150], p2: [250, 150] }], [pageId, { p1: [0, 0], p2: [150, 150] }], [regA.id, { p1: [150, 150], p2: [150, 50] }], [regA.id, { p1: [0, 0], p2: [0, 50] }]]) {
+          const x = await call('POST', vpath(cid), { ...b, real: 1, unit: 'm' }, qs);
+          assert.strictEqual(x.s, 400, cid + ' ' + JSON.stringify(b) + ' ' + JSON.stringify(x.j)); assert.match(x.j.error, /where this calibration applies/);
+        }
+        assert.deepStrictEqual([pctOf(pageId), pctOf(regA.id)], before, 'verify_pct unchanged');
+        const y = await call('POST', vpath(regA.id), { p1: [150, 150], p2: [250, 150], real: 2, unit: 'm' }, qs);
+        assert.strictEqual(y.s, 200, JSON.stringify(y.j)); assert.ok(Math.abs(y.j.pct) < 1e-9, 'a region verified inside it: ' + y.j.pct);
       }
       const p2cal = calRows(P2)[0].id;
       assert.strictEqual((await call('POST', vpath(p2cal), { p1: [0, 0], p2: [200, 0], real: 10, unit: 'm' }, qs)).s, 404, 'a calibration of another drawing');
@@ -1718,7 +1744,7 @@ server.listen(0, async () => {
       // the list shows the geometry and which calibration was used
       const listed = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === mPoly.id);
       assert.deepStrictEqual(listed.geom, poly);
-      assert.deepStrictEqual(listed.calibration, { id: pageCal.id, region: false, scale: 0.05, verify_pct: null });
+      assert.deepStrictEqual(listed.calibration, { id: pageCal.id, region: false, region_no: null, scale: 0.05, verify_pct: null });
       // Task 6: the list carries the scale the quantity used and the drawing's kind/units (the formula "350 pt × 0.05 m/pt");
       // a drawing exposes the server's unit table, so the browser never keeps its own copy
       assert.deepStrictEqual([listed.scale, listed.drawing_kind, listed.drawing_units], [0.05, 'pdf', null]);
@@ -1813,6 +1839,10 @@ server.listen(0, async () => {
       const reg = (await ok(call('POST', `drawings/${P1}/calibrations`, { ...regBody, apply: true, expect: expectOf(r.j.changes) }, qs), 'region apply')).calibration;
       assert.strictEqual(mRow(mArea.id).calibration_id, reg.id); near(mRow(mArea.id).qty, 6, 'area at 0.025'); near(qtyOf(rM2), 6, 'm2 row');
       assert.strictEqual(mRow(mPoly.id).calibration_id, pageCal.id, 'the polyline stays on the page calibration');
+      // final review M3: the list says which region (numbered as the scale line: the drawing's regions by id, from 1)
+      { const ls = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements;
+        assert.deepStrictEqual(ls.find(x => x.id === mArea.id).calibration, { id: reg.id, region: true, region_no: 1, scale: 0.025, verify_pct: null });
+        assert.strictEqual(ls.find(x => x.id === mPoly.id).calibration.region_no, null); }
       // a new measurement starting in the region uses it
       const mRect = await ok(measure(P1, { row_id: rM2, geom: { tool: 'rect', p1: [160, 160], p2: [200, 180] } }), 'rect in region');
       assert.strictEqual(mRect.calibration_id, reg.id); near(mRect.qty, 0.5, 'rect 40×20 × 0.025²'); near(qtyOf(rM2), 6.5, 'm2 row');
@@ -1920,6 +1950,75 @@ server.listen(0, async () => {
       assert.strictEqual(mf.status, 200); assert.match(mf.headers.get('content-type'), /^text\/javascript/);
       assert.ok(Buffer.from(await mf.arrayBuffer()).equals(fs.readFileSync(path.join(__dirname, 'lib', 'takeoff', 'manual.js'))));
       for (const p of ['lib/takeoff/calib.js', 'lib/units.js', 'server.js', 'lib/takeoff/']) assert.strictEqual((await fetch(`http://localhost:${server.address().port}/${p}`)).status, 404, p);
+    }
+
+    // ---- final review I1: an imported row's measured total never goes below 0 (its client qty is never changed);
+    // M4: a drawn measurement can be unlinked (PUT row_id: null) -----------------------------------------------------
+    {
+      const { makePdf, PDF_PAGES } = require('./test/fixtures/make-takeoff.js');
+      const { writeXlsx } = require('./lib/xlsx.js');
+      const near = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) < 1e-9, `${msg}: expected ≈${b}, got ${a}`);
+      const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
+      const T = (await ok(call('POST', 'tenders', { title: 'Test Imported Deductions', kind: 'rta' }, qs), 'tender')).id;
+      const BOQ = { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Fake imported kerb', 'm', 50]] }]).toString('base64'),
+        sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } };
+      await ok(call('POST', `tenders/${T}/import`, BOQ, qs), 'import');
+      const rowsOf = async () => ok(call('GET', `tenders/${T}/rows`, null, viewer), 'rows');
+      const rI = (await rowsOf()).find(r => r.description === 'Fake imported kerb').id;
+      const rT = (await ok(call('POST', `tenders/${T}/rows`, { description: 'Fake take-off kerb', unit: 'm' }, qs), 'take-off row')).id;
+      const pdfUp = await upload(T, 'Fake deduction sheet', makePdf(), qs);
+      const [P1] = (await ok(call('POST', `drawings/${pdfUp.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages')).drawings.map(x => x.id);
+      await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'calibrate');   // 0.05 m/unit
+      const measure = b => call('POST', `drawings/${P1}/measurements`, { tool: 'manual', ...b }, qs);
+      const put = (id, b) => call('PUT', `measurements/${id}`, b, qs);
+      const line = (y, len) => ({ tool: 'line', pts: [[0, y], [len, y]] });
+      const qtyOf = id => db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(id).qty;
+      const mRow = id => db.prepare('SELECT * FROM measurements WHERE id=?').get(id);
+      const snap = () => JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(T), db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(P1),
+        db.prepare('SELECT id, qty FROM tender_rows WHERE tender_id=? ORDER BY id').all(T)]);
+      const measuredOf = async id => (await rowsOf()).find(r => r.id === id).measured_qty;
+      const refused = (r, msg) => { assert.strictEqual(r.s, 400, msg + ': ' + JSON.stringify(r.j)); assert.match(r.j.error, /deductions exceed the measured quantity/, msg); };
+
+      // a deduction alone on an imported row → 400, nothing saved
+      let s0 = snap();
+      refused(await measure({ row_id: rI, geom: line(100, 20), deduct: true }), 'deduction only');
+      assert.strictEqual(snap(), s0, 'nothing saved');
+      // 5 m − 1 m: saved, measured 4, the client qty stays 50
+      const mPos = await ok(measure({ row_id: rI, geom: line(100, 100) }), 'positive');
+      const mDed = await ok(measure({ row_id: rI, geom: line(200, 20), deduct: true }), 'deduction');
+      assert.strictEqual(mDed.row_qty, null, 'an imported row qty is not recomputed');
+      near(await measuredOf(rI), 4, 'measured'); assert.strictEqual(qtyOf(rI), 50, 'client qty unchanged');
+      // deleting the positive measurement would leave only the deduction → 400, nothing deleted
+      s0 = snap();
+      refused(await call('DELETE', `measurements/${mPos.id}`, null, qs), 'delete leaving a deduction');
+      // unlinking it (M4) likewise; a deduction made bigger than the rest likewise
+      refused(await put(mPos.id, { row_id: null }), 'unlink leaving a deduction');
+      refused(await put(mDed.id, { factor: 6 }), 'deduction × 6');
+      assert.strictEqual(snap(), s0, 'nothing changed');
+      // PUT moving a deduction from a take-off row onto the imported row (4 − 6 < 0) → 400, it stays where it was
+      const tPos = await ok(measure({ row_id: rT, geom: line(300, 200) }), 'take-off positive');
+      const tDed = await ok(measure({ row_id: rT, geom: line(400, 120), deduct: true }), 'take-off deduction');
+      near(qtyOf(rT), 4, 'take-off row 10 − 6');
+      s0 = snap();
+      refused(await put(tDed.id, { row_id: rI }), 'relink a deduction onto the imported row');
+      assert.strictEqual(snap(), s0, 'nothing moved'); assert.strictEqual(mRow(tDed.id).row_id, rT);
+      // a region that rescales the positive one below the deduction: the apply is refused, nothing stored
+      const reg = { region: [0, 90, 120, 110], p1: [0, 95], p2: [100, 95], real: 0.5, unit: 'm' };   // 0.005 m/unit: 5 m → 0.5 m
+      let r = await call('POST', `drawings/${P1}/calibrations`, reg, qs);
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), [mPos.id]);
+      refused(await call('POST', `drawings/${P1}/calibrations`, { ...reg, apply: true, expect: r.j.changes.map(c => ({ measurement_id: c.measurement_id, new_qty: c.new_qty })) }, qs), 'region apply');
+      assert.strictEqual(snap(), s0, 'no region, nothing rescaled');
+      // the take-off rule is unchanged: below 0 refused, 0 and above fine
+      assert.match((await put(tPos.id, { row_id: null })).j.error, /take-off total would be -6/);
+      // M4: a drawn measurement unlinked → row_id NULL, the row recomputed, listed as unlinked, audited; linked again
+      const u = await ok(put(tDed.id, { row_id: null }), 'unlink');
+      assert.strictEqual(mRow(tDed.id).row_id, null); assert.strictEqual(u.row_qty, null); near(u.old_row_qty, 10, 'old row'); near(qtyOf(rT), 10, 'take-off row without the deduction');
+      const lst = await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list');
+      assert.ok(lst.unlinked.some(x => x.id === tDed.id) && !lst.measurements.some(x => x.id === tDed.id), 'listed as unlinked');
+      const a = JSON.parse(db.prepare("SELECT detail FROM audit_log WHERE action='measure_edit' ORDER BY id DESC LIMIT 1").get().detail);
+      assert.strictEqual(a.row_id, null); assert.strictEqual(a.from_row_id, rT);
+      await ok(put(tDed.id, { row_id: rT }), 'link again'); near(qtyOf(rT), 4, 'linked again');
+      assert.match((await put(tPos.id, { row_id: 'x' })).j.error, /row_id/, 'row_id: a row id or null');
     }
 
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------

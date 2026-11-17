@@ -102,9 +102,18 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
   // normalised unit, or the row's unit is not recognised and it was confirmed (uom_confirmed) — all in one unit.
   // Any other one stops the write: never silently left out, never m added into m2.
   const rowMeasurements = rowId => ctx.drawings ? ctx.drawings.rowMeasurements(rowId) : [];
+  // An imported row's qty is the client's: never changed (null returned). Its measured total must not go below 0 either
+  // (in any unit): deductions that exceed what is measured are refused like on a take-off row. Callers run this inside
+  // their transaction, so a refusal rolls the write back.
   function recomputeTakeoffQty(rowId) {
     const row = db.prepare('SELECT * FROM tender_rows WHERE id=?').get(rowId);
-    if (!row || row.source !== 'takeoff' || row.is_heading) return null;   // an imported row's qty is the client's: never changed
+    if (!row || row.is_heading) return null;
+    if (row.source !== 'takeoff') {
+      const m = ctx.drawings ? ctx.drawings.rowMeasuredQty(row.id) : null;
+      const neg = m ? m.units.find(u => u.qty < 0) : null;
+      if (neg) bad(`measured total would be ${neg.qty} ${neg.unit}: deductions exceed the measured quantity`);
+      return null;
+    }
     const u = normUom(row.unit);
     let qty = takeoffQty(db.prepare('SELECT * FROM takeoff_lines WHERE row_id=?').all(row.id));
     const ms = rowMeasurements(row.id);

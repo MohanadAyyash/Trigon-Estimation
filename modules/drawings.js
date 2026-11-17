@@ -572,6 +572,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       onPage(d, [['p1', b.p1], ['p2', b.p2]]);
       tx(() => {
         mustDraft(tenderRow(t.id));
+        // the line checks this calibration only where it applies: both points resolve to it (the page outside every
+        // region, a region inside it), as a measurement's first point would
+        const cals = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(d.id), at = p => calib.calibrationFor(cals, p);
+        if (![at(b.p1), at(b.p2)].every(x => x && x.id === c.id)) bad('both verify points must lie where this calibration applies (inside its region, or for the page outside every region)');
         if (!db.prepare('UPDATE calibrations SET verify_pct=? WHERE id=? AND scale=?').run(pct, c.id, c.scale).changes) bad('the calibration changed: verify again', 409);
         audit(me, 'calibration_verify', 'calibrations', c.id, { drawing_id: d.id, calibration_id: c.id, pct, warning });
       });
@@ -649,15 +653,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     return reply(res, 200, out);
   }
 
+  // the file's download name: the drawing name with its extension, percent-encoded (RFC 5987/8187: ' ( ) * too), so no
+  // name can break the header
+  const dispositionName = (name, ext) => {
+    const n = String(name || 'drawing'), has = new RegExp('\\.' + (ext === 'jpg' ? 'jpe?g' : ext) + '$', 'i').test(n);
+    return encodeURIComponent(has ? n : n + '.' + ext).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  };
   // GET /drawings/:id/file: the uploaded bytes as they are (a page row: the shared file). Any reader. no-cache + ETag (the
-  // content never changes for a sha256, the browser asks every time and gets 304).
+  // content never changes for a sha256, the browser asks every time and gets 304). Never shown as a page of this site: a
+  // download (attachment) in a sandbox (CSP); the viewer reads it with fetch (pdf.js, createImageBitmap).
   async function serveFile(req, res, d, me) {
     need(me, 'admin', 'qs', 'viewer');
     const ext = extOf(d), etag = `"${d.sha256}"`;
     let fh;
     try { fh = await fsp.open(storedFile(d.sha256, ext), 'r'); } catch (e) { bad('the stored drawing file is missing: upload the drawing again', 409); }
     const tags = String(req.headers['if-none-match'] || '').split(',').map(x => x.trim().replace(/^W\//, ''));
-    const head = { ETag: etag, 'Cache-Control': 'private, no-cache', 'X-Content-Type-Options': 'nosniff' };
+    const head = { ETag: etag, 'Cache-Control': 'private, no-cache', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': 'sandbox',
+      'Content-Disposition': `attachment; filename="drawing.${ext}"; filename*=UTF-8''${dispositionName(d.name, ext)}` };
     if (tags.includes(etag) || tags.includes('*')) { await fh.close().catch(() => {}); res.writeHead(304, head); res.end(); return true; }
     let size;
     try { size = (await fh.stat()).size; } catch (e) { await fh.close().catch(() => {}); throw e; }
@@ -906,7 +918,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     });
     return reply(res, 200, out);
   }
-  // PUT /measurements/:id on a manual measurement: row_id, width, depth, factor, deduct, label (the geometry never
+  // PUT /measurements/:id on a manual measurement: row_id (null unlinks it), width, depth, factor, deduct, label (the geometry never
   // changes: delete and redraw). qty is recomputed with the calibration (or units) it was saved with; the unit and
   // overlap gates run when the row or the unit changes; both rows are recomputed in the tx.
   async function editManual(req, res, m, t, me) {
@@ -914,7 +926,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     for (const k of Object.keys(b)) if (![...MANUAL_EDIT, 'confirm_uom', 'confirm_overlap'].includes(k)) bad('unknown field: ' + k);
     if (!MANUAL_EDIT.some(k => b[k] !== undefined)) bad('nothing to change: send row_id, width, depth, factor, deduct or label');
     const set = {};
-    if (b.row_id !== undefined) set.row_id = rowIdOf(b.row_id);
+    if (b.row_id !== undefined) set.row_id = b.row_id === null ? null : rowIdOf(b.row_id);   // null: unlinked (kept, as after a re-import)
     if (b.width !== undefined) set.width = dim(b, 'width');
     if (b.depth !== undefined) set.depth = dim(b, 'depth');
     if (b.factor !== undefined) { const f = dim(b, 'factor'); set.factor = f === null ? 1 : f; }
@@ -1207,14 +1219,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
 
   function tenderMeasurements(t) {
     const all = db.prepare(`SELECT m.*, d.name AS drawing_name, d.kind AS drawing_kind, d.units AS drawing_units, r.no AS row_no, r.description AS row_description, r.unit AS row_unit,
-      c.region AS cal_region, c.scale AS cal_scale, c.verify_pct AS cal_verify_pct
+      c.region AS cal_region, c.scale AS cal_scale, c.verify_pct AS cal_verify_pct,
+      (SELECT COUNT(*) FROM calibrations c2 WHERE c2.drawing_id=c.drawing_id AND c2.region IS NOT NULL AND c2.id<=c.id) AS cal_region_no
       FROM measurements m JOIN drawings d ON d.id=m.drawing_id LEFT JOIN tender_rows r ON r.id=m.row_id LEFT JOIN calibrations c ON c.id=m.calibration_id WHERE m.tender_id=? ORDER BY m.id`).all(t.id);
     for (const x of all) {
       x.selection_summary = parseSummary(x.selection_summary);   // handles_count and this; never the handle list
       x.geom = parseGeom(x.geom);   // a manual measurement's shape, for the viewer
-      // which calibration a PDF/image quantity used (page or region) and its verify %
-      x.calibration = x.calibration_id === null || x.cal_scale === null ? null : { id: x.calibration_id, region: x.cal_region !== null, scale: x.cal_scale, verify_pct: x.cal_verify_pct };
-      delete x.cal_region; delete x.cal_scale; delete x.cal_verify_pct;
+      // which calibration a PDF/image quantity used (page or region n: the drawing's regions by id from 1, as the
+      // browser's scale line numbers them) and its verify %
+      x.calibration = x.calibration_id === null || x.cal_scale === null ? null
+        : { id: x.calibration_id, region: x.cal_region !== null, region_no: x.cal_region !== null ? x.cal_region_no : null, scale: x.cal_scale, verify_pct: x.cal_verify_pct };
+      delete x.cal_region; delete x.cal_scale; delete x.cal_verify_pct; delete x.cal_region_no;
       // a manual quantity's scale (metres per drawing/page unit), as the server used it: its calibration, or the DXF units
       x.scale = x.tool !== 'manual' || x.metric === 'count' ? null : x.calibration ? x.calibration.scale
         : x.drawing_kind === 'dxf' && hasUnit(x.drawing_units) ? UNIT_TO_M[x.drawing_units] : null;
