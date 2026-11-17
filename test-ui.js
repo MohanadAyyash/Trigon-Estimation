@@ -794,6 +794,26 @@ server.listen(0, async () => {
       assert.strictEqual((await page.textContent(rvRow(mA.id) + ' td.rv-diff')).trim(), '+' + f2(44));
       assert.ok(await page.$(rvRow(mA.id) + ' .rv-no-checks'), 'no checks fire');
       assert.strictEqual(await rq(rowP), 100, 'nothing changed by the probe');
+      // R18b: the row totals the server gave with the preview (never summed here)
+      const totAfter = rid => page.$eval(`${DR} #rv-totals tr[data-row="${rid}"]`, r => r.cells[3].textContent.trim());
+      assert.deepStrictEqual([await totAfter(rowP), await totAfter(rowE)], [f2(144), f2(4)], 'After totals from the preview');
+      // another resolution drops the preview (and its totals); the next Accept revision is a probe again
+      await page.selectOption(`#rv-res-${mA.id}`, 'delete');
+      assert.strictEqual(await page.$(DR + ' #rv-preview'), null);
+      assert.strictEqual((await page.textContent(rvRow(mA.id) + ' td.rv-after')).trim(), 'deleted');
+      assert.strictEqual(await totAfter(rowP), '—', 'no totals before the next preview');
+      await page.selectOption(`#rv-res-${mA.id}`, 'relink'); await page.selectOption(`#rv-to-${mA.id}`, '0');
+      assert.strictEqual((await page.textContent(rvRow(mA.id) + ' td.rv-after')).trim(), '—', 'the earlier preview is gone');
+      {
+        let sentBody = null;
+        const spy = q => { if (q.url().endsWith(`/api/drawings/${v2}/accept`)) sentBody = JSON.parse(q.postData()); };
+        page.on('request', spy);
+        await page.click('#rv-accept');
+        await page.waitForSelector(DR + ' #rv-preview');
+        page.off('request', spy);
+        took('409 (Conflict)', 'second probe 409 logged');
+        assert.deepStrictEqual(sentBody.expect.find(x => x.measurement_id === mA.id), { measurement_id: mA.id, new_qty: null, resolution: 'relink', to: 'PAVING' }, 'a probe again');
+      }
       // the comparison views (deviceScaleFactor 2): the new version over the old one in grey
       if (process.env.REVISION_SCREENSHOT) {
         const ctx2 = await browser.newContext({ viewport: { width: 1360, height: 1000 }, deviceScaleFactor: 2 });
@@ -882,7 +902,8 @@ server.listen(0, async () => {
 
       // ---- PDF: v2 shown over v1 with an opacity slider (the pixel blend follows it); accept copies the calibration (R15) ----
       const { buildPdf, makePdf, PDF_PAGES } = require('./test/fixtures/make-takeoff.js');
-      const RED = { x: 300, y: 500, w: 200, h: 150, rgb: [0.8, 0.2, 0.2] };
+      // v2's page has another /Rotate (90) and page-box origin (−100, −50): the previous page must line up in user space (R17)
+      const RED = { x: 400, y: 300, w: 150, h: 100, rgb: [0.8, 0.2, 0.2] };
       const pt2 = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision PDF' }, admin), 'pdf revision tender')).id;
       const rowK = (await ok(call('POST', `tenders/${pt2}/rows`, { no: '1', description: 'Fake kerb', unit: 'm' }, admin), 'row')).id;
       const pu = await fetch(`${base}tenders/${pt2}/drawings?name=sheet`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: makePdf() });
@@ -892,7 +913,7 @@ server.listen(0, async () => {
       const DQ = `#drawings[data-tender="${pt2}"]`;
       await page.goto(`${origin}/#/tender/${pt2}/drawings/${P1}`);
       await page.waitForSelector(DQ + ' #rv-upload');
-      await page.setInputFiles('#rv-file', { name: 'sheet-b.pdf', mimeType: 'application/pdf', buffer: buildPdf([{ box: [0, 0, 595, 842], rotate: 0, rect: RED }]) });
+      await page.setInputFiles('#rv-file', { name: 'sheet-b.pdf', mimeType: 'application/pdf', buffer: buildPdf([{ box: [-100, -50, 742, 545], rotate: 90, rect: RED }]) });
       await page.click('#rv-upload');
       // the browser reads the new pages, then the table: the drawn line is to be checked on the new page
       await page.waitForSelector(DQ + ' #rv-table');
@@ -911,12 +932,17 @@ server.listen(0, async () => {
       const nearQ = (got, want, msg) => assert.ok(want.every((v, k) => Math.abs(got[k] - v) <= 4), msg + ': ' + JSON.stringify(got) + ' ≈ ' + JSON.stringify(want));
       const red = [...RED.rgb.map(v => Math.round(v * 255)), 255], blue = [51, 102, 204, 255], white = [255, 255, 255, 255];
       const mid = (a, b) => a.map((v, k) => Math.round((v + b[k]) / 2));
+      // pixels at user-space points of the new viewer (toScreen): the old blue rectangle sits at its own user point
       await mixTo(0);
-      nearQ(await pixelQ(400, 575), red, 'slider 0: the new page only (its red rectangle)'); nearQ(await pixelQ(200, 175), white, 'slider 0: no old rectangle');
+      nearQ(await pixelQ(475, 350), red, 'slider 0: the new page only (its red rectangle)'); nearQ(await pixelQ(200, 175), white, 'slider 0: no old rectangle');
       await mixTo(100);
-      nearQ(await pixelQ(400, 575), white, 'slider 100: the previous page only'); nearQ(await pixelQ(200, 175), blue, 'slider 100: the old blue rectangle');
+      nearQ(await pixelQ(475, 350), white, 'slider 100: the previous page only');
+      for (const [x, y] of [[200, 175], [110, 110], [290, 240]]) nearQ(await pixelQ(x, y), blue, `slider 100: the old blue rectangle at its user point ${x}, ${y}`);
       await mixTo(50);
-      nearQ(await pixelQ(400, 575), mid(red, white), 'slider 50: half and half'); nearQ(await pixelQ(200, 175), mid(white, blue), 'slider 50: half and half (old)');
+      nearQ(await pixelQ(475, 350), mid(red, white), 'slider 50: half and half'); nearQ(await pixelQ(200, 175), mid(white, blue), 'slider 50: half and half (old)');
+      assert.strictEqual(await page.$(DQ + ' #tv-under-note'), null, 'PDF over PDF: aligned, no note');
+      assert.strictEqual((await page.textContent(DQ + ' #tv-rev')).trim(), 'Rev 2', 'the viewer says which version it shows');
+      assert.ok(await page.$(DQ + ' #tl-cals-previous'), 'the scale line says it is the previous version\'s');
       assert.strictEqual((await page.textContent('#tv-under-pct')).trim(), '50 %');
       await page.click('#tv-close');
       // nothing blocked: Accept revision at once; the line moves to the new page with a copy of its calibration
@@ -933,6 +959,87 @@ server.listen(0, async () => {
       const mkRow = `${DQ} #dw-measurements tr[data-measurement="${mK.id}"]`;
       assert.ok(await page.$(mkRow + ' .m-review'), 'check badge'); assert.ok(await page.$(mkRow + ' .tl-copied'), 'R15 in the list');
       await page.click('#tv-close');
+
+      // ---- the checks of a resolution (R7/R14): gate counts, a block relink (R12 shape), a check to tick, confirm_checks;
+      // a viewer sees the panel read only ----
+      {
+        const ins = (hd, name, x) => [[0, 'INSERT'], [5, hd], [8, 'MH'], [2, name], [10, x], [20, 100]];
+        const sqAt = (x0, n) => [[x0, 0], [x0 + n, 0], [x0 + n, n], [x0, n]];
+        const gv = v2 => dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
+          ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 4], ...layerRec('ASPHALT'), ...layerRec('PAVING'), ...layerRec('TWIN'), ...layerRec('MH'), [0, 'ENDTAB']]),
+          ...dsec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK'], [0, 'BLOCK'], [2, 'MH2'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
+          ...dsec('ENTITIES', [...(v2 ? [] : lwp('GA', sqAt(0, 10000), 'ASPHALT')), ...lwp('GP', sqAt(20000, 5000), 'PAVING'),
+            ...lineR('W1', 'TWIN', 0, 0, 0, 500), ...lineR('W2', 'TWIN', 0, 0, 0, 500), ...(v2 ? lineR('W3', 'TWIN', 0, 0, 0, 500) : []), ...ins('GM', v2 ? 'MH2' : 'MH1', 100)])]);
+        const gt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision Checks' }, admin), 'checks tender')).id;
+        const rowA2 = (await ok(call('POST', `tenders/${gt}/rows`, { no: '1', description: 'Fake surfacing', unit: 'm2' }, admin), 'row')).id;
+        const rowW = (await ok(call('POST', `tenders/${gt}/rows`, { no: '2', description: 'Fake twin kerb', unit: 'm' }, admin), 'row')).id;
+        const rowN = (await ok(call('POST', `tenders/${gt}/rows`, { no: '3', description: 'Fake manholes', unit: 'nr' }, admin), 'row')).id;
+        const g1 = await upDxf(gt, 'checks', gv(false));
+        await ok(call('PUT', `drawings/${g1}/units`, { units: 'mm' }, admin), 'units');
+        const meas = (b, msg) => ok(call('POST', `drawings/${g1}/measurements`, b, admin), msg);
+        const gA = await meas({ row_id: rowA2, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'area' }, 'asphalt');
+        await meas({ row_id: rowA2, tool: 'dxf_layer', layer: 'PAVING', metric: 'area', confirm_overlap: true }, 'paving');
+        const gW = await meas({ row_id: rowW, tool: 'dxf_layer', layer: 'TWIN', metric: 'open_length', confirm_duplicate: true }, 'twin');
+        const gM = await meas({ row_id: rowN, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' }, 'manhole');
+        const gr = await fetch(`${base}drawings/${g1}/replace?name=checks`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(gv(true)) });
+        const g2 = (await gr.json()).id; await parsed(g2);
+        await ok(call('PUT', `drawings/${g2}/units`, { units: 'mm' }, admin), 'units v2');
+        const gc = (await ok(call('GET', `drawings/${g2}/compare`, null, admin), 'compare')).items, twin = gc.find(x => x.measurement_id === gW.id);
+        assert.deepStrictEqual(gc.map(x => [x.measurement_id, x.status, x.reason || null]).filter(x => x[1] === 'blocked'),
+          [[gA.id, 'blocked', 'layer_empty'], [gW.id, 'blocked', 'confirm_needed'], [gM.id, 'blocked', 'block_missing']], 'fixture');
+        const DG = `#drawings[data-tender="${gt}"]`, gRow = id => `${DG} #rv-table tr[data-measurement="${id}"]`;
+        // a viewer: the panel and its table, read only
+        await ok(call('POST', 'users', { username: 'viewer1', password: 'secret12', role: 'viewer' }, admin), 'viewer user');
+        {
+          const vctx = await browser.newContext({ viewport: { width: 1360, height: 1000 } });
+          const vck = (await call('POST', 'login', { username: 'viewer1', password: 'secret12' })).ck.split('=');
+          await vctx.addCookies([{ name: vck[0], value: vck[1], url: origin }]);
+          const vp = await vctx.newPage();
+          vp.on('console', m => { if (m.type() === 'error') errors.push(m.text()); }); vp.on('pageerror', e => errors.push(String(e)));
+          await vp.goto(`${origin}/#/tender/${gt}/drawings/${g1}`);
+          await vp.waitForSelector(gRow(gA.id));
+          for (const sx of ['#rv-accept', '#rv-cancel', 'select.rv-res', '#rv-upload', '#rv-units-confirm']) assert.strictEqual(await vp.$(DG + ' ' + sx), null, 'viewer: no ' + sx);
+          assert.ok((await vp.textContent(gRow(gM.id) + ' td.rv-res-cell')).includes('Link to another layer or block'), 'viewer: the options as text');
+          await vctx.close();
+        }
+        await page.goto(`${origin}/#/tender/${gt}/drawings/${g1}`);
+        await page.waitForSelector(gRow(gA.id));
+        // gate counts (R11): old → new
+        const dupWord = 'possible duplicates';
+        assert.ok((await page.textContent(gRow(gW.id) + ' td.rv-status')).includes(`${dupWord}: ${twin.gate_counts.duplicate.old} → ${twin.gate_counts.duplicate.new}`), 'gate counts shown');
+        // a block count relinks to { layer, block } (R12): the dropdown names both
+        await page.selectOption(`#rv-res-${gM.id}`, 'relink');
+        assert.deepStrictEqual(await page.$$eval(`#rv-to-${gM.id} option`, o => o.map(x => x.textContent)), ['Choose the layer or block…', 'MH / MH2']);
+        await page.selectOption(`#rv-to-${gM.id}`, '0');
+        await page.selectOption(`#rv-res-${gW.id}`, 'confirm');
+        await page.selectOption(`#rv-res-${gA.id}`, 'relink'); await page.selectOption(`#rv-to-${gA.id}`, '0');
+        await page.click('#rv-accept');
+        await page.waitForSelector(DG + ' #rv-preview');
+        took('409 (Conflict)', 'probe 409 logged');
+        // relinked onto PAVING, already measured on the row: a check to tick before Accept revision
+        assert.ok(await page.$(`#rv-chk-${gA.id}-overlap`), 'the overlap check');
+        assert.ok(await page.isDisabled('#rv-accept'), 'unticked: no accept');
+        await page.check(`#rv-chk-${gA.id}-overlap`);
+        assert.ok(await page.isEnabled('#rv-accept'));
+        // confirm_checks: the server refuses an unconfirmed check (the request is sent without its confirm here); the
+        // preview stays with the tick, nothing changed
+        await page.route(`**/api/drawings/${g2}/accept`, async r => {
+          const b = JSON.parse(r.request().postData());
+          for (const e of b.expect) delete e.confirm;
+          await r.continue({ postData: JSON.stringify(b) });
+        });
+        await page.click('#rv-accept');
+        await page.waitForFunction(() => document.querySelector('#rv-accept') && !document.querySelector('#rv-accept').disabled);
+        await page.unroute(`**/api/drawings/${g2}/accept`);
+        took('409 (Conflict)', 'confirm_checks 409 logged');
+        assert.ok(await page.$(DG + ' #rv-preview') && await page.isChecked(`#rv-chk-${gA.id}-overlap`), 'the preview and its tick stay');
+        assert.strictEqual(db.prepare('SELECT replaced_by FROM drawings WHERE id=?').get(g1).replaced_by, null, 'nothing changed');
+        await page.click('#rv-accept');
+        await page.waitForSelector(DG + ' #dw-history');
+        const after = id => db.prepare('SELECT layer, block, duplicate, drawing_id FROM measurements WHERE id=?').get(id);
+        assert.deepStrictEqual({ ...after(gA.id) }, { layer: 'PAVING', block: null, duplicate: 0, drawing_id: g2 });
+        assert.deepStrictEqual([after(gM.id).block, after(gW.id).duplicate], ['MH2', 1]);
+      }
 
       // ---- read only (an approved tender holding a pending version: older data): the table, no action ----
       const ro = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision Read-only' }, admin), 'ro tender')).id;

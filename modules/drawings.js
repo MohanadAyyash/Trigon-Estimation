@@ -174,11 +174,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     // calibrations in id order, so the lower-id rule between regions sharing an edge picks the same one in the copy
     const cmap = new Map();
-    // copied_from (R15) points at the Rev's copy of the source (copied before it: a lower id); the flag is kept either way
+    // copied_from (R15) points at the Rev's copy of the source (copied before it: a lower id); a source not in the Rev: NULL
     const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,copied_from,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)');
     for (const c of db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? AND d.pending=0 ORDER BY c.id').all(oldTid))
       cmap.set(c.id, Number(insC.run(dmap.get(c.drawing_id), c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.verify_pct,
-        c.copied_from === null ? null : cmap.get(c.copied_from) ?? c.copied_from, c.created, c.created_by).lastInsertRowid));
+        c.copied_from === null ? null : cmap.get(c.copied_from) ?? null, c.created, c.created_by).lastInsertRowid));
     const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,geom,deduct,calibration_id,created,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) SELECT ?, handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
@@ -1069,8 +1069,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     // 3. R18: every qty as reviewed, every check of a resolution confirmed (else 409: the tx rolls back)
     // a table where only probes differ is a preview (R14); any other difference is a stale table
     const differ = items.map(it => expect.get(it.measurement_id)).filter(e => e.resolution !== 'delete' && (e.new_qty === null || !sameQty(e.new_qty, qtyOf.get(e.measurement_id))));
-    if (differ.length) conflictBody(differ.every(isProbe) ? { error: PREVIEW, code: 'resolution_preview', ...body, resolved } : { error: REVIEW_AGAIN, ...body, resolved });
-    if (checked.some(gt => gt.gates.some(g => !(gt.e.confirm || []).includes(g)))) conflictBody({ error: 'confirm the checks of the chosen resolutions', code: 'confirm_checks', ...body, resolved });
+    // R18b: a preview also gives the row totals the chosen resolutions make (rowTotals with the resolved qtys, delete = 0)
+    const resolvedTotals = () => ({ rows: compare.rowTotals(items.map(it => {
+      const e = expect.get(it.measurement_id);
+      return it.status !== 'blocked' ? it : { ...it, status: 'resolved', new_qty: e.resolution === 'delete' ? 0 : qtyOf.get(it.measurement_id) };
+    })) });
+    if (differ.length) conflictBody(differ.every(isProbe) ? { error: PREVIEW, code: 'resolution_preview', ...body, resolved, resolved_totals: resolvedTotals() } : { error: REVIEW_AGAIN, ...body, resolved });
+    if (checked.some(gt => gt.gates.some(g => !(gt.e.confirm || []).includes(g))))
+      conflictBody({ error: 'confirm the checks of the chosen resolutions', code: 'confirm_checks', ...body, resolved, resolved_totals: resolvedTotals() });
     // 4. the rows (an imported row keeps its client qty; its measured total must not go below 0), then the drawings
     const rowQty = rows.map(r => ({ row_id: r, qty: recompute(r) }));
     db.prepare('UPDATE drawings SET pending=0 WHERE id=? OR parent_id=?').run(nd.id, nd.id);

@@ -2190,6 +2190,18 @@ server.listen(0, async () => {
       const REPLACED = 'this drawing has been replaced by a newer version: it is kept as history only', REVIEW = 'the measured quantities changed: review the changes again';
       // batch 4 Task 4, R14: a relink / keep_matched sent with new_qty null is a probe: its own code and message
       const PREVIEW = 'check what the chosen resolutions give, then accept again';
+      // R18b: the row totals a preview gives, by hand: Σ per row and unit of the items' qty after accept (a deleted one 0,
+      // a resolved one its resolved qty)
+      const handTotals = (items, resolved) => {
+        const rv = new Map(resolved.map(x => [x.measurement_id, x])), out = new Map();
+        for (const it of items) {
+          if (it.row_id === null) continue;
+          const k = it.row_id + '/' + it.qty_unit, x = out.get(k) || { row_id: it.row_id, qty_unit: it.qty_unit, old: 0, new: 0 }, r = rv.get(it.measurement_id);
+          x.old += it.old_qty; x.new += r ? (r.resolution === 'delete' ? 0 : r.new_qty) : it.new_qty;
+          out.set(k, x);
+        }
+        return [...out.values()];
+      };
       const ACCEPT = (did, b, ck = qs) => call('POST', `drawings/${did}/accept`, b, ck);
       // the reviewed table: every item with the qty shown, plus the resolutions by measurement id
       const expOf = (items, o = {}) => items.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty, ...(o[x.measurement_id] || {}) }));
@@ -2636,9 +2648,14 @@ server.listen(0, async () => {
         assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.deepStrictEqual([r.j.code, r.j.error], ['resolution_preview', PREVIEW], 'R14: the probe is not a stale table'); assert.deepStrictEqual(r.j.items, c.items);
         assert.deepStrictEqual(r.j.resolved, [{ measurement_id: mArea.id, resolution: 'relink', to: 'PAVING', new_qty: mArea.qty, gates: [] },
           { measurement_id: mSel.id, resolution: 'keep_matched', new_qty: items.get(mSel.id).keep_matched_qty, gates: [] }]);
+        // R18b: the totals the resolutions give (the compare's own totals stay null on the blocked rows)
+        assert.deepStrictEqual(r.j.resolved_totals, { rows: handTotals(c.items, r.j.resolved) });
+        assert.ok(r.j.totals.rows.some(x => x.new === null) && r.j.resolved_totals.rows.every(x => typeof x.new === 'number'));
+        assert.deepStrictEqual(r.j.resolved_totals.rows.find(x => x.row_id === rM2), { row_id: rM2, qty_unit: 'm2', old: mArea.qty, new: mArea.qty });
         // a probe sent with another qty that no longer matches is a stale table (REVIEW), not a preview
         r = await ACCEPT(N, { expect: expOf(c.items, probe).map(x => x.measurement_id === mBlk.id ? { ...x, new_qty: 1 } : x) });
         assert.strictEqual(r.s, 409); assert.deepStrictEqual([r.j.code, r.j.error], [undefined, REVIEW]);
+        assert.strictEqual(r.j.resolved_totals, undefined, 'a stale table gives no preview totals');
         // null on an item without relink / keep_matched is never a probe
         r = await ACCEPT(N, { expect: expOf(c.items, { ...probe, [mBlk.id]: { new_qty: null } }) });
         assert.strictEqual(r.s, 409); assert.deepStrictEqual([r.j.code, r.j.error], [undefined, REVIEW]);
@@ -2840,6 +2857,7 @@ server.listen(0, async () => {
         assert.deepStrictEqual(r.j.resolved.map(x => [x.measurement_id, x.resolution, x.to, x.gates]), [[gA.id, 'relink', 'ASPH2', ['duplicate']], [gX.id, 'delete', undefined, []],
           [gS.id, 'keep_matched', undefined, ['overlap']], [gW.id, 'confirm', undefined, ['duplicate']]]);
         rel(r.j.resolved[0].new_qty, 8, 'two 4 m2 squares'); assert.strictEqual(r.j.resolved[1].new_qty, null); rel(r.j.resolved[2].new_qty, 2, 'E2');
+        assert.deepStrictEqual(r.j.resolved_totals, { rows: handTotals(gc.items, r.j.resolved) }, 'R18b: a deleted item counts 0');
         // relink to PAVING: gP already measures it on the row → overlap
         r = await ACCEPT(g2, { expect: expOf(gc.items, { ...base3, [gA.id]: { resolution: 'relink', to: 'PAVING', new_qty: null }, [gS.id]: { resolution: 'keep_matched', new_qty: 2 } }) });
         assert.strictEqual(r.s, 409); assert.strictEqual(r.j.code, 'resolution_preview');
@@ -2850,6 +2868,7 @@ server.listen(0, async () => {
         const exact = { ...base3, [gA.id]: { resolution: 'relink', to: 'PAVING', new_qty: gP.qty }, [gS.id]: { resolution: 'keep_matched', new_qty: r.j.resolved[2].new_qty } };
         r = await ACCEPT(g2, { expect: expOf(gc.items, exact) });
         assert.strictEqual(r.s, 409); assert.deepStrictEqual([r.j.code, r.j.error], ['confirm_checks', 'confirm the checks of the chosen resolutions']);
+        assert.deepStrictEqual(r.j.resolved_totals, { rows: handTotals(gc.items, r.j.resolved) });
         assert.deepStrictEqual(r.j.resolved.filter(x => x.gates.length).map(x => [x.measurement_id, x.gates]), [[gA.id, ['overlap']], [gS.id, ['overlap']], [gW.id, ['duplicate']]]);
         assert.strictEqual(JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TG), db.prepare('SELECT * FROM measurement_handles ORDER BY rowid').all(),
           db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TG)]), sG, 'nothing changed');

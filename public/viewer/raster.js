@@ -28,12 +28,16 @@
 //   engine.whenIdle() -> Promise once no render is pending or running (tests)
 //
 // Previous version underneath (batch 4 Task 4, display only): opts.under = { kind, url, page, rotation } is another page
-// (the version this one replaces), its display top-left on this page's, at its own size. It is rendered once onto an
-// opaque white canvas (a PDF page whole at twice the fit resolution, an image as decoded; ≤ 16 MP) and blended with the
-// page: a canvas pixel is (1 − mix) · this page + mix · the previous one (drawn after the page at opacity mix, which is
-// the same blend as the page at 1 − mix over it). engine.setUnderMix(0..1), engine.underMix(); opts.underMix sets the
-// start (default 0: this page only). engine.ready waits for it; a failure to load it calls onError and leaves this page
-// shown alone.
+// (the version this one replaces). It is rendered once onto an opaque white canvas (a PDF page whole at twice the fit
+// resolution, an image as decoded; ≤ 16 MP) and blended with the page: a canvas pixel is (1 − mix) · this page + mix · the
+// previous one (drawn after the page at opacity mix, the same blend as the page at 1 − mix over it).
+// Alignment (R17): in page space, where the measurements live. PDF over PDF: the previous page's bitmap → its unrotated
+// user space (inverse of its pdf.js viewport transform) → this page's display (this viewport's transform) → screen, one
+// affine (setTransform), so another /Rotate or page-box origin lines up point for point. Image over image: pixels (the
+// same as display). A PDF and an image: no common space; drawn display top-left on top-left at its own size and
+// engine.underAligned() is false (the page says so). engine.setUnderMix(0..1), engine.underMix(); opts.underMix sets
+// the start (default 0: this page only). engine.ready waits for it; a failure to load it calls onError and leaves this
+// page shown alone.
 //
 // Rendering: a PDF is rendered by pdf.js (worker /vendor/pdfjs/pdf.worker.min.mjs). The whole page once at the fit
 // resolution, then the visible part at the current zoom 150 ms after the view stops changing (canvas ≤ 16 MP). A new
@@ -45,6 +49,10 @@
 (function () {
 const BG = '#1e1e1e', PAGE = '#ffffff', EDGE = 'rgba(255,255,255,0.25)';
 const MAX_PIXELS = 16e6, DEBOUNCE_MS = 150, DRAG_PX = 3;
+// 2-D affines [a, b, c, d, e, f] (x' = a x + c y + e, y' = b x + d y + f), as canvas setTransform takes them
+const mul = (P, Q) => [P[0] * Q[0] + P[2] * Q[1], P[1] * Q[0] + P[3] * Q[1], P[0] * Q[2] + P[2] * Q[3], P[1] * Q[2] + P[3] * Q[3],
+  P[0] * Q[4] + P[2] * Q[5] + P[4], P[1] * Q[4] + P[3] * Q[5] + P[5]];
+const inv = M => { const d = M[0] * M[3] - M[1] * M[2]; return [M[3] / d, -M[1] / d, -M[2] / d, M[0] / d, (M[2] * M[5] - M[3] * M[4]) / d, (M[1] * M[4] - M[0] * M[5]) / d]; };
 
 let lib = null;
 function pdfjs() {
@@ -78,7 +86,8 @@ function create(container, opts) {
   const tasks = { base: null, detail: null };   // pdf.js render tasks in flight
   let timer = 0, busy = 0, idleWaiters = [];
   let drag = null, mouse = null;
-  let under = null, mix = Math.min(1, Math.max(0, Number(o.underMix) || 0));   // under: { c (opaque canvas), w, h (display size at scale 1) }
+  // under: { c (opaque canvas), toPage: bitmap px → its page space (PDF user space, image pixels), toDisp: bitmap px → its display }
+  let under = null, mix = Math.min(1, Math.max(0, Number(o.underMix) || 0)), pageToD = null;   // pageToD: this page's page → display affine
 
   // ---- load ----
   async function load() {
@@ -92,7 +101,7 @@ function create(container, opts) {
       if (img.width !== o.pageW || img.height !== o.pageH)
         throw Object.assign(new Error('image size ' + img.width + ' × ' + img.height + ' ≠ ' + o.pageW + ' × ' + o.pageH), { code: 'image_frame', width: img.width, height: img.height, pageW: o.pageW, pageH: o.pageH });
       dw = img.width; dh = img.height;
-      toD = (x, y) => [x, y]; toP = (x, y) => [x, y];
+      toD = (x, y) => [x, y]; toP = (x, y) => [x, y]; pageToD = [1, 0, 0, 1, 0, 0];
     } else if (o.kind === 'pdf') {
       const [m, ab] = await Promise.all([pdfjs(), fetchFile(o.url)]);
       if (dead) return;
@@ -107,6 +116,7 @@ function create(container, opts) {
       dw = vp.width; dh = vp.height;
       toD = (x, y) => vp.convertToViewportPoint(x, y);
       toP = (x, y) => vp.convertToPdfPoint(x, y);
+      pageToD = vp.transform.slice();
     } else throw new Error('unknown kind: ' + o.kind);
     fit();
     if (pg) renderBase();
@@ -131,8 +141,9 @@ function create(container, opts) {
       if (dead) { b.close(); return; }
       const [c, g] = paper(b.width, b.height, capScale(b.width, b.height, 1));
       g.drawImage(b, 0, 0, c.width, c.height);
+      const k = b.width / c.width;   // bitmap px → image px (= its display)
       b.close();
-      under = { c, w: b.width, h: b.height };
+      under = { c, toPage: [k, 0, 0, b.height / c.height, 0, 0], toDisp: [k, 0, 0, b.height / c.height, 0, 0] };
     } else if (u.kind === 'pdf') {
       const m = await pdfjs();
       if (dead) return;
@@ -143,10 +154,10 @@ function create(container, opts) {
         const p = await d.getPage(u.page || 1);
         const r = [0, 90, 180, 270].includes(u.rotation) ? u.rotation : p.rotate;
         const vp1 = p.getViewport({ scale: 1, rotation: r }), s = capScale(vp1.width, vp1.height, Math.max(1, fitScale * dpr * 2));
-        const [c, g] = paper(vp1.width, vp1.height, s);
-        await p.render({ canvasContext: g, viewport: p.getViewport({ scale: s, rotation: r }) }).promise;
+        const [c, g] = paper(vp1.width, vp1.height, s), vps = p.getViewport({ scale: s, rotation: r });
+        await p.render({ canvasContext: g, viewport: vps }).promise;
         if (dead) return free(c);
-        under = { c, w: vp1.width, h: vp1.height };
+        under = { c, toPage: inv(vps.transform), toDisp: [1 / s, 0, 0, 1 / s, 0, 0] };
       } finally { loading.destroy(); }
     } else throw new Error('unknown kind: ' + u.kind);
     schedule();
@@ -232,7 +243,12 @@ function create(container, opts) {
       }
       if (base) blit(base);
       if (detail) blit(detail);
-      if (under && mix > 0) { ctx.globalAlpha = mix; ctx.drawImage(under.c, sx, sy, under.w * s, under.h * s); ctx.globalAlpha = 1; }
+      if (under && mix > 0) {
+        // display → screen (CSS px): x · s + (tx − ox · s), y · s + (ty + oy · s) (screenOf); then the bitmap through page space
+        const toScr = [s, 0, 0, s, V.tx - V.ox * s, V.ty + V.oy * s];
+        const M = mul(toScr, underAligned() ? mul(pageToD, under.toPage) : under.toDisp);
+        ctx.save(); ctx.globalAlpha = mix; ctx.transform(...M); ctx.drawImage(under.c, 0, 0); ctx.restore();
+      }
       ctx.lineWidth = 1; ctx.strokeStyle = EDGE; ctx.strokeRect(sx - 0.5, sy - 0.5, dw * s + 1, dh * s + 1);
       if (o.onDraw) o.onDraw(ctx, api);
     }
@@ -257,6 +273,9 @@ function create(container, opts) {
     fitScale = V.scale;
     viewChanged();
   }
+
+  // the previous version lines up in page space only when both are PDFs or both images (R17)
+  function underAligned() { return !!o.under && o.under.kind === o.kind; }
 
   // ---- input ----
   const pos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
@@ -348,6 +367,7 @@ function create(container, opts) {
     setUnderMix(v) { mix = Math.min(1, Math.max(0, Number(v) || 0)); schedule(); },
     underMix: () => mix,
     hasUnder: () => !!under,
+    underAligned,
     whenIdle: () => new Promise(f => { idleWaiters.push(f); settle(); }),
   };
   resize();

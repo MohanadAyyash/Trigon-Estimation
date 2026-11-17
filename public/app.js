@@ -666,7 +666,6 @@
     page_missing: t('rv_r_page_missing'), manual_check: t('rv_r_manual_check') })[r] || r;
   const rvGate = g => ({ incomplete: t('rv_g_incomplete'), duplicate: t('rv_g_duplicate'), mixed_blocks: t('rv_g_mixed_blocks'), overlap: t('rv_g_overlap') })[g] || g;
   // a relink target (R12): a layer name, or { layer, block }
-  const rvTarget = x => typeof x === 'string' ? h('span', { dir: 'auto' }, x) : [h('span', { dir: 'auto' }, x.layer), ' / ', h('span', { dir: 'auto' }, x.block)];
   const rvTargetText = x => typeof x === 'string' ? x : x.layer + ' / ' + x.block;
 
   // top: the drawing's first row; pend: its new version (GET compare). The table changes nothing: Accept revision sends
@@ -724,7 +723,8 @@
       return sec;
     }
 
-    let items = c.items, totals = c.totals, newPages = c.new_pages || [], note = null, rowsNow = rows, msNow = ms;
+    // resolvedTotals (R18b): the row totals the server gave with the last preview; dropped by any change of a resolution
+    let items = c.items, totals = c.totals, newPages = c.new_pages || [], note = null, rowsNow = rows, msNow = ms, resolvedTotals = null;
     const choice = new Map();     // measurement id -> { res, to: index in relink_choices ('' none yet) }
     const previews = new Map();   // measurement id -> { key, new_qty, gates, ticks: Set } (R14: what the server said)
     const keyOf = id => { const ch = choice.get(id); return ch ? ch.res + ':' + (ch.res === 'relink' ? ch.to : '') : ''; };
@@ -764,9 +764,11 @@
           const opts = [['', t('rv_o_choose')], ...it.options.map(o => [o, o === 'delete' ? t('rv_o_delete') : o === 'relink' ? t('rv_o_relink')
             : o === 'keep_matched' ? t('rv_o_keep_matched', { qty: q(it, it.keep_matched_qty), unit: it.qty_unit || '' }) : o === 'confirm' ? t('rv_o_confirm') : o])];
           const rs = sel('rv-res-' + id, ch ? ch.res : '', opts, { class: 'rv-res' });
-          rs.addEventListener('change', () => { if (rs.value) choice.set(id, { res: rs.value, to: '' }); else choice.delete(id); note = null; draw(); });
+          // another resolution: its preview goes (the next Accept revision asks again), and so do the preview's totals
+          const changed = () => { previews.delete(id); resolvedTotals = null; note = null; draw(); };
+          rs.addEventListener('change', () => { if (rs.value) choice.set(id, { res: rs.value, to: '' }); else choice.delete(id); changed(); });
           const to = ch && ch.res === 'relink' ? sel('rv-to-' + id, ch.to, [['', t('rv_to_choose')], ...(it.relink_choices || []).map((x, k) => [String(k), rvTargetText(x)])], { class: 'rv-to' }) : null;
-          if (to) to.addEventListener('change', () => { ch.to = to.value; note = null; draw(); });
+          if (to) to.addEventListener('change', () => { ch.to = to.value; changed(); });
           // R14: the checks the server says the resolution brings, each to be ticked before Accept revision
           const checks = p ? h('div', { class: 'rv-checks small' }, p.gates.length ? p.gates.map(g => h('label', { class: 'field check' }, h('span', null, t('rv_confirm_check', { check: rvGate(g) })),
             h('input', { type: 'checkbox', id: `rv-chk-${id}-${g}`, checked: p.ticks.has(g), onchange: ev => { if (ev.target.checked) p.ticks.add(g); else p.ticks.delete(g); refresh(); } })))
@@ -780,7 +782,7 @@
           h('td', { class: 'num rv-after' + (p ? ' rv-resolved' : '') }, ch && ch.res === 'delete' ? t('rv_deleted') : q(it, after)),
           h('td', { class: 'num rv-diff' }, fin(diff) ? (diff > 0 ? '+' : '') + q(it, diff) : '—'), h('td', null, it.qty_unit || ''), h('td', { class: 'rv-res-cell' }, res));
       };
-      const tots = (totals && totals.rows) || [];
+      const tots = ((resolvedTotals || totals) && (resolvedTotals || totals).rows) || [];
       tableBox.replaceChildren(...[
         note === 'again' ? h('p', { id: 'rv-again', class: 'err' }, t('rv_again')) : note === 'preview' ? h('p', { id: 'rv-preview', class: 'warn' }, t('rv_preview')) : null,
         h('p', { class: 'muted small' }, t('rv_intro')),
@@ -788,7 +790,7 @@
           items.map(tr), { class: 'grid rv-table', id: 'rv-table' })) : h('p', { id: 'rv-table', class: 'muted' }, t('rv_nothing_measured')),
         tots.length ? [h('h3', null, t('rv_totals')), h('div', { class: 'scroll' }, table([t('row'), t('unit'), t('cal_before'), t('cal_after')], tots.map(x =>
           h('tr', { 'data-row': String(x.row_id) }, h('td', null, h('span', { dir: 'auto' }, rowName(x.row_id))), h('td', null, x.qty_unit || ''),
-            h('td', { class: 'num' }, fmt2(x.old)), h('td', { class: 'num' }, fin(x.new) ? fmt2(x.new) : h('span', { class: 'muted', title: t('rv_total_blocked') }, '—')))), { class: 'grid', id: 'rv-totals' }))] : null,
+            h('td', { class: 'num' }, fmt2(x.old)), h('td', { class: 'num' + (resolvedTotals ? ' rv-resolved' : '') }, fin(x.new) ? fmt2(x.new) : h('span', { class: 'muted', title: t('rv_total_blocked') }, '—')))), { class: 'grid', id: 'rv-totals' }))] : null,
         newPages.length ? h('p', { id: 'rv-new-pages', class: 'small muted' }, t('rv_new_pages', { pages: newPages.join(', ') })) : null].flat().filter(Boolean));
       refresh();
     }
@@ -806,6 +808,9 @@
       });
       acceptBtn.disabled = true;
       msgBox.replaceChildren();
+      // the resolutions as sent: an answer is kept only for what is still chosen (a change while it was on its way wins)
+      const sent = new Map(items.map(it => [it.measurement_id, keyOf(it.measurement_id)]));
+      const toOf = id => { const it = items.find(x => x.measurement_id === id), ch = choice.get(id); return ch && ch.res === 'relink' ? it.relink_choices[Number(ch.to)] : undefined; };
       try {
         await api('POST', `drawings/${pend.id}/accept`, { expect });
         if (tok !== routeTok) return;
@@ -818,18 +823,22 @@
         if (e.status === 409 && (b.code === 'resolution_preview' || b.code === 'confirm_checks') && Array.isArray(b.resolved) && Array.isArray(b.items)) {
           // R14: what each relink / keep_matched gives and the checks it brings; nothing changed. The ticks given for a check
           // still asked for stay.
-          for (const r of b.resolved) if (probes(r.resolution)) {
+          const same = [...sent].every(([id, k]) => keyOf(id) === k);
+          for (const r of b.resolved) if (probes(r.resolution) && keyOf(r.measurement_id) === sent.get(r.measurement_id)
+            && (r.resolution !== 'relink' || JSON.stringify(r.to) === JSON.stringify(toOf(r.measurement_id)))) {
             const was = previewOf(r.measurement_id);
             previews.set(r.measurement_id, { key: keyOf(r.measurement_id), new_qty: r.new_qty, gates: r.gates, ticks: new Set(was ? [...was.ticks].filter(g => r.gates.includes(g)) : []) });
           }
-          items = b.items; totals = b.totals; note = 'preview';
+          items = b.items; totals = b.totals; note = same ? 'preview' : null; resolvedTotals = same && b.resolved_totals ? b.resolved_totals : null;
           draw();
-        } else if (e.status === 409 && Array.isArray(b.items) && b.ready && !b.needs_units) {
-          // a stale table: the fresh one (labels and rows read again), every resolution chosen again
+        } else if ((e.status === 409 || e.status === 400) && Array.isArray(b.items) && b.ready && !b.needs_units) {
+          // a stale table (409), or a refusal that comes with the fresh one (400): that table (labels and rows read again),
+          // every resolution chosen again; a 400 says why in words
           try { [rowsNow, msNow] = await Promise.all([api('GET', `tenders/${pend.tender_id}/rows`), api('GET', `tenders/${pend.tender_id}/measurements`)]); } catch (e2) { /* the last ones */ }
           if (tok !== routeTok) return;
-          items = b.items; totals = b.totals; newPages = b.new_pages || []; choice.clear(); previews.clear(); note = 'again';
+          items = b.items; totals = b.totals; newPages = b.new_pages || []; choice.clear(); previews.clear(); resolvedTotals = null; note = 'again';
           draw();
+          if (e.status === 400) msgBox.replaceChildren(h('p', { id: 'rv-refused', class: 'err' }, t('error') + ': ' + srvMsg(e.message)));
         } else if (e.status === 409 && (b.needs_units || b.ready === false)) rerender();
         else { refresh(); msgBox.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message))); }
       }
@@ -962,7 +971,7 @@
   // cmp: { under: a drawing row, on } draws that version in grey under this one, with a toggle (display only)
   function viewerCard(d, lt, rows, canLink, refreshList, editable, savedOf, cmp) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id) });
-    const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
+    const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''), cmp && cmp.show ? h('span', { class: 'tag warn-tag', id: 'tv-rev' }, t('dw_rev_n', { rev: d.rev })) : null);
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
     const idle = (...extra) => { openBtn.disabled = false; sec.replaceChildren(title(), ...extra, openBtn); };
     idle();
@@ -1042,7 +1051,9 @@
           underCb ? h('label', { class: 'tv-check' }, underCb, ' ' + t('tv_under')) : null,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
         h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_dxf')) : null,
-          underErr ? h('p', { id: 'tv-under-error', class: 'err small' }, t('tv_under_failed') + ': ' + underErr) : null),
+          underErr ? h('p', { id: 'tv-under-error', class: 'err small' }, t('tv_under_failed') + ': ' + underErr) : null,
+          // R17: drawn in raw drawing coordinates; other units do not line up
+          RU && cmp.under.units && d.units && cmp.under.units !== d.units ? h('p', { id: 'tv-under-note', class: 'warn small' }, t('tv_under_units', { a: cmp.under.units, b: d.units })) : null),
         barBox,
         h('p', { class: 'muted small' }, t('tv_help'), editable ? ' ' + t('tl_help_dxf') : ''),
         h('div', { class: 'tv-body' },
@@ -1164,7 +1175,7 @@
   // blended with this one, with a slider (display only)
   function rasterCard(d, rows, editable, savedOf, refreshList, cmp) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id), 'data-kind': d.kind });
-    const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
+    const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''), cmp && cmp.show ? h('span', { class: 'tag warn-tag', id: 'tv-rev' }, t('dw_rev_n', { rev: d.rev })) : null);
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
     const unit = d.kind === 'pdf' ? t('tv_unit_pt') : t('tv_unit_px');
     const info = h('p', { id: 'tv-page-info', class: 'muted small' }, d.kind === 'pdf'
@@ -1204,7 +1215,8 @@
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
           u ? h('label', { class: 'tv-check tv-mix' }, t('tv_under') + ' ', mixIn, ' ', mixOut) : null,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
-        h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_raster')) : null),
+        h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_raster')) : null,
+          u && u.kind !== d.kind ? h('p', { id: 'tv-under-note', class: 'warn small' }, t('tv_under_mixed')) : null),
         barBox,
         h('p', { class: 'muted small' }, t('tv_raster_help'), editable ? ' ' + t('tl_help_raster') : ''),
         h('p', { class: 'muted', id: 'tv-loading' }, t('loading')),
@@ -1224,7 +1236,7 @@
       window.__tvViewer = eng;   // test hook
       // no snap on a page; Shift keeps a segment horizontal or vertical; a tool takes the left button (pan: middle/right)
       mp = measurePanel({ d: full, kind: d.kind, unit, editable, rows, savedOf: () => [...savedOf(d.id), ...(u ? savedOf(u.id) : [])], refreshList, alive: () => tok === routeTok,
-        cals: calsOf.calibrations || [], units: Object.keys(full.unit_to_m || {}), cursor: () => cur, axisLock: true,
+        cals: calsOf.calibrations || [], calsPrevious: !!(cmp && cmp.show), units: Object.keys(full.unit_to_m || {}), cursor: () => cur, axisLock: true,
         eng: { canvas: eng.canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
           setToolMode: on => eng.setPanOnLeft(!on) } });
       barBox.replaceWith(mp.bar || '');
@@ -1267,7 +1279,9 @@
     [/cannot be recomputed at the new scale/, () => t('se_rescale')], [/would be out of range: it must be at most/, () => t('se_rescale_range')],
     [/kept changing while its quantities were recomputed/, () => t('se_units_retry')],
     [/^(a replacement is pending|this drawing already has a pending replacement): accept or cancel it first$/, () => t('se_pending')],
-    [/^this drawing has been replaced by a newer version: it is kept as history only$/, () => t('se_replaced')], [/^could not total the selection/, () => t('se_sel_total')]];
+    [/^this drawing has been replaced by a newer version: it is kept as history only$/, () => t('se_replaced')], [/^could not total the selection/, () => t('se_sel_total')],
+    [/^blocked items need a resolution/, () => t('se_need_resolution')],
+    [/^measurement \d+: (needs a resolution|cannot be resolved by|relink to must be one of|is not blocked|to goes with|to and confirm go with|confirm goes with|a deleted measurement)/, () => t('se_bad_resolution')]];
   const srvMsg = m => { const g = geomMsg(m); if (g !== m) return g; for (const [re, f] of SERVER_MSG) if (re.test(m)) return f(); return m; };
   const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
   const fmtPct = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');
@@ -1305,7 +1319,8 @@
     function showScale() {
       if (!raster) { const s = c.dxfScale(); scaleEl.replaceChildren(s ? t('tl_scale_dxf', { u: c.unit, s: fmtScale(s) }) : h('span', { class: 'warn' }, t('tl_units_none'))); return; }
       const page = cals.find(x => x.region === null), regs = cals.filter(x => x.region !== null);
-      scaleEl.replaceChildren(...(page ? [t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) }), ' · ', verifiedTag(page), copiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
+      scaleEl.replaceChildren(...(c.calsPrevious && cals.length ? [h('span', { class: 'tag warn-tag', id: 'tl-cals-previous' }, t('tl_cals_previous')), ' '] : []),
+        ...(page ? [t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) }), ' · ', verifiedTag(page), copiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
         ...regs.flatMap((x, k) => [' — ', t('tl_scale_region', { n: k + 1, u: c.unit, s: fmtScale(x.scale) }), ' · ', verifiedTag(x), copiedTag(x)]));
     }
     // { scale } or { reason }: as the server resolves it (modules/drawings.js createManual)
