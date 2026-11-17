@@ -7,6 +7,8 @@ const { writeXlsx } = require('../lib/xlsx');
 const { round2 } = require('../lib/money');
 const { viewSnapshot } = require('../lib/costs');
 const { normUom } = require('../lib/units');
+const { formulaText, metricLabel } = require('../lib/takeoff/formula.js');
+const I18N = require('../public/i18n.js');
 
 const DAY = 86400000, MAX = 1e12, MAX_MONTHS = 1200;
 const KINDS = ['rta', 'direct'];
@@ -380,6 +382,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
         rows: viewRows(c.rows, me.role), hidden: c.hidden, blocking: c.blocking, snapshot_warnings: viewWarnings(c, me.role), measure_warnings: measureWarnings(t) });
     }
     if (sub === 'export' && parts.length === 3 && method === 'GET') return exportApi(res, url, t, me);
+    if (sub === 'takeoff.xlsx' && parts.length === 3 && method === 'GET') return takeoffReport(res, url, t, me);
     if (parts.length === 3 && method === 'POST' && ['submit', 'return', 'send', 'reprice', 'approve', 'revise'].includes(sub)) return workflow(sub, req, res, t, me);
     if (sub === 'result' && parts.length === 3 && method === 'PUT') {
       need(me, 'admin', 'qs');
@@ -515,6 +518,83 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     const head = { 'Content-Disposition': `attachment; filename="${name}"` };
     if (format === 'xlsx') return reply(res, 200, writeXlsx(sheets), { ...head, 'Content-Type': XLSX_TYPE });
     return reply(res, 200, toCsv(sheets), { ...head, 'Content-Type': 'text/csv; charset=utf-8' });
+  }
+
+  // ---- Excel take-off report (batch 4 Task 5) ---------------------------------------------------------------
+  // The measurements, rows and drawings of a tender in one language (Arabic sheets right-to-left). Every number is a
+  // stored value or the tender API's own: a measurement's qty, a row's qty, its measured total (measuredView, as GET rows)
+  // and its take-off lines (takeoffQty, the formula of the row qty). Nothing is rescaled or recomputed here. The formula
+  // text is the measurement list's (lib/takeoff/formula.js). Before approval every sheet carries the draft label.
+  const TOOL_KEYS = { line: 'tl_line', polyline: 'tl_polyline', area: 'tl_area', rect: 'tl_rect', count: 'tl_count' };
+  const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+  function takeoffReport(res, url, t, me) {
+    need(me, 'admin', 'qs', 'viewer');
+    const lang = url.searchParams.get('lang') || 'en';
+    if (!['ar', 'en'].includes(lang)) bad('lang must be ar or en');
+    const tr = (k, vars) => {
+      let s = I18N[lang][k] ?? I18N.en[k] ?? k;
+      if (vars) for (const v of Object.keys(vars)) s = s.split('{' + v + '}').join(String(vars[v]));
+      return s;
+    };
+    const draft = !FROZEN_STATUSES.includes(t.status);
+    const head = [[tr('rp_title'), tr('rp_tender'), t.title, tr('rp_ref'), t.ref, tr('rp_rev'), t.rev],
+      [tr('rp_status'), tr('st_' + t.status), tr('rp_generated'), new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC']];
+    if (draft) head.push([DRAFT_EN, DRAFT_AR]);
+    head.push([]);
+    const { list, drawings } = ctx.drawings ? ctx.drawings.reportData(t) : { list: { measurements: [], unlinked: [] }, drawings: [] };
+    const dById = new Map(drawings.map(d => [d.id, d]));
+
+    const toolText = m => m.tool === 'manual' ? tr('m_manual') + ': ' + (m.geom && Object.hasOwn(TOOL_KEYS, m.geom.tool) ? tr(TOOL_KEYS[m.geom.tool]) : '')
+      : m.tool === 'dxf_selection' ? tr('m_selection', { n: m.handles_count || 0 })
+      : m.tool === 'dxf_blocks' ? tr('rp_tool_blocks') + ': ' + m.layer + ' / ' + m.block + (m.nested ? ' (' + tr('lk_nested') + ')' : '')
+      : tr('rp_tool_layer') + ': ' + m.layer;
+    // what a quantity's scale came from (as the list's line under the formula): a calibration, or the DXF units
+    const calText = m => m.metric === 'count' ? null
+      : m.calibration ? (!m.calibration.region ? tr('m_cal_page') : finNum(m.calibration.region_no) ? tr('m_cal_region_n', { n: m.calibration.region_no }) : tr('m_cal_region'))
+      : m.drawing_kind === 'dxf' ? tr('m_cal_units', { u: m.drawing_units || '—' }) : null;
+    const mRows = [...list.measurements, ...list.unlinked].map(m => {
+      const d = dById.get(m.drawing_id) || {};
+      return [m.id, m.drawing_name, d.rev ?? null, d.page ?? null, m.label, toolText(m), metricLabel(m.metric, tr), m.row_id === null ? null : m.row_no,
+        m.row_id === null ? tr('rp_unlinked') : m.row_description, formulaText(m, tr), m.qty, m.qty_unit, m.deduct ? tr('yes') : null, calText(m),
+        m.review_needed ? tr('yes') : null, m.created_by, m.created];
+    });
+
+    const lineQ = db.prepare('SELECT * FROM takeoff_lines WHERE row_id=?');
+    const note = v => [v.measured_qty === null && v.measured_units.length > 1 ? tr('mixed_units') + ': ' + v.measured_units.map(u => u.qty + ' ' + u.unit).join('; ') : null,
+      v.measured_incomplete ? tr('measured_incomplete') : null, v.measured_duplicate ? tr('measured_duplicate') : null].filter(Boolean).join(' · ') || null;
+    const rRows = db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(t.id).map(r => {
+      if (r.is_heading) return [r.no, r.description];
+      const v = measuredView(r);
+      return r.source === 'takeoff'
+        ? [r.no, r.description, tr('rp_src_takeoff'), r.unit, takeoffQty(lineQ.all(r.id)), v.measured_qty, r.qty, null, null, null, note(v)]
+        : [r.no, r.description, tr('rp_src_import'), r.unit, null, null, null, r.qty, v.measured_qty, v.measured_diff_pct, note(v)];
+    });
+
+    const scaleText = d => {
+      if (d.kind === 'dxf') return d.units;
+      const parts = [];
+      if (finNum(d.page_scale)) parts.push(tr('tl_scale_page', { u: tr(d.kind === 'pdf' ? 'tv_unit_pt' : 'tv_unit_px'), s: fmtScale(d.page_scale) }));
+      if (d.regions) parts.push(tr('rp_regions', { n: d.regions }));
+      return parts.join(' · ') || null;
+    };
+    const dRows = drawings.map(d => {
+      const by = d.replaced_by === null ? null : dById.get(d.replaced_by);
+      return [d.name, d.kind, d.rev, d.page, scaleText(d), d.sha256 ? d.sha256.slice(0, 12) : null, d.created_by, d.created,
+        by ? `${by.name} (${tr('rp_rev')} ${by.rev})` : d.replaced_by === null ? null : String(d.replaced_by)];
+    });
+
+    const rtl = lang === 'ar';
+    const sheets = [
+      { name: tr('rp_sheet_measurements'), rtl, colWidths: [8, 30, 6, 6, 24, 24, 16, 10, 36, 60, 14, 8, 10, 24, 12, 14, 22], rows: [...head,
+        ['rp_id', 'rp_drawing', 'rp_rev', 'rp_page', 'rp_label', 'rp_tool', 'rp_measure', 'rp_row_no', 'rp_row_desc', 'rp_formula', 'rp_qty', 'rp_unit', 'rp_deduct', 'rp_cal',
+          'rp_review', 'rp_created_by', 'rp_created_at'].map(k => tr(k)), ...mRows] },
+      { name: tr('rp_sheet_rows'), rtl, colWidths: [10, 50, 14, 8, 14, 16, 14, 14, 14, 14, 40], rows: [...head,
+        ['rp_no', 'rp_desc', 'rp_source', 'rp_unit', 'rp_from_lines', 'rp_from_measurements', 'rp_total', 'rp_client_qty', 'rp_measured', 'rp_diff_pct', 'rp_note'].map(k => tr(k)), ...rRows] },
+      { name: tr('rp_sheet_drawings'), rtl, colWidths: [36, 8, 6, 6, 30, 16, 14, 26, 36], rows: [...head,
+        ['rp_drawing', 'rp_kind', 'rp_rev', 'rp_page', 'rp_units_scale', 'rp_sha', 'rp_uploaded_by', 'rp_uploaded_at', 'rp_replaced_by'].map(k => tr(k)), ...dRows] },
+    ];
+    const name = `tender-${safeRef(t.ref, t.id)}-rev${t.rev}-takeoff${draft ? '-DRAFT' : ''}.xlsx`;
+    return reply(res, 200, writeXlsx(sheets), { 'Content-Disposition': `attachment; filename="${name}"`, 'Content-Type': XLSX_TYPE });
   }
 
   // ---- workflow ----------------------------------------------------------------------------------------

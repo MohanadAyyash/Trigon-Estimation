@@ -214,7 +214,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const hooks = { beforeUnitTx: null, beforeMeasureTx: null, beforeAcceptTx: null };
   // R8: a tender with a drawing replacement waiting for accept or cancel is not submitted or approved (tenders.js)
   const hasPendingReplacement = tid => !!db.prepare('SELECT 1 FROM drawings WHERE tender_id=? AND pending=1 LIMIT 1').get(tid);
-  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, hasPendingReplacement, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
+  // the Excel take-off report (tenders.js): the measurement list as GET /tenders/:id/measurements returns it, and the
+  // tender's drawings (not a pending replacement) with their page calibration scale and number of calibrated regions
+  const reportData = t => ({
+    list: tenderMeasurements(t),
+    drawings: db.prepare(`SELECT d.*, (SELECT c.scale FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NULL) AS page_scale,
+      (SELECT COUNT(*) FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NOT NULL) AS regions FROM drawings d WHERE d.tender_id=? AND d.pending=0 ORDER BY d.id`).all(t.id),
+  });
+  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, hasPendingReplacement, reportData, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
 
   // ---- upload: stream to a temp file while hashing; 413 the moment the limit is passed -----------------------
   // a received file is held until its drawing row is written; a file that ends with no drawing row (the tender was

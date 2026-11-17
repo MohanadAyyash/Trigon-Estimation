@@ -2887,6 +2887,123 @@ server.listen(0, async () => {
       }
     }
 
+    // ---- batch 4 Task 5: the Excel take-off report (GET /tenders/:id/takeoff.xlsx?lang=ar|en), any reader ------------------
+    {
+      const { makePdf, PDF_PAGES } = require('./test/fixtures/make-takeoff.js');
+      const { writeXlsx, readXlsx } = require('./lib/xlsx.js');
+      const TF = require('./lib/takeoff/formula.js'), I18N = require('./public/i18n.js');
+      const tr = lang => k => I18N[lang][k];
+      const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
+      const T = (await ok(call('POST', 'tenders', { title: 'Test Take-off Report', ref: 'TR-01', kind: 'rta' }, qs), 'tender')).id;
+      const BOQ = { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'FAKE SECTION', null, null], ['1.1', 'Fake imported paving', 'm2', 100]] }]).toString('base64'),
+        sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } };
+      await ok(call('POST', `tenders/${T}/import`, BOQ, qs), 'import');
+      const rowsOf = () => ok(call('GET', `tenders/${T}/rows`, null, viewer), 'rows');
+      const rI = (await rowsOf()).find(r => r.description === 'Fake imported paving').id;
+      const rT = (await ok(call('POST', `tenders/${T}/rows`, { no: '2.1', description: 'Fake kerb', unit: 'm' }, qs), 'take-off row')).id;
+      await ok(call('POST', `tenders/${T}/rows/${rT}/lines`, { description: 'fake extra', l: 2 }, qs), 'line');
+      // a PDF page at 0.05 m/pt: 5 m on the kerb, a 1 m deduction, a 25 m2 rectangle on the imported row
+      const pdfUp = await upload(T, 'Fake report sheet', makePdf(), qs);
+      const [P1] = (await ok(call('POST', `drawings/${pdfUp.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages')).drawings.map(x => x.id);
+      await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'calibrate');
+      const manual = b => ok(call('POST', `drawings/${P1}/measurements`, { tool: 'manual', ...b }, qs), 'manual');
+      const mL = await manual({ row_id: rT, geom: { tool: 'line', pts: [[0, 100], [100, 100]] }, label: 'Fake kerb north' });
+      const mD = await manual({ row_id: rT, geom: { tool: 'line', pts: [[0, 200], [20, 200]] }, deduct: true });
+      const mR = await manual({ row_id: rI, geom: { tool: 'rect', p1: [200, 200], p2: [300, 300] } });
+      // a DXF in mm: the KERB layer's open length (5 m) on the kerb row
+      const dx = await upload(T, 'Fake report plan', Buffer.from(FIXTURE), qs);
+      assert.strictEqual((await waitDone(dx.j.id, qs)).status, 'ready');
+      await ok(call('PUT', `drawings/${dx.j.id}/units`, { units: 'mm' }, qs), 'units');
+      const mK = await ok(call('POST', `drawings/${dx.j.id}/measurements`, { row_id: rT, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', factor: 2 }, qs), 'dxf');
+      // an older version of the plan, replaced by it (history); one measurement flagged for review
+      const old = await upload(T, 'Fake report plan v0', Buffer.from(FIXTURE), qs);
+      await waitDone(old.j.id, qs);
+      db.prepare('UPDATE drawings SET replaced_by=?, rev=1 WHERE id=?').run(dx.j.id, old.j.id); db.prepare('UPDATE drawings SET rev=2 WHERE id=?').run(dx.j.id);
+      db.prepare('UPDATE measurements SET review_needed=1 WHERE id=?').run(mL.id);
+
+      const get = async (q, ck = viewer) => { const r = await fetch(base + `tenders/${T}/takeoff.xlsx` + q, { headers: { cookie: ck } }); return { s: r.status, h: r.headers, b: Buffer.from(await r.arrayBuffer()) }; };
+      // refusals
+      assert.strictEqual((await get('?lang=en', '')).s, 401, 'no session');
+      assert.strictEqual((await get('?lang=fr')).s, 400, 'lang must be ar or en');
+      assert.strictEqual((await fetch(base + 'tenders/999999/takeoff.xlsx', { headers: { cookie: viewer } })).status, 404);
+      // a viewer downloads it
+      const en = await get('?lang=en');
+      assert.strictEqual(en.s, 200, en.b.toString());
+      assert.strictEqual(en.h.get('content-type'), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      assert.strictEqual(en.h.get('content-disposition'), 'attachment; filename="tender-TR-01-rev1-takeoff-DRAFT.xlsx"');
+      const wb = readXlsx(en.b);
+      assert.deepStrictEqual(wb.sheets.map(x => [x.name, !!x.rtl]), [['Measurements', false], ['Rows', false], ['Drawings', false]]);
+      const [SM, SR, SD] = wb.sheets;
+      // header: the tender, its ref, the date it was made, and the draft label on every sheet
+      for (const sh of wb.sheets) {
+        const top = sh.rows.slice(0, 4).flat();
+        assert.ok(top.includes('Test Take-off Report') && top.includes('TR-01'), sh.name + ': tender in the header');
+        assert.ok(top.includes('DRAFT — NOT APPROVED') && top.includes('مسودة — غير معتمدة'), sh.name + ': draft label');
+        assert.ok(top.some(v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(v)), sh.name + ': generation date');
+      }
+      // a table: the row whose first cell is the first heading; cells by heading
+      const tableOf = (sh, first) => {
+        const hi = sh.rows.findIndex(r => r[0] === first);
+        assert.ok(hi >= 0, sh.name + ': heading row');
+        const heads = sh.rows[hi];
+        return sh.rows.slice(hi + 1).filter(r => r.length).map(r => Object.fromEntries(heads.map((h, i) => [h, r[i] ?? null])));
+      };
+      // Measurements: the list's own formula text and stored qty, as numbers
+      const list = await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list');
+      const all = [...list.measurements, ...list.unlinked];
+      const mt = tableOf(SM, 'ID');
+      assert.deepStrictEqual(mt.map(x => x.ID).sort((a, b) => a - b), all.map(m => m.id).sort((a, b) => a - b), 'every measurement once');
+      for (const m of all) {
+        const x = mt.find(y => y.ID === m.id);
+        assert.strictEqual(x.Formula, TF.formulaText(m, tr('en')), 'formula text = the list: ' + m.id);
+        assert.strictEqual(x.Qty, m.qty, 'stored qty'); assert.strictEqual(typeof x.Qty, 'number');
+        assert.strictEqual(x.Unit, m.qty_unit);
+        assert.strictEqual(x['Created by'], 'qs1');
+      }
+      const byId = id => mt.find(y => y.ID === id);
+      assert.strictEqual(byId(mL.id).Formula, 'length 100.00 pt × 0.05 m/pt = 5.00 m');
+      assert.strictEqual(byId(mD.id).Formula, 'length 20.00 pt × 0.05 m/pt = 1.00 m × −1 = -1.00 m');
+      assert.strictEqual(byId(mK.id).Formula, 'open length 5.00 m × factor 2 = 10.00 m');
+      assert.deepStrictEqual([byId(mL.id).Drawing, byId(mL.id).Page, byId(mL.id).Label, byId(mL.id)['Row no.'], byId(mL.id)['Row description']],
+        [db.prepare('SELECT name FROM drawings WHERE id=?').get(P1).name, 1, 'Fake kerb north', '2.1', 'Fake kerb']);
+      assert.deepStrictEqual([byId(mK.id).Drawing, byId(mK.id).Rev, byId(mK.id).Tool, byId(mK.id).Measure, byId(mK.id)['Calibration / units']],
+        ['Fake report plan', 2, 'DXF layer: KERB', 'open length', 'drawing units mm']);
+      assert.strictEqual(byId(mL.id)['Calibration / units'], 'page calibration');
+      assert.deepStrictEqual([byId(mL.id)['Review needed'], byId(mK.id)['Review needed'], byId(mD.id).Deduction, byId(mL.id).Deduction], ['Yes', null, 'Yes', null]);
+      assert.strictEqual(byId(mR.id).Tool, 'drawn: Rectangle');
+      // Rows: the tender API's row qty and measured qty, never recomputed
+      const api = await rowsOf(), rt = tableOf(SR, 'No.');
+      const apiT = api.find(r => r.id === rT), apiI = api.find(r => r.id === rI);
+      const xT = rt.find(x => x.Description === 'Fake kerb'), xI = rt.find(x => x.Description === 'Fake imported paving');
+      assert.strictEqual(xT.Total, apiT.qty, 'take-off total = the API row qty'); assert.ok(Math.abs(apiT.qty - 16) < 1e-9, 'kerb 2 + 5 − 1 + 10');
+      assert.strictEqual(xT['From measurements'], apiT.measured_qty); assert.strictEqual(xT['From lines'], 2);
+      assert.deepStrictEqual([xT.Source, xT.Unit, xT['Client qty'], xT.Measured, xT['Difference %']], ['take-off', 'm', null, null, null]);
+      assert.deepStrictEqual([xI.Source, xI.Unit, xI['Client qty'], xI.Total, xI['From lines']], ['client BOQ', 'm2', 100, null, null]);
+      assert.strictEqual(xI.Measured, apiI.measured_qty); assert.strictEqual(xI['Difference %'], apiI.measured_diff_pct);
+      assert.ok(Math.abs(apiI.measured_diff_pct + 75) < 1e-9, '25 m2 vs 100 m2');
+      assert.ok(rt.some(x => x.Description === 'FAKE SECTION' && x.Total === null), 'heading listed, no numbers');
+      // Drawings: name, kind, rev, page, units/scale, short sha256, uploaded by/at, replaced by
+      const dt = tableOf(SD, 'Drawing'), dRow = id => db.prepare('SELECT * FROM drawings WHERE id=?').get(id);
+      const xd = dt.find(x => x.Drawing === 'Fake report plan'), xo = dt.find(x => x.Drawing === 'Fake report plan v0'), xp = dt.find(x => x.Drawing === dRow(P1).name && x.Page === 1);
+      assert.deepStrictEqual([xd.Kind, xd.Rev, xd['Units / scale'], xd['SHA-256 (short)'], xd['Uploaded by'], xd['Replaced by']], ['dxf', 2, 'mm', dRow(dx.j.id).sha256.slice(0, 12), 'qs1', null]);
+      assert.strictEqual(xd['Uploaded at'], dRow(dx.j.id).created);
+      assert.strictEqual(xo['Replaced by'], 'Fake report plan (Rev 2)');
+      assert.deepStrictEqual([xp.Kind, xp['Units / scale']], ['pdf', 'Page: 1 pt = 0.05 m']);
+      // Arabic: right-to-left sheets, Arabic headings, the formula in Arabic as the Arabic list shows it
+      const ar = readXlsx((await get('?lang=ar')).b);
+      assert.deepStrictEqual(ar.sheets.map(x => [x.name, x.rtl]), [['القياسات', true], ['البنود', true], ['المخططات', true]]);
+      const amt = tableOf(ar.sheets[0], I18N.ar.rp_id);
+      assert.ok(I18N.ar.rp_formula in amt[0] && I18N.ar.rp_qty in amt[0], 'Arabic headings');
+      for (const m of all) assert.strictEqual(amt.find(y => y[I18N.ar.rp_id] === m.id)[I18N.ar.rp_formula], TF.formulaText(m, tr('ar')), 'AR formula = the AR list');
+      assert.ok(TF.formulaText(all.find(m => m.id === mK.id), tr('ar')).startsWith('طول مفتوح'), 'Arabic words');
+      // not a draft once approved: no label, no -DRAFT in the name
+      db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
+      const ap = await get('?lang=en');
+      assert.strictEqual(ap.h.get('content-disposition'), 'attachment; filename="tender-TR-01-rev1-takeoff.xlsx"');
+      assert.ok(!readXlsx(ap.b).sheets[0].rows.flat().includes('DRAFT — NOT APPROVED'), 'approved: no draft label');
+      assert.strictEqual(readXlsx((await get('')).b).sheets[0].name, 'Measurements', 'English by default');
+    }
+
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------
     {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-restart-'));

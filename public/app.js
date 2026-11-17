@@ -346,6 +346,8 @@
     if (ready) out.push(a('client', 'xlsx', t('export_client_xlsx')), a('client', 'csv', t('export_client_csv')));
     else out.push(h('span', { class: 'button secondary disabled', title: t('export_client_blocked') }, t('export_client_xlsx')));
     if (canWrite()) out.push(a('internal', 'xlsx', t('export_internal_xlsx')), a('internal', 'csv', t('export_internal_csv')));
+    // the take-off report (any reader), in the screen's language
+    out.push(h('a', { class: 'button secondary', id: 'export-takeoff', href: `/api/tenders/${T.id}/takeoff.xlsx?lang=${lang}`, download: true, title: t('export_takeoff_title') }, t('export_takeoff_xlsx')));
     return h('span', { class: 'row wrap' }, out);
   }
 
@@ -1667,39 +1669,13 @@
       : m.tool === 'dxf_selection' ? [h('span', { class: 'm-sel' }, t('m_selection', { n: m.handles_count || 0 })), ' ',
       h('button', { class: 'small secondary m-show', onclick: () => showSelection(m) }, t('m_show')), selBlocks(m)]
       : [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
-    // spec 5.6: the formula with its inputs, "<metric> <base> <unit> × width w × depth d × factor f = qty unit" (width/depth
-    // only when given, factor only when not 1). A measurement saved before `base` was stored derives it from qty when every
-    // factor is known; otherwise only the qty is shown.
-    // a drawn shape (spec 5.6, batch 3): the shape in drawing/page units × the scale it used, then the batch 1 factors:
-    // "length 110.00 pt × 0.1 m/pt = 11.00 m × width 0.5 = 5.50 m2"; a deduction ends "× −1"
-    const manualHow = m => {
-      const u = m.drawing_kind === 'pdf' ? t('tv_unit_pt') : m.drawing_kind === 'image' ? t('tv_unit_px') : (m.drawing_units || '');
-      const extras = (fin(m.width) ? ' × ' + t('f_width') + ' ' + fmtQ(m.width) : '') + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '')
-        + (fin(m.factor) && m.factor !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(m.factor) : '') + (m.deduct ? ' × −1' : '');
-      const tail = extras && fin(m.qty) ? extras + ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : '';
-      if (!fin(m.base)) return metricLabel(m.metric) + (fin(m.qty) ? ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : '');
-      if (m.metric === 'count' || !fin(m.scale)) return metricLabel(m.metric) + ' ' + (m.metric === 'count' ? fmtQ(m.base) + ' nr' : fmt2(m.base) + (m.metric === 'area' ? ' m2' : ' m'))
-        + (tail || (fin(m.qty) && m.qty !== m.base ? ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : ''));
-      const shape = m.metric === 'area' ? fmt2(m.base / (m.scale * m.scale)) + ' ' + u + '² × (' + fmtScale(m.scale) + ' m/' + u + ')² = ' + fmt2(m.base) + ' m2'
-        : fmt2(m.base / m.scale) + ' ' + u + ' × ' + fmtScale(m.scale) + ' m/' + u + ' = ' + fmt2(m.base) + ' m';
-      return metricLabel(m.metric) + ' ' + shape + tail;
-    };
     // which calibration a drawn quantity used (page or region, and its verify %), or the DXF units
     const calLine = m => m.tool !== 'manual' || m.metric === 'count' ? null
       : m.calibration ? h('div', { class: 'small muted m-cal' }, !m.calibration.region ? t('m_cal_page') : fin(m.calibration.region_no) ? t('m_cal_region_n', { n: m.calibration.region_no }) : t('m_cal_region'),
         ' · ', verifiedTag(m.calibration), copiedTag(m.calibration))
       : m.drawing_kind === 'dxf' ? h('div', { class: 'small muted m-cal' }, t('m_cal_units', { u: m.drawing_units || '—' })) : null;
-    const how = m => {
-      if (m.tool === 'manual') return manualHow(m);
-      const w = m.width === null || m.width === undefined ? 1 : m.width, d = m.depth === null || m.depth === undefined ? 1 : m.depth, f = m.factor;
-      const known = [w, d, f].every(x => fin(x) && x > 0);
-      const base = fin(m.base) ? m.base : known && fin(m.qty) ? m.qty / (w * d * f) : null;
-      const tail = fin(m.qty) ? ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : '';
-      if (base === null) return metricLabel(m.metric) + tail;
-      const unit = m.metric === 'count' ? 'nr' : m.metric === 'area' ? 'm2' : 'm';
-      return metricLabel(m.metric) + ' ' + (m.metric === 'count' ? fmtQ(base) : fmt2(base)) + ' ' + unit + (fin(m.width) ? ' × ' + t('f_width') + ' ' + fmtQ(m.width) : '')
-        + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '') + (fin(f) && f !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(f) : '') + tail;
-    };
+    // spec 5.6: the formula with its inputs (lib/takeoff/formula.js: the same text as the Excel take-off report)
+    const how = m => window.TakeoffFormula.formulaText(m, t);
     const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null,
       m.mixed ? h('span', { class: 'tag' }, t('m_mixed')) : null, m.deduct ? h('span', { class: 'tag' }, t('m_deduct')) : null,
       m.review_needed ? h('span', { class: 'tag warn-tag m-review', title: t('m_check_title') }, t('m_check')) : null];

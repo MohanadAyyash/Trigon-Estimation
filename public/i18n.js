@@ -230,6 +230,16 @@ const I18N = {
     wc_unsupported_hatch_edge: 'Hatches with spline edges: not measured', wc_paper_space: 'Paper-space entities skipped (only model space is measured)',
     wc_xref: 'External references (xref) not included', wc_nonplanar: 'Shapes drawn on a tilted plane (not the plan view): not measured', wc_missing_block: 'Inserts of a block that is not defined',
     wc_z_ignored: 'Height (Z) differences ignored: measured in plan', wc_degenerate_arc: 'Arcs with a zero sweep angle: not measured', wc_possible_duplicate: 'Possible duplicate copies',
+    // Excel take-off report (batch 4 Task 5)
+    export_takeoff_xlsx: 'Take-off report (xlsx)', export_takeoff_title: 'Measurements, rows and drawings, with the formula of each quantity',
+    rp_sheet_measurements: 'Measurements', rp_sheet_rows: 'Rows', rp_sheet_drawings: 'Drawings', rp_title: 'Take-off report', rp_tender: 'Tender', rp_ref: 'Ref',
+    rp_rev: 'Rev', rp_status: 'Status', rp_generated: 'Generated', rp_id: 'ID', rp_drawing: 'Drawing', rp_page: 'Page', rp_label: 'Label', rp_tool: 'Tool',
+    rp_measure: 'Measure', rp_row_no: 'Row no.', rp_row_desc: 'Row description', rp_formula: 'Formula', rp_qty: 'Qty', rp_unit: 'Unit', rp_deduct: 'Deduction',
+    rp_cal: 'Calibration / units', rp_review: 'Review needed', rp_created_by: 'Created by', rp_created_at: 'Created at', rp_unlinked: 'unlinked',
+    rp_tool_layer: 'DXF layer', rp_tool_blocks: 'DXF blocks', rp_no: 'No.', rp_desc: 'Description', rp_source: 'Source', rp_src_takeoff: 'take-off',
+    rp_src_import: 'client BOQ', rp_from_lines: 'From lines', rp_from_measurements: 'From measurements', rp_total: 'Total', rp_client_qty: 'Client qty',
+    rp_measured: 'Measured', rp_diff_pct: 'Difference %', rp_note: 'Note', rp_kind: 'Kind', rp_units_scale: 'Units / scale', rp_sha: 'SHA-256 (short)',
+    rp_uploaded_by: 'Uploaded by', rp_uploaded_at: 'Uploaded at', rp_replaced_by: 'Replaced by', rp_regions: 'calibrated regions: {n}',
   },
   ar: {
     app_title: 'تريجون للتسعير',
@@ -451,6 +461,16 @@ const I18N = {
     wc_unsupported_hatch_edge: 'تهشير بحواف منحنية (spline): لم يُقَس', wc_paper_space: 'عناصر فضاء الورق تم تجاهلها (يُقاس فضاء النموذج فقط)',
     wc_xref: 'المراجع الخارجية (xref) غير مضمّنة', wc_nonplanar: 'أشكال مرسومة على مستوى مائل (ليس المسقط الأفقي): لم تُقَس', wc_missing_block: 'إدراجات لبلوك غير معرّف',
     wc_z_ignored: 'فروق الارتفاع (Z) تم تجاهلها: القياس في المسقط', wc_degenerate_arc: 'أقواس بزاوية صفرية: لم تُقَس', wc_possible_duplicate: 'نسخ مكررة محتملة',
+    // تقرير الكميات (Excel) (الدفعة 4، المهمة 5)
+    export_takeoff_xlsx: 'تقرير الكميات (xlsx)', export_takeoff_title: 'القياسات والبنود والمخططات، مع معادلة كل كمية',
+    rp_sheet_measurements: 'القياسات', rp_sheet_rows: 'البنود', rp_sheet_drawings: 'المخططات', rp_title: 'تقرير الكميات', rp_tender: 'المناقصة', rp_ref: 'المرجع',
+    rp_rev: 'الإصدار', rp_status: 'الحالة', rp_generated: 'أُعدّ التقرير في', rp_id: 'الرقم التعريفي', rp_drawing: 'المخطط', rp_page: 'الصفحة', rp_label: 'الوصف', rp_tool: 'الأداة',
+    rp_measure: 'القياس', rp_row_no: 'رقم البند', rp_row_desc: 'وصف البند', rp_formula: 'المعادلة', rp_qty: 'الكمية', rp_unit: 'الوحدة', rp_deduct: 'خصم',
+    rp_cal: 'المعايرة / الوحدات', rp_review: 'يحتاج مراجعة', rp_created_by: 'أنشأه', rp_created_at: 'تاريخ الإنشاء', rp_unlinked: 'غير مربوط',
+    rp_tool_layer: 'طبقة DXF', rp_tool_blocks: 'بلوكات DXF', rp_no: 'رقم', rp_desc: 'الوصف', rp_source: 'المصدر', rp_src_takeoff: 'حصر كميات',
+    rp_src_import: 'BOQ العميل', rp_from_lines: 'من الأسطر', rp_from_measurements: 'من القياسات', rp_total: 'الإجمالي', rp_client_qty: 'كمية العميل',
+    rp_measured: 'المقيس', rp_diff_pct: 'الفرق %', rp_note: 'ملاحظة', rp_kind: 'النوع', rp_units_scale: 'الوحدات / المقياس', rp_sha: 'SHA-256 (مختصر)',
+    rp_uploaded_by: 'رفعه', rp_uploaded_at: 'تاريخ الرفع', rp_replaced_by: 'استُبدل بـ', rp_regions: 'مناطق معايَرة: {n}',
   },
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = I18N;

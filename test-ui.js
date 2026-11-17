@@ -16,6 +16,8 @@ assert.strictEqual(nonLiteral, null, 't() must be called with a literal key: ' +
 const used = [...new Set([...app.matchAll(/\bt\('([^']+)'/g)].map(m => m[1]))];
 assert.ok(used.length > 50, 'app.js uses t() keys');
 for (const k of used) for (const l of ['en', 'ar']) assert.ok(typeof I18N[l][k] === 'string' && I18N[l][k].trim(), `key "${k}" missing in ${l}`);
+// the formula text (lib/takeoff/formula.js, shared by the measurement list and the Excel report) reads these keys
+for (const k of require('./lib/takeoff/formula.js').KEYS) for (const l of ['en', 'ar']) assert.ok(typeof I18N[l][k] === 'string' && I18N[l][k].trim(), `formula key "${k}" missing in ${l}`);
 assert.deepStrictEqual(Object.keys(I18N.ar).sort(), Object.keys(I18N.en).sort(), 'ar and en have the same keys');
 // batch-2 carry-over: the imperative of «عدّ» is «عُدّ» (not «اعدّ»)
 assert.ok(I18N.ar.tv_confirm_mixed.includes('عُدّ') && !I18N.ar.tv_confirm_mixed.includes('اعدّ'), 'AR tv_confirm_mixed: ' + I18N.ar.tv_confirm_mixed);
@@ -117,6 +119,7 @@ server.listen(0, async () => {
     await page.goto(`${origin}/#/tender/${full}/summary`);
     await page.waitForSelector(`#summary[data-tender="${full}"] #num-P`);
     assert.strictEqual(await page.$('#price-banner'), null, 'complete price: no partial banner');
+    assert.strictEqual(await page.getAttribute('#export-takeoff', 'href'), `/api/tenders/${full}/takeoff.xlsx?lang=en`, 'take-off report link, English');
     assert.ok(await page.isVisible('#newer-banner'), 'newer snapshot banner');
     const pr = (await call('GET', `tenders/${full}/price`, null, admin)).j;
     const shownP = (await page.textContent('#num-P')).trim();
@@ -1062,6 +1065,8 @@ server.listen(0, async () => {
       await page.waitForSelector(DO + ' #rv-table');
       const arRow = await page.textContent(`${DO} #rv-table tr[data-measurement="${mR.id}"]`);
       assert.ok(arRow.includes(I18N.ar.rv_st_blocked) && arRow.includes(I18N.ar.rv_r_layer_missing), 'Arabic status and reason: ' + arRow);
+      assert.strictEqual(await page.getAttribute('#export-takeoff', 'href'), `/api/tenders/${ro}/takeoff.xlsx?lang=ar`, 'take-off report link, Arabic');
+      assert.strictEqual((await page.textContent('#export-takeoff')).trim(), I18N.ar.export_takeoff_xlsx);
       await page.click('#lang-toggle'); await page.waitForFunction(() => document.dir === 'ltr');
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
@@ -1271,7 +1276,7 @@ server.listen(0, async () => {
     // ---- manual measuring and calibration tools (batch 3 Task 6) ----------------------------------------------------
     {
       const { makePdf } = require('./test/fixtures/make-takeoff.js');
-      for (const f of ['/viewer/tools.js', '/lib/takeoff/manual.js']) assert.ok(html.includes('src="' + f + '"'), 'index.html loads ' + f);
+      for (const f of ['/viewer/tools.js', '/lib/takeoff/manual.js', '/lib/takeoff/formula.js']) assert.ok(html.includes('src="' + f + '"'), 'index.html loads ' + f);
       const mt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Measure' }, admin), 'measure tender')).id;
       const rowM = (await ok(call('POST', `tenders/${mt}/rows`, { no: '1', description: 'Test kerb line', unit: 'm' }, admin), 'm row')).id;
       const rowA = (await ok(call('POST', `tenders/${mt}/rows`, { no: '2', description: 'Test paving', unit: 'm2' }, admin), 'm2 row')).id;

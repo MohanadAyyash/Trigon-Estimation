@@ -63,6 +63,17 @@ assert.throws(() => readXlsx(buildZip([{ name: 'xl/workbook.xml', data: WB(['S']
 const ar = [['البند', 'الوصف', 'الكمية'], ['١', 'رصف أحجار البردورة — مم', 12], ['2', '  padded  ', 'line1\nline2 & <b> "q" \'s\'']];
 assert.deepStrictEqual(readXlsx(writeXlsx([{ name: 'جدول الكميات', rows: ar }])).sheets, [{ name: 'جدول الكميات', rows: ar }]);
 
+// 5b. right-to-left sheets (Arabic reports): <sheetView rightToLeft="1">, read back as rtl: true; a left-to-right sheet has no rtl key
+const rtl = readXlsx(writeXlsx([{ name: 'القياسات', rtl: true, rows: [['الكمية', 12.5]] }, { name: 'Rows', rows: [['Qty', 1]] }]));
+assert.deepStrictEqual(rtl.sheets, [{ name: 'القياسات', rtl: true, rows: [['الكمية', 12.5]] }, { name: 'Rows', rows: [['Qty', 1]] }]);
+const view = v => readXlsx(buildZip([{ name: 'xl/workbook.xml', data: WB(['S']) }, { name: 'xl/_rels/workbook.xml.rels', data: RELS(1) },
+  { name: 'xl/worksheets/sheet1.xml', data: SHEET('').replace('<sheetData>', `<sheetViews>${v}</sheetViews><sheetData>`) }])).sheets[0];
+assert.strictEqual(view('<sheetView workbookViewId="0" rightToLeft="1"/>').rtl, true, 'a file saved by Excel with RTL');
+assert.strictEqual(view('<sheetView rightToLeft="true" workbookViewId="0"></sheetView>').rtl, true);
+assert.strictEqual('rtl' in view('<sheetView rightToLeft="0" workbookViewId="0"/>'), false);
+assert.strictEqual('rtl' in view('<sheetView workbookViewId="0"/>'), false);
+assert.throws(() => writeXlsx([{ name: 'S', rtl: 'yes', rows: [] }]), /rtl must be true or false/);
+
 // 6. errors
 assert.throws(() => readXlsx(Buffer.from('hello, definitely not a zip')), /^Error: not an xlsx file$/);
 assert.throws(() => readXlsx(Buffer.alloc(0)), /not an xlsx file/);
