@@ -12,6 +12,7 @@ const { PARSER_VERSION } = require('../lib/dxf/summary.js');
 const { imageSize } = require('../lib/takeoff/imagesize.js');
 const calib = require('../lib/takeoff/calib.js');
 const manual = require('../lib/takeoff/manual.js');
+const compare = require('../lib/takeoff/compare.js');
 
 const MAX_QTY = 1e12;                          // the same cap as an imported or edited row qty (tenders.js MAX)
 const MAX_BYTES = 100 * 1024 * 1024;           // the only route above the 20 MB JSON limit (DXF and PDF)
@@ -56,6 +57,10 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   // points, image pixels), the PDF page /Rotate, and for pages 2..n the drawing row of page 1 (same file)
   // page_x0/page_y0 (R16): a PDF page box's lower-left corner in user space (page.view[0], [1]); points stay absolute
   for (const [c, type] of [['page', 'INTEGER'], ['page_w', 'REAL'], ['page_h', 'REAL'], ['rotation', 'INTEGER'], ['parent_id', 'INTEGER'], ['page_x0', 'REAL NOT NULL DEFAULT 0'], ['page_y0', 'REAL NOT NULL DEFAULT 0']])
+    if (!db.prepare('PRAGMA table_info(drawings)').all().some(x => x.name === c)) db.exec(`ALTER TABLE drawings ADD COLUMN ${c} ${type}`);
+  // a new version of a drawing (batch 4, spec 6.5): pending = 1 until it is accepted or cancelled; replaces_id = the drawing
+  // row it replaces (a PDF page row: the old row of the same page number, NULL for a page the old file did not have)
+  for (const [c, type] of [['pending', 'INTEGER NOT NULL DEFAULT 0'], ['replaces_id', 'INTEGER']])
     if (!db.prepare('PRAGMA table_info(drawings)').all().some(x => x.name === c)) db.exec(`ALTER TABLE drawings ADD COLUMN ${c} ${type}`);
   // 1 = saved with confirm_uom: the user accepted that qty_unit differs from the row's unit
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'uom_confirmed')) db.exec('ALTER TABLE measurements ADD COLUMN uom_confirmed INTEGER NOT NULL DEFAULT 0');
@@ -116,6 +121,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const drawingRow = id => id === null ? null : db.prepare('SELECT * FROM drawings WHERE id=?').get(id);
   const mustDraft = t => { if (t.status !== 'draft') bad(`tender is ${t.status}: only a draft can be changed`, 409); };
   const hasUnit = u => typeof u === 'string' && Object.hasOwn(UNIT_TO_M, u);
+  // Review Focus 3: while a new version of a drawing waits to be accepted or cancelled, nothing on the old one (any page of
+  // it) is measured, edited, deleted, relinked, calibrated or changed in units, so the compare it was reviewed against
+  // stays true; and nothing is measured or calibrated on the pending one (its measurements arrive by accept).
+  const pendingFor = d => db.prepare('SELECT id FROM drawings WHERE replaces_id=? AND pending=1 AND parent_id IS NULL').get(d.parent_id ?? d.id) || null;
+  const notReplacing = d => { if (pendingFor(d)) bad('a replacement is pending: accept or cancel it first', 409); };
+  const notPending = d => { if (d.pending) bad('this drawing is a pending replacement: accept or cancel it first', 409); };
+  const canMeasure = d => { notPending(d); notReplacing(d); };
 
   // ---- hooks for tenders.js (R1). Callers run them inside their own transaction. ------------------------------
   const hasMeasurements = rowId => !!db.prepare('SELECT 1 FROM measurements WHERE row_id=? LIMIT 1').get(rowId);
@@ -136,12 +148,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     return n;
   };
   // revise: copy the drawings rows (same sha256, no file copy), their calibrations and the measurements with drawing,
-  // row and calibration ids remapped
+  // row and calibration ids remapped. A pending replacement (not accepted) is not copied: the Rev has accepted history only.
   const cloneForTender = (oldTid, newTid, rowIdMap) => {
     const dmap = new Map(), parsing = [];
     const insD = db.prepare(`INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,page,page_w,page_h,rotation,page_x0,page_y0,parent_id,rev,replaced_by,created,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,NULL,?,?)`);
-    const olds = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(oldTid);
+    const olds = db.prepare('SELECT * FROM drawings WHERE tender_id=? AND pending=0 ORDER BY id').all(oldTid);
     for (const d of olds) {
       const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.failed_version, d.page, d.page_w, d.page_h, d.rotation, d.page_x0, d.page_y0,
         d.rev, d.created, d.created_by).lastInsertRowid);
@@ -149,6 +161,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
     }
     for (const d of olds) if (d.replaced_by !== null && dmap.has(d.replaced_by)) db.prepare('UPDATE drawings SET replaced_by=? WHERE id=?').run(dmap.get(d.replaced_by), dmap.get(d.id));
+    for (const d of olds) if (d.replaces_id !== null && dmap.has(d.replaces_id)) db.prepare('UPDATE drawings SET replaces_id=? WHERE id=?').run(dmap.get(d.replaces_id), dmap.get(d.id));
     // a PDF page row keeps its page 1 row (never detached silently)
     for (const d of olds) if (d.parent_id !== null) {
       if (!dmap.has(d.parent_id)) bad(`drawing ${d.id}: its page 1 is not in this tender`, 409);
@@ -157,7 +170,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     // calibrations in id order, so the lower-id rule between regions sharing an edge picks the same one in the copy
     const cmap = new Map();
     const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
-    for (const c of db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? ORDER BY c.id').all(oldTid))
+    for (const c of db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? AND d.pending=0 ORDER BY c.id').all(oldTid))
       cmap.set(c.id, Number(insC.run(dmap.get(c.drawing_id), c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.verify_pct, c.created, c.created_by).lastInsertRowid));
     const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,geom,deduct,calibration_id,created,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
@@ -178,7 +191,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (parsing.length) setTimeout(() => { for (const [id, sha] of parsing) { const d = drawingRow(id); if (d && d.sha256 === sha && d.status === 'parsing') startParse(id, sha); } }, 0);
     return { drawings: dmap.size, measurements: n, calibrations: cmap.size };
   };
-  // delete a draft tender: its drawings and measurements rows go too (files stay: they are shared by sha256)
+  // delete a draft tender: its drawings (pending replacements too) and measurements rows go too (files stay: they are
+  // shared by sha256)
   const deleteForTender = tid => ({
     handles: Number(db.prepare('DELETE FROM measurement_handles WHERE measurement_id IN (SELECT id FROM measurements WHERE tender_id=?)').run(tid).changes),
     measurements: Number(db.prepare('DELETE FROM measurements WHERE tender_id=?').run(tid).changes),
@@ -391,7 +405,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   }
 
   // ---- HTTP -----------------------------------------------------------------------------------------------
-  async function upload(req, res, url, t, me) {
+  // old: the drawing row this upload is a new version of (POST /drawings/:id/replace), null for a new drawing
+  async function upload(req, res, url, t, me, old = null) {
     // every refusal here comes before the body is read; server.js closes the connection so the client stops sending
     need(me, 'admin', 'qs'); mustDraft(t);
     const name = String(url.searchParams.get('name') || '').trim();
@@ -400,6 +415,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (Number(req.headers['content-length']) > MAX_BYTES) bad('the drawing is larger than 100 MB', 413);
     const named = NAME_EXT[(/\.([a-z]+)$/i.exec(name) || [])[1]?.toLowerCase()] || null;
     if ((named === 'png' || named === 'jpg') && Number(req.headers['content-length']) > MAX_IMAGE_BYTES) bad('the image is larger than 50 MB', 413);
+    if (old && named) sameFamily(old, named);
     // a DXF, a PDF (status 'pages' until the browser registers them) or a PNG/JPEG image (one page, ready), by magic bytes
     const got = await receive(req, named);
     let used = false;
@@ -408,6 +424,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       const stillDraft = () => { const cur = tenderRow(t.id); if (!cur) bad('tender not found', 404); mustDraft(cur); };
       stillDraft();
       const kind = got.ext === 'dxf' ? 'dxf' : got.ext === 'pdf' ? 'pdf' : 'image';
+      if (old) sameFamily(old, got.ext);
       // the same file already parsed (and not being parsed again) -> reuse its cache, ready at once
       const prev = kind === 'dxf' && !inflight.has(got.sha) && fs.existsSync(cacheFile(got.sha)) && await summaryCurrent(got.sha)
         ? db.prepare("SELECT suggested_units FROM drawings WHERE sha256=? AND status='ready' ORDER BY id DESC LIMIT 1").get(got.sha) : null;
@@ -415,16 +432,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       const img = kind === 'image' ? got.size : null;
       const id = tx(() => {
         stillDraft();
-        const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,page,page_w,page_h,rotation,rev,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?)')
+        const o = old ? replaceable(old.id) : null;   // still replaceable once the body is in (one pending replacement)
+        const did = Number(db.prepare('INSERT INTO drawings(tender_id,kind,name,sha256,bytes,suggested_units,status,page,page_w,page_h,rotation,rev,pending,replaces_id,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(t.id, kind, name, got.sha, got.bytes, prev ? prev.suggested_units : null, status, img ? 1 : null, img ? img.width : null, img ? img.height : null, img ? 0 : null,
-            new Date().toISOString(), me.username).lastInsertRowid);
-        audit(me, 'upload', 'drawings', did, { name, bytes: got.bytes, sha256: got.sha, ...(kind !== 'dxf' ? { kind } : {}), ...(img ? { width: img.width, height: img.height } : {}) });
+            o ? o.rev + 1 : 1, o ? 1 : 0, o ? o.id : null, new Date().toISOString(), me.username).lastInsertRowid);
+        audit(me, 'upload', 'drawings', did, { name, bytes: got.bytes, sha256: got.sha, ...(kind !== 'dxf' ? { kind } : {}), ...(img ? { width: img.width, height: img.height } : {}), ...(o ? { replaces: o.id } : {}) });
         return did;
       });
       used = true;
       if (status === 'parsing') startParse(id, got.sha);
       return reply(res, 202, { id });
     } finally { release(got.sha, used, got.ext); }
+  }
+
+  // ---- a new version of a drawing (batch 4, spec 6.5): uploaded as a pending row, compared, then accepted or cancelled ----
+  // a DXF is replaced by a DXF; a PDF or an image by a PDF or an image (ext: the stored file type)
+  const sameFamily = (old, ext) => {
+    if ((old.kind === 'dxf') !== (ext === 'dxf')) bad(old.kind === 'dxf' ? 'a new version of a DXF drawing must be a DXF file' : 'a new version of a PDF or an image must be a PDF or an image');
+  };
+  // the drawing row `id` can take a new version: not pending itself, a whole drawing (a PDF by its first page), not
+  // replaced already, and no other replacement pending. Checked before the body is read and again in the upload's tx.
+  function replaceable(id) {
+    const o = drawingRow(id);
+    if (!o) bad('drawing not found', 404);
+    notPending(o);
+    if (o.parent_id !== null) bad('replace the whole PDF: use its first page');
+    if (o.replaced_by !== null) bad('this drawing has been replaced already: replace its newest version', 409);
+    if (pendingFor(o)) bad('this drawing already has a pending replacement: accept or cancel it first', 409);
+    return o;
   }
 
   // POST /drawings/:id/pages { pages: [{ page, width, height, rotation }] }: what pdf.js read in the browser (the server
@@ -455,10 +490,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (!cur || cur.status !== 'pages') bad('the pages of this drawing are already registered', 409);
       const [p1] = pages, now = new Date().toISOString();
       db.prepare("UPDATE drawings SET status='ready', page=?, page_w=?, page_h=?, rotation=?, page_x0=?, page_y0=? WHERE id=? AND status='pages'").run(p1.page, p1.width, p1.height, p1.rotation, p1.x0, p1.y0, cur.id);
-      const ins = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,page_w,page_h,rotation,page_x0,page_y0,parent_id,rev,created,created_by) VALUES(?,'pdf',?,?,?,'ready',?,?,?,?,?,?,?,?,?,?)");
+      const ins = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,page_w,page_h,rotation,page_x0,page_y0,parent_id,rev,pending,replaces_id,created,created_by) VALUES(?,'pdf',?,?,?,'ready',?,?,?,?,?,?,?,?,?,?,?,?)");
+      // a pending new version: its page n row is pending too and replaces the old drawing's page n row (none: NULL)
+      const was = cur.pending && cur.replaces_id !== null ? drawingRow(cur.replaces_id) : null;
+      const oldPage = n => !was ? null : was.page === n ? was.id : (db.prepare('SELECT id FROM drawings WHERE parent_id=? AND page=?').get(was.id, n) || { id: null }).id;
       const out = [cur.id];
       for (const p of pages.slice(1))
-        out.push(Number(ins.run(cur.tender_id, pageName(cur.name, p.page), cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, p.x0, p.y0, cur.id, cur.rev, now, me.username).lastInsertRowid));
+        out.push(Number(ins.run(cur.tender_id, pageName(cur.name, p.page), cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, p.x0, p.y0, cur.id, cur.rev, cur.pending ? 1 : 0, oldPage(p.page), now, me.username).lastInsertRowid));
       audit(me, 'pages', 'drawings', cur.id, { pages: n });
       return out;
     });
@@ -568,13 +606,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     if (parts.length === 3 && method === 'POST') return calibrate(req, res, d, t, me);
     if (parts.length === 5 && parts[4] === 'verify' && method === 'POST') {
-      need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d);
+      need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d); canMeasure(d);
       const c = calibOf(d, parts[3]), b = await ctx.readBody(req);
       for (const k of Object.keys(b)) if (!['p1', 'p2', 'real', 'unit'].includes(k)) bad('unknown field: ' + k);
       const pct = calc(() => calib.verifyPct(c, b.p1, b.p2, b.real, b.unit)), warning = Math.abs(pct) > 1;
       onPage(d, [['p1', b.p1], ['p2', b.p2]]);
       tx(() => {
-        mustDraft(tenderRow(t.id));
+        mustDraft(tenderRow(t.id)); canMeasure(drawingRow(d.id));
         // the line checks this calibration only where it applies: both points resolve to it (the page outside every
         // region, a region inside it), as a measurement's first point would
         const cals = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(d.id), at = p => calib.calibrationFor(cals, p);
@@ -585,10 +623,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       return reply(res, 200, { pct, warning });
     }
     if (parts.length === 4 && method === 'DELETE') {
-      need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d);
+      need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d); canMeasure(d);
       const c = calibOf(d, parts[3]);
       tx(() => {
-        mustDraft(tenderRow(t.id));
+        mustDraft(tenderRow(t.id)); canMeasure(drawingRow(d.id));
         const cur = db.prepare('SELECT * FROM calibrations WHERE id=?').get(c.id);
         if (!cur) bad('calibration not found', 404);
         const n = calibrationUsers(cur.id);
@@ -607,6 +645,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   async function calibrate(req, res, d, t, me) {
     need(me, 'admin', 'qs'); mustDraft(t); rasterOnly(d);
     if (d.status !== 'ready') bad('register the pages of this PDF first', 409);
+    canMeasure(d);
     const b = await ctx.readBody(req);
     for (const k of Object.keys(b)) if (!CAL_FIELDS.includes(k)) bad('unknown field: ' + k);
     const apply = optBool(b, 'apply'), expect = cleanExpect(b, apply);
@@ -621,6 +660,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       mustDraft(tenderRow(t.id));
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready') bad('the drawing changed: try again', 409);
+      canMeasure(cur);
       let replaced;
       if (region === null) replaced = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? AND region IS NULL').get(d.id) || null;
       else {
@@ -713,6 +753,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         mustDraft(tenderRow(t.id));
         const cur = drawingRow(d.id);
         if (!cur || cur.status !== 'ready') bad(`drawing is ${cur ? cur.status : 'gone'}: units can be set once it is ready`, 409);
+        notReplacing(cur);   // the pending one itself takes its units (needed for the compare)
         if (cur.units !== before.units || cur.sha256 !== before.sha256 || unitInputs(d.id) !== seen) return null;
         const body = error => ({ error, from: cur.units, to: b.units, changes: listed(changes) });
         if (changes.length && !apply) conflictBody(body('unit change changes measured quantities'));
@@ -729,6 +770,81 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (out) return reply(res, 200, out);
     }
     bad('the drawing kept changing while its quantities were recomputed: try again', 409);
+  }
+
+  // ---- GET /drawings/:newId/compare (spec 6.5): every measurement of the old drawing against the pending new version, read
+  // only. Each new qty is computed by the code that created the measurement: a layer metric or block count from the new
+  // drawing's scaled layer table, a selection by totalling its handles on the new cache (select worker, selectionBase),
+  // all through dxfQty (dxfRescale); a manual shape by manualQty on its stored geometry (manualRescale) with the new
+  // drawing's units (DXF) or the calibration it was saved with, copied to the same page at accept (PDF/image). What
+  // matches and the status, reason and options come from lib/takeoff/compare.js.
+  async function compareReplacement(nd) {
+    const old = drawingRow(nd.replaces_id);
+    if (!old) bad('the drawing this version replaces is missing', 409);
+    const result = (ready, items, extra = {}) => ({ ready, ...extra, items, totals: { rows: compare.rowTotals(items) } });
+    const items = [];
+    if (nd.kind === 'dxf') {
+      // the units are pre-filled from the old drawing's (old_units); the user confirms them on the new one
+      const units = { needs_units: nd.units === null, old_units: old.units };
+      if (nd.status === 'failed') bad('the new version could not be read: ' + nd.error, 409);
+      if (nd.status !== 'ready') return result(false, [], units);
+      if (nd.units === null) return result(true, [], units);
+      const f = UNIT_TO_M[nd.units];
+      let layers = null;
+      const newLayers = async () => layers || (layers = scaledTable((await readSummary(nd.sha256)).raw, nd.units).layers);
+      for (const m of db.prepare('SELECT * FROM measurements WHERE drawing_id=? ORDER BY id').all(old.id)) {
+        let r;
+        if (m.tool === 'manual') r = { review: true, new_qty: m.metric === 'count' ? m.qty : manualRescale(m, { scale: f }).qty };
+        else if (m.tool === 'dxf_layer' || m.tool === 'dxf_blocks') {
+          r = (m.tool === 'dxf_layer' ? compare.layerMatch : compare.blockMatch)(await newLayers(), m);
+          if (r.base !== undefined) r = { new_qty: dxfRescale(m, r.base).qty };
+        } else if (m.tool === 'dxf_selection') r = await compareSelection(m, old, nd, f);
+        else cannotRescale(m);
+        items.push(compare.item(m, r));
+      }
+      return result(true, items, { needs_units: false });
+    }
+    // PDF / image: page n of the old file is page n of the new one
+    if (nd.status !== 'ready') return result(false, [], { needs_units: false });
+    const newPages = new Set(db.prepare('SELECT page FROM drawings WHERE id=? OR parent_id=?').all(nd.id, nd.id).map(x => x.page));
+    for (const m of db.prepare(`SELECT m.*, d.page AS on_page FROM measurements m JOIN drawings d ON d.id=m.drawing_id
+      WHERE d.id=? OR d.parent_id=? ORDER BY m.id`).all(old.id, old.id)) {
+      if (!newPages.has(m.on_page)) { items.push(compare.item(m, { reason: 'page_missing' })); continue; }
+      let qty = m.qty;
+      if (m.metric !== 'count') {
+        const c = m.calibration_id === null ? null : db.prepare('SELECT scale FROM calibrations WHERE id=? AND drawing_id=?').get(m.calibration_id, m.drawing_id);
+        if (!c) cannotRescale(m);
+        qty = manualRescale(m, c).qty;
+      }
+      items.push(compare.item(m, { review: true, new_qty: qty }));
+    }
+    return result(true, items, { needs_units: false });
+  }
+  // a selection on the new drawing: each stored handle must be there with its stored geomKey (compare.selectionMatch).
+  // All matched (and the same number of entities used) → its total on the new cache; otherwise blocked, with the qty of
+  // the handles that still match (keep_matched_qty; null when none). A stored row without a geomKey (saved before
+  // batch 2) takes its key from the old drawing's cache when that cache gives the stored selection back exactly;
+  // otherwise it never matches. Nothing is written.
+  async function compareSelection(m, old, nd, f) {
+    const stored = db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid').all(m.id).map(h => ({ ...h }));
+    const handles = stored.map(h => h.handle), total = hs => totalSelection(nd.sha256, hs, m.metric, !!m.nested);
+    if (stored.some(h => h.geom_key === null)) {
+      let o = null;
+      try { o = await totalSelection(old.sha256, handles, m.metric, !!m.nested); } catch (e) { if (!e.status) throw e; }
+      if (o && !o.unknown && o.used === m.handles_count) {
+        const k = new Map(o.used_handles.map((h, i) => [h, o.used_keys[i]]));
+        for (const h of stored) if (h.geom_key === null && k.has(h.handle)) h.geom_key = k.get(h.handle);
+      }
+    }
+    const sel = await total(handles);
+    const x = compare.selectionMatch(stored, new Map(sel.used_handles.map((h, i) => [h, sel.used_keys[i]])), sel.unknown);
+    if (x.all && sel.used === m.handles_count) return { new_qty: dxfRescale(m, selectionBase(sel.base, m.metric, f)).qty };
+    let keep = null;
+    if (x.matched.length) {
+      const k = await total(x.matched);
+      if (k.used) keep = dxfRescale(m, selectionBase(k.base, m.metric, f)).qty;
+    }
+    return { reason: x.reason || 'geometry_changed', keep_matched_qty: keep };
   }
 
   // the file's download name: the drawing name with its extension, percent-encoded (RFC 5987/8187: ' ( ) * too), so no
@@ -772,7 +888,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     return drawingRow(d.id);
   }
 
-  async function drawingApi(req, res, parts, me) {
+  async function drawingApi(req, res, url, parts, me) {
     const [, idStr, sub] = parts, method = req.method;
     let d = drawingRow(idOf(idStr));
     if (!d) bad('drawing not found', 404);
@@ -797,8 +913,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (sub === 'file' && parts.length === 3 && method === 'GET') return serveFile(req, res, d, me);
     if (sub === 'pages' && parts.length === 3 && method === 'POST') return registerPages(req, res, d, t, me);
     if (sub === 'calibrations' && parts.length >= 3 && parts.length <= 5) return calibrationApi(req, res, parts, d, t, me);
-    if (sub === 'units' && parts.length === 3 && method === 'PUT') { need(me, 'admin', 'qs'); mustDraft(t); dxfOnly(); return setUnits(req, res, d, t, me); }
+    if (sub === 'units' && parts.length === 3 && method === 'PUT') { need(me, 'admin', 'qs'); mustDraft(t); dxfOnly(); notReplacing(d); return setUnits(req, res, d, t, me); }
     if (sub === 'measurements' && parts.length === 3 && method === 'POST') return createMeasurement(req, res, d, t, me);
+    if (sub === 'replace' && parts.length === 3 && method === 'POST') { need(me, 'admin', 'qs'); mustDraft(t); return upload(req, res, url, t, me, replaceable(d.id)); }
+    if (sub === 'compare' && parts.length === 3 && method === 'GET') {
+      need(me, 'admin', 'qs', 'viewer');
+      if (!d.pending || d.parent_id !== null || d.replaces_id === null) bad('this drawing is not a pending replacement', 409);
+      return reply(res, 200, await compareReplacement(d));
+    }
     return false;
   }
 
@@ -961,6 +1083,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       mustDraft(tenderRow(t.id));
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
+      canMeasure(cur);
       // R14: a count does not depend on scale, so it needs no calibration (calibration_id NULL)
       let scale = null, cal = null;
       if (m.metric === 'count') { /* no scale */ }
@@ -1006,6 +1129,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (!cur) bad('measurement not found', 404);
       const d = drawingRow(cur.drawing_id);
       if (!d) bad('the drawing of this measurement is missing', 409);
+      canMeasure(d);
       const g = parseGeom(cur.geom);
       if (!g) bad(`the shape of measurement ${cur.id} cannot be read: delete it and measure again`, 409);
       const next = { ...cur, ...set };
@@ -1100,7 +1224,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const recompute = rowId => rowId === null ? null : ctx.tenders.recomputeTakeoffQty(rowId);
 
   async function createMeasurement(req, res, d, t, me) {
-    need(me, 'admin', 'qs'); mustDraft(t);
+    need(me, 'admin', 'qs'); mustDraft(t); canMeasure(d);
     const b = await ctx.readBody(req);
     if (b.tool === 'manual') return createManual(res, d, t, me, cleanManual(b));
     const m = cleanMeasure(b);
@@ -1140,6 +1264,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       // the table read above must still describe this drawing (units could change before the first measurement)
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
+      canMeasure(cur);
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap);
       const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,base,created,created_by)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, t.id, m.row_id, m.tool, m.layer, m.block, m.metric, m.nested ? 1 : 0, m.width, m.depth, m.factor, m.label, m.color,
@@ -1188,6 +1313,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       // the totals must still describe this drawing (units could change before the first measurement)
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
+      canMeasure(cur);
       const overlapping = overlapCount(m, d.sha256, t.id, -1);
       // exact copies within the selection, and copies of entities other selections on the row already measured
       const duplicates = sel.duplicates + crossDuplicates(m, d.sha256, t.id, -1);
@@ -1238,11 +1364,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     const t = tenderRow(m.tender_id);
     if (!t) bad('measurement not found', 404);
     mustDraft(t);
+    const md = drawingRow(m.drawing_id);
+    if (md) canMeasure(md);
     if (method === 'DELETE') {
       const out = tx(() => {
         mustDraft(tenderRow(t.id));
         const cur = db.prepare('SELECT * FROM measurements WHERE id=?').get(m.id);
         if (!cur) bad('measurement not found', 404);
+        const cd = drawingRow(cur.drawing_id);
+        if (cd) canMeasure(cd);
         db.prepare('DELETE FROM measurement_handles WHERE measurement_id=?').run(m.id);
         db.prepare('DELETE FROM measurements WHERE id=?').run(m.id);
         audit(me, 'measure_delete', 'measurements', m.id, summaryOf(cur));
@@ -1263,6 +1393,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         if (cur.row_id === rowId) bad('the measurement is already linked to this row');
         const d = drawingRow(cur.drawing_id);
         if (!d) bad('the drawing of this measurement is missing', 409);
+        canMeasure(d);
         const isSel = cur.tool === 'dxf_selection';
         const mv = { ...cur, row_id: rowId, ...(isSel ? { sel: storedSel(cur) } : {}) };
         const overlaps = overlapCount(mv, d.sha256, t.id, cur.id);
@@ -1320,11 +1451,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (parts[0] === 'tenders' && parts[2] === 'drawings' && parts.length === 3) {
       const t = tenderRow(idOf(parts[1]));
       if (!t) bad('tender not found', 404);
-      if (method === 'GET') { need(me, 'admin', 'qs', 'viewer'); return reply(res, 200, db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(t.id)); }
+      if (method === 'GET') {
+        need(me, 'admin', 'qs', 'viewer');
+        // a pending new version is not a drawing of the tender yet: it is shown under the row it replaces
+        const pend = new Map(db.prepare('SELECT * FROM drawings WHERE tender_id=? AND pending=1 AND replaces_id IS NOT NULL ORDER BY id').all(t.id).map(x => [x.replaces_id, x]));
+        return reply(res, 200, db.prepare('SELECT * FROM drawings WHERE tender_id=? AND pending=0 ORDER BY id').all(t.id).map(x => ({ ...x, pending_replacement: pend.get(x.id) || null })));
+      }
       if (method === 'POST') return upload(req, res, url, t, me);
       return false;
     }
-    if (parts[0] === 'drawings' && parts.length >= 2) return drawingApi(req, res, parts, me);
+    if (parts[0] === 'drawings' && parts.length >= 2) return drawingApi(req, res, url, parts, me);
     return false;
   }
 

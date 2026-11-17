@@ -258,4 +258,70 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
     assert.strictEqual(JSON.stringify(browser.manualQty(g, o)), JSON.stringify(node.manualQty(g, o)));
 }
 
+// ---- batch 4 Task 2: compare a measurement with the drawing that replaces it (lib/takeoff/compare.js), hand-built tables ----
+{
+  const C = require('./lib/takeoff/compare.js');
+  // the new drawing's layer table in metres (as scaledTable gives it): KERB kept, ASPHALT renamed PAVING, MH with one more MH1
+  const layers = [
+    { layer: 'KERB', open_length: 5, closed_perimeter: 0, area: 0, blocks: [] },
+    { layer: 'MH', open_length: 0, closed_perimeter: 0, area: 0, blocks: [{ name: 'MH1', top: 2, nested: 1 }, { name: 'MH2', top: 0, nested: 3 }, { name: 'GULLY', top: 1, nested: 0 }] },
+    { layer: 'PAVING', open_length: 0, closed_perimeter: 40, area: 100, blocks: [] },
+    { layer: 'TEXT', open_length: 0, closed_perimeter: 0, area: 0, blocks: [] },
+  ];
+  const m = (id, o) => ({ id, row_id: 1, tool: 'dxf_layer', label: null, qty: 5, qty_unit: 'm', metric: 'open_length', layer: 'KERB', block: null, nested: 0, ...o });
+  // same layer and metric → its base; the item is `same` when the qty is unchanged
+  assert.deepStrictEqual(C.layerMatch(layers, m(1)), { base: 5 });
+  let it = C.item(m(1), { new_qty: 5 });
+  assert.deepStrictEqual(it, { measurement_id: 1, row_id: 1, tool: 'dxf_layer', label: null, old_qty: 5, new_qty: 5, qty_unit: 'm', status: 'same', options: [] });
+  assert.strictEqual(C.item(m(1), { new_qty: 6 }).status, 'changed');
+  // layer renamed → blocked layer_missing, relink choices = the new layers with that metric > 0 (other names)
+  const asph = m(2, { layer: 'ASPHALT', metric: 'area', qty: 90, qty_unit: 'm2' });
+  assert.deepStrictEqual(C.layerMatch(layers, asph), { reason: 'layer_missing', relink_choices: ['PAVING'] });
+  it = C.item(asph, C.layerMatch(layers, asph));
+  assert.deepStrictEqual(it, { measurement_id: 2, row_id: 1, tool: 'dxf_layer', label: null, old_qty: 90, new_qty: null, qty_unit: 'm2', status: 'blocked', reason: 'layer_missing',
+    options: ['delete', 'relink'], relink_choices: ['PAVING'] });
+  // the layer is there but has none of the metric → blocked layer_empty (relink to one that has it)
+  assert.deepStrictEqual(C.layerMatch(layers, m(3, { layer: 'TEXT' })), { reason: 'layer_empty', relink_choices: ['KERB'] });
+  // nothing to relink to → delete only
+  const none = C.item(m(4, { layer: 'GONE', metric: 'closed_perimeter' }), C.layerMatch([layers[0]], m(4, { layer: 'GONE', metric: 'closed_perimeter' })));
+  assert.deepStrictEqual([none.status, none.reason, none.options, none.relink_choices], ['blocked', 'layer_missing', ['delete'], []]);
+  // block count changed → `changed`; nested adds the nested inserts
+  const blk = m(5, { tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count', qty: 1, qty_unit: 'nr' });
+  assert.deepStrictEqual(C.blockMatch(layers, blk), { base: 2 });
+  assert.deepStrictEqual(C.blockMatch(layers, { ...blk, nested: 1 }), { base: 3 });
+  assert.strictEqual(C.item(blk, { new_qty: 2 }).status, 'changed');
+  // a block gone from its layer → blocked block_missing, relink to the block names counted there (MH2 has nested inserts only)
+  const b2 = { ...blk, block: 'MH9' };
+  assert.deepStrictEqual(C.blockMatch(layers, b2), { reason: 'block_missing', relink_choices: ['GULLY', 'MH1'] });
+  assert.deepStrictEqual(C.blockMatch(layers, { ...b2, nested: 1 }), { reason: 'block_missing', relink_choices: ['GULLY', 'MH1', 'MH2'] });
+  assert.deepStrictEqual(C.blockMatch(layers, { ...b2, layer: 'NOPE' }), { reason: 'block_missing', relink_choices: [] });
+  assert.deepStrictEqual(C.item(b2, C.blockMatch(layers, b2)).options, ['delete', 'relink']);
+  // selection: matched by handle AND geomKey. One handle reused for different geometry → not matched, geometry_changed
+  const stored = [{ handle: 'A', geom_key: 'ka' }, { handle: 'B', geom_key: 'kb' }, { handle: 'C', geom_key: 'kc' }];
+  assert.deepStrictEqual(C.selectionMatch(stored, new Map([['A', 'ka'], ['B', 'kb'], ['C', 'kc']]), 0), { all: true, matched: ['A', 'B', 'C'], reason: null });
+  assert.deepStrictEqual(C.selectionMatch(stored, new Map([['A', 'ka'], ['B', 'kX'], ['C', 'kc']]), 0), { all: false, matched: ['A', 'C'], reason: 'geometry_changed' });
+  // a handle no longer in the drawing → handles_missing
+  assert.deepStrictEqual(C.selectionMatch(stored, new Map([['A', 'ka'], ['C', 'kc']]), 1), { all: false, matched: ['A', 'C'], reason: 'handles_missing' });
+  // a stored row without its geomKey never matches (it cannot be told apart from a reused handle)
+  assert.deepStrictEqual(C.selectionMatch([{ handle: 'A', geom_key: null }], new Map([['A', 'ka']]), 0), { all: false, matched: [], reason: 'geometry_changed' });
+  const sel = m(6, { tool: 'dxf_selection', layer: null, qty: 7 });
+  it = C.item(sel, { reason: 'geometry_changed', keep_matched_qty: 4 });
+  assert.deepStrictEqual(it, { measurement_id: 6, row_id: 1, tool: 'dxf_selection', label: null, old_qty: 7, new_qty: null, qty_unit: 'm', status: 'blocked', reason: 'geometry_changed',
+    options: ['delete', 'keep_matched'], keep_matched_qty: 4 });
+  // nothing still matches → delete only
+  assert.deepStrictEqual(C.item(sel, { reason: 'handles_missing', keep_matched_qty: null }).options, ['delete']);
+  // manual → review manual_check (not blocking), with its recomputed qty; a missing page → blocked page_missing
+  const man = m(7, { tool: 'manual', layer: null, qty: 2, label: 'Fake line' });
+  assert.deepStrictEqual(C.item(man, { review: true, new_qty: 2 }), { measurement_id: 7, row_id: 1, tool: 'manual', label: 'Fake line', old_qty: 2, new_qty: 2, qty_unit: 'm',
+    status: 'review', reason: 'manual_check', options: ['mark_reviewed'] });
+  assert.deepStrictEqual(C.item(man, { reason: 'page_missing' }), { measurement_id: 7, row_id: 1, tool: 'manual', label: 'Fake line', old_qty: 2, new_qty: null, qty_unit: 'm',
+    status: 'blocked', reason: 'page_missing', options: ['delete'] });
+  // row totals: Σ old and Σ new of the drawing's items per row (first seen first); new is null while an item of the row
+  // is blocked; unlinked measurements have no row
+  const items = [C.item(m(1), { new_qty: 6 }), C.item(m(8, { row_id: 2, qty: 3 }), { new_qty: 3 }), C.item(m(9, { qty: 1.5 }), { review: true, new_qty: 1.25 }),
+    C.item(m(10, { row_id: 3 }), { reason: 'layer_missing', relink_choices: [] }), C.item(m(11, { row_id: 3, qty: 1 }), { new_qty: 2 }), C.item(m(12, { row_id: null }), { new_qty: 9 })];
+  assert.deepStrictEqual(C.rowTotals(items), [{ row_id: 1, old: 6.5, new: 7.25 }, { row_id: 2, old: 3, new: 3 }, { row_id: 3, old: 6, new: null }]);
+  assert.deepStrictEqual(C.rowTotals([]), []);
+}
+
 console.log('takeoff ok');
