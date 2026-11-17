@@ -496,7 +496,7 @@
   const DW_UNITS = ['mm', 'cm', 'm', 'km', 'ft', 'in'];
   const DW_MAX = 100 * 1024 * 1024;
   const metricLabel = m => ({ open_length: t('mt_open_length'), closed_perimeter: t('mt_closed_perimeter'), area: t('mt_area'), count: t('mt_count') })[m] || m;
-  const dwStatusLabel = s => ({ parsing: t('dws_parsing'), ready: t('dws_ready'), failed: t('dws_failed') })[s] || s;
+  const dwStatusLabel = s => ({ parsing: t('dws_parsing'), pages: t('dws_pages'), ready: t('dws_ready'), failed: t('dws_failed') })[s] || s;
   const warnLabel = c => ({ unsupported_polyline: t('wc_unsupported_polyline'), self_intersecting: t('wc_self_intersecting'), hatch_open_loop: t('wc_hatch_open_loop'),
     hatch_no_boundary: t('wc_hatch_no_boundary'), hatch_loops_overlap: t('wc_hatch_loops_overlap'),
     unsupported_hatch_edge: t('wc_unsupported_hatch_edge'), paper_space: t('wc_paper_space'), xref: t('wc_xref'), nonplanar: t('wc_nonplanar'),
@@ -527,7 +527,7 @@
   }
 
   function uploadPanel(id) {
-    const name = inp('dw-name', '', { maxlength: 200 }), file = h('input', { type: 'file', id: 'dw-file', accept: '.dxf' });
+    const name = inp('dw-name', '', { maxlength: 200 }), file = h('input', { type: 'file', id: 'dw-file', accept: '.dxf,.pdf,.png,.jpg,.jpeg' });
     const msg = h('p', { id: 'dw-progress', class: 'muted' });
     const say = (text, cls) => { msg.className = cls || 'muted'; msg.textContent = text; };
     const btn = h('button', { id: 'dw-upload', onclick: async () => {
@@ -569,7 +569,14 @@
         h('td', null, d.units || '—'), h('td', { class: 'num' }, !fin(d.bytes) ? '—' : d.bytes < 10486 ? '< 0.01' : (d.bytes / 1048576).toFixed(2)),
         h('td', null, (fmtTime(d.created) || '') + (d.created_by ? ' · ' + d.created_by : '')))), { class: 'grid' })) : h('p', { class: 'muted' }, t('dw_none'))));
     for (const d of list.filter(x => x.status === 'parsing')) watchParse(d.id, () => rerender());
-    if (cur && cur.status === 'ready') {
+    // a PDF whose pages are not registered yet: this browser reads them (pdf.js) and tells the server, then the tab again
+    const pagesMsg = h('div', { id: 'dw-pages' });
+    if (editable) for (const d of list.filter(x => x.status === 'pages')) readPages(d, err => {
+      if (cur && d.id === cur.id) pagesMsg.replaceChildren(h('div', { id: 'dw-pages-error', class: 'banner banner-red' }, h('strong', null, t('dw_pages_failed')), ': ', err.message));
+    });
+    if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) box.append(rasterCard(cur));
+    else if (cur && cur.status === 'pages') box.append(pagesMsg, h('p', { id: 'dw-pages-wait', class: 'muted' }, editable ? t('dws_pages') : t('dw_pages_later')));
+    else if (cur && cur.status === 'ready') {
       // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
       try { await drawingPanel(box, cur, ms, rows, editable, refreshList); }
       catch (e) { box.append(h('div', { id: 'dw-panel-error', class: 'banner banner-red' }, h('strong', null, t('dw_panel_failed')), ': ', e.message)); }
@@ -790,6 +797,86 @@
         },
         close: () => { eng.destroy(); window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); },
       };
+    }
+    return sec;
+  }
+
+  // ---- PDF pages: read in the browser by pdf.js (the server cannot read a PDF), registered once, then the tab again ----
+  // Each page's size is its unrotated page box (pdf.js page.view, PDF user space) and its rotation the page's /Rotate:
+  // stored points are unrotated (R12), so the server's bounds use the unrotated size.
+  const pagesReading = new Set();   // drawing ids being read (one at a time per drawing)
+  async function readPages(d, onError) {
+    if (pagesReading.has(d.id)) return;
+    pagesReading.add(d.id);
+    const tok = routeTok;
+    try {
+      const r = await fetch(`/api/drawings/${d.id}/file`);
+      if (r.status === 401) { me = null; return renderLogin(); }
+      if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { j = null; } throw new Error((j && j.error) || r.statusText || String(r.status)); }
+      const [lib, ab] = await Promise.all([TVRaster.pdfjs(), r.arrayBuffer()]);
+      const loading = lib.getDocument({ data: new Uint8Array(ab), isEvalSupported: false });
+      const pages = [];
+      try {
+        const doc = await loading.promise;
+        for (let n = 1; n <= doc.numPages; n++) {
+          const pg = await doc.getPage(n), v = pg.view;
+          pages.push({ page: n, width: v[2] - v[0], height: v[3] - v[1], rotation: pg.rotate });
+        }
+      } finally { loading.destroy(); }
+      try { await api('POST', `drawings/${d.id}/pages`, { pages }); }
+      catch (e) { if (e.status !== 409) throw e; }   // already registered (another tab): the list shows its pages
+      if (tok === routeTok) whenFormsFree(tok, () => rerender());
+    } catch (e) { if (tok === routeTok) onError(e); }
+    finally { pagesReading.delete(d.id); }
+  }
+
+  // ---- PDF page / image viewer (public/viewer/raster.js): the page on a canvas, zoom and pan; display only ----
+  function rasterCard(d) {
+    const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id), 'data-kind': d.kind });
+    const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
+    const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
+    const unit = d.kind === 'pdf' ? t('tv_unit_pt') : t('tv_unit_px');
+    const info = h('p', { id: 'tv-page-info', class: 'muted small' }, d.kind === 'pdf'
+      ? t('tv_pdf_page', { page: d.page, w: fmtQ(d.page_w), h: fmtQ(d.page_h), unit, rot: d.rotation || 0 })
+      : t('tv_image_size', { w: d.page_w, h: d.page_h, unit }));
+    const idle = (...extra) => { openBtn.disabled = false; sec.replaceChildren(title(), info, ...extra, openBtn); };
+    idle();
+    viewerOpeners.set(d.id, openViewer);
+    const errorBanner = msg => h('div', { id: 'tv-error', class: 'banner banner-red' }, h('strong', null, t('tv_unavailable')), ': ', msg);
+    let opening = null;
+    function openViewer() {
+      if (!opening) opening = loadViewer().catch(e => {
+        if (e && e.status === 401) { me = null; return renderLogin(); }
+        if (sec.isConnected) idle(errorBanner(String((e && e.message) || e)));
+      }).finally(() => { opening = null; });
+      return opening;
+    }
+    async function loadViewer() {
+      closeViewer();
+      const tok = routeTok;
+      openBtn.disabled = true;
+      const wrap = h('div', { class: 'tv-canvas-wrap' }), cursor = h('span', { id: 'tv-cursor' });
+      const showCursor = p => { cursor.textContent = p ? iso('X ' + p[0].toFixed(2) + '  Y ' + p[1].toFixed(2) + ' ' + unit) : ''; };
+      sec.replaceChildren(title(), info,
+        h('div', { class: 'row wrap tv-toolbar' },
+          h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
+          h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
+        h('p', { class: 'muted small' }, t('tv_raster_help')),
+        h('p', { class: 'muted', id: 'tv-loading' }, t('loading')),
+        wrap, h('div', { id: 'tv-status', class: 'tv-status small' }, cursor));
+      const eng = TVRaster.create(wrap, { kind: d.kind, url: `/api/drawings/${d.id}/file`, page: d.page, pageW: d.page_w, pageH: d.page_h, rotation: d.rotation,
+        alive: () => tok === routeTok, onCursor: showCursor, onError: e => { if (sec.isConnected) sec.append(errorBanner(String((e && e.message) || e))); } });
+      eng.canvas.id = 'tv-canvas';
+      window.__tvViewer = eng;   // test hook
+      const mine = activeViewer = { drawingId: d.id, highlight: () => {}, close: () => { eng.destroy(); if (window.__tvViewer === eng) window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); } };
+      try { await eng.ready; } catch (e) {
+        if (activeViewer !== mine || tok !== routeTok) return;   // closed or left while loading: nothing to report
+        activeViewer = null; eng.destroy(); if (window.__tvViewer === eng) window.__tvViewer = null;
+        throw e;
+      }
+      const l = sec.querySelector('#tv-loading');
+      if (l) l.remove();
+      eng.canvas.setAttribute('data-ready', '1');
     }
     return sec;
   }

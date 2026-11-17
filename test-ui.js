@@ -668,6 +668,117 @@ server.listen(0, async () => {
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
 
+    // ---- PDF and image viewer (batch 3 Task 5): pages read by the browser, rendered by the vendored pdf.js ----------
+    {
+      const { makePdf, PDF_RECTS, makePng } = require('./test/fixtures/make-takeoff.js');
+      for (const f of ['/viewer/raster.js']) assert.ok(html.includes('src="' + f + '"'), 'index.html loads ' + f);
+      const pt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI PDF' }, admin), 'pdf tender')).id;
+      const DP = `#drawings[data-tender="${pt}"]`;
+      await page.goto(`${origin}/#/tender/${pt}/drawings`);
+      await page.waitForSelector(DP + ' #dw-upload');
+      await page.setInputFiles('#dw-file', { name: 'sheets.pdf', mimeType: 'application/pdf', buffer: makePdf() });
+      await page.click('#dw-upload');
+      // the upload is one row in 'pages'; this browser reads the 2 pages with pdf.js and registers them: 2 ready rows
+      await page.waitForSelector(DP + ' #tv-panel[data-kind="pdf"]');
+      const pages = db.prepare('SELECT id, kind, status, page, page_w, page_h, rotation, parent_id FROM drawings WHERE tender_id=? ORDER BY page').all(pt).map(r => ({ ...r }));
+      assert.deepStrictEqual(pages.map(r => [r.kind, r.status, r.page, r.page_w, r.page_h, r.rotation]), [['pdf', 'ready', 1, 595, 842, 0], ['pdf', 'ready', 2, 842, 595, 90]],
+        'pages registered by the browser with their unrotated size and rotation');
+      assert.strictEqual(pages[1].parent_id, pages[0].id);
+      assert.strictEqual(await page.$$eval(DP + ' a[href*="/drawings/"]', a => a.length), 2, 'two rows listed');
+      const idle = () => page.evaluate(() => window.__tvViewer.whenIdle());
+      // [r, g, b, a] of the canvas pixel under a page point
+      const pixel = (x, y) => page.evaluate(([x, y]) => {
+        const e = window.__tvViewer, s = e.toScreen(x, y), d = window.devicePixelRatio || 1;
+        return Array.from(e.canvas.getContext('2d').getImageData(Math.floor(s[0] * d), Math.floor(s[1] * d), 1, 1).data);
+      }, [x, y]);
+      const near = (got, want, msg) => assert.ok(want.every((v, k) => Math.abs(got[k] - v) <= 3), msg + ': ' + JSON.stringify(got) + ' ≈ ' + JSON.stringify(want));
+      const rgb = r => r.rgb.map(v => Math.round(v * 255));
+      // page 2 (/Rotate 90): portrait on screen, its filled rectangle where the page coordinates say
+      await page.goto(`${origin}/#/tender/${pt}/drawings/${pages[1].id}`);
+      await page.waitForSelector(`${DP} #tv-panel[data-drawing="${pages[1].id}"] #tv-open`);
+      assert.ok((await page.textContent('#tv-page-info')).includes('rotation 90°'), 'page info: ' + await page.textContent('#tv-page-info'));
+      await page.click(DP + ' #tv-open');
+      await page.waitForSelector(DP + ' #tv-canvas[data-ready="1"]');
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      await idle();
+      const R2 = PDF_RECTS[1];
+      assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.size()), [595, 842], 'rotated 90: shown portrait');
+      near(await pixel(R2.x + R2.w / 2, R2.y + R2.h / 2), [...rgb(R2), 255], 'rotated page: the rectangle is rendered under its page point');
+      near(await pixel(R2.x - 40, R2.y + R2.h / 2), [255, 255, 255, 255], 'rotated page: white beside it');
+      // wheel zoom at the cursor keeps the page point under it; the visible part is rendered again, sharp at the new zoom
+      {
+        // the mouse at whole client pixels (as the browser reports it) near the rectangle's left edge
+        const [mx, my, cx, cy] = await page.evaluate(([x, y]) => {
+          const e = window.__tvViewer, s = e.toScreen(x, y), r = e.canvas.getBoundingClientRect(), mx = Math.round(r.left + s[0]), my = Math.round(r.top + s[1]);
+          return [mx, my, mx - r.left, my - r.top];
+        }, [R2.x, R2.y + R2.h / 2]);
+        await page.mouse.move(mx, my);
+        const before = await page.evaluate(([x, y]) => window.__tvViewer.toPage(x, y), [cx, cy]);
+        const s0 = await page.evaluate(() => window.__tvViewer.view().scale);
+        for (let k = 0; k < 4; k++) await page.mouse.wheel(0, -500);
+        await page.waitForFunction(s => window.__tvViewer.view().scale > s * 10, s0);
+        const after = await page.evaluate(([x, y]) => window.__tvViewer.toPage(x, y), [cx, cy]);
+        assert.ok(Math.abs(after[0] - before[0]) < 1e-6 && Math.abs(after[1] - before[1]) < 1e-6, 'zoom keeps the point under the cursor: ' + before + ' / ' + after);
+        await idle();
+        const step = 2 / await page.evaluate(() => window.__tvViewer.view().scale);   // 2 screen px in page units
+        near(await pixel(R2.x + step, R2.y + R2.h / 2), [...rgb(R2), 255], 'zoomed: just inside the edge is the fill (re-rendered, not a blurred bitmap)');
+        near(await pixel(R2.x - step, R2.y + R2.h / 2), [255, 255, 255, 255], 'zoomed: just outside the edge is white');
+      }
+      // every rotation: toPage/toScreen are exact inverses, a page length is the same on screen, the fill is under its point
+      const rots = await page.evaluate(async ([id, R]) => {
+        const out = [];
+        for (const rotation of [0, 90, 180, 270]) {
+          const div = document.createElement('div');
+          div.style.cssText = 'width:400px;height:300px';
+          document.body.append(div);
+          const e = TVRaster.create(div, { kind: 'pdf', url: `/api/drawings/${id}/file`, page: 2, pageW: 842, pageH: 595, rotation });
+          e.canvas.style.cssText = 'display:block;width:100%;height:100%';
+          await e.ready;
+          const a = [R.x, R.y], b = [R.x + R.w, R.y + R.h], sa = e.toScreen(...a), sb = e.toScreen(...b), back = e.toPage(...e.toScreen(123.25, 456.5));
+          const c = e.toScreen(R.x + R.w / 2, R.y + R.h / 2), d = window.devicePixelRatio || 1;
+          out.push({ rotation, size: e.size(), len: Math.hypot(sb[0] - sa[0], sb[1] - sa[1]) / e.view().scale, back,
+            fill: Array.from(e.canvas.getContext('2d').getImageData(Math.floor(c[0] * d), Math.floor(c[1] * d), 1, 1).data) });
+          e.destroy(); div.remove();
+        }
+        return out;
+      }, [pages[1].id, R2]);
+      for (const r of rots) {
+        assert.ok(Math.abs(r.back[0] - 123.25) < 1e-9 && Math.abs(r.back[1] - 456.5) < 1e-9, 'round trip at rotation ' + r.rotation + ': ' + r.back);
+        assert.ok(Math.abs(r.len - Math.hypot(R2.w, R2.h)) < 1e-9, 'a page length does not depend on rotation ' + r.rotation + ': ' + r.len);
+        assert.deepStrictEqual(r.size, r.rotation % 180 ? [595, 842] : [842, 595], 'shown size at rotation ' + r.rotation);
+        near(r.fill, [...rgb(R2), 255], 'fill under its page point at rotation ' + r.rotation);
+      }
+      await page.click('#tv-fit');
+      // page 1 (no rotation)
+      await page.goto(`${origin}/#/tender/${pt}/drawings/${pages[0].id}`);
+      await page.waitForSelector(`${DP} #tv-panel[data-drawing="${pages[0].id}"] #tv-open`);
+      assert.strictEqual(await page.evaluate(() => window.__tvViewer), null, 'the viewer is detached on route change');
+      await page.click(DP + ' #tv-open');
+      await page.waitForSelector(DP + ' #tv-canvas[data-ready="1"]');
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      await idle();
+      const R1 = PDF_RECTS[0];
+      near(await pixel(R1.x + R1.w / 2, R1.y + R1.h / 2), [...rgb(R1), 255], 'page 1: the rectangle under its page point');
+      near(await pixel(R1.x + R1.w / 2, R1.y + R1.h + 20), [255, 255, 255, 255], 'page 1: white above it (y up)');
+      // a PNG: uploaded through the UI, ready at once; pixels y down from the top-left, drawn as stored
+      await page.setInputFiles('#dw-file', { name: 'photo.png', mimeType: 'image/png', buffer: makePng(64, 48, [40, 120, 200]) });
+      await page.click('#dw-upload');
+      await page.waitForSelector(DP + ' #tv-panel[data-kind="image"]');
+      assert.ok((await page.textContent('#tv-page-info')).includes('64 × 48 px'), 'image size shown');
+      await page.click(DP + ' #tv-open');
+      await page.waitForSelector(DP + ' #tv-canvas[data-ready="1"]');
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      await idle();
+      near(await pixel(32, 24), [40, 120, 200, 255], 'image pixel drawn');
+      near(await pixel(-1, -1), [30, 30, 30, 255], 'outside the image: the background');
+      assert.ok(await page.evaluate(() => { const e = window.__tvViewer; return e.toScreen(0, 0)[1] < e.toScreen(0, 48)[1]; }), 'image y down');
+      const back = await page.evaluate(() => { const e = window.__tvViewer; return e.toPage(...e.toScreen(12.5, 33.25)); });
+      assert.ok(Math.abs(back[0] - 12.5) < 1e-9 && Math.abs(back[1] - 33.25) < 1e-9, 'image round trip');
+      await page.click('#tv-close');
+      assert.strictEqual(await page.evaluate(() => window.__tvViewer), null, 'closed');
+      await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    }
+
     // a submitted tender: read-only (no upload, link, delete or units controls), numbers still shown
     await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
