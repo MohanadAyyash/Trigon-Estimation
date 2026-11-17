@@ -670,7 +670,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (sub === undefined && parts.length === 2 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer');
       const c = d.kind === 'dxf' && d.status === 'ready' ? await readSummary(d.sha256) : null;
-      return reply(res, 200, { ...d, header: c && c.header, ignored: c && c.ignored, warnings: c && c.warnings, calibrations: d.kind === 'dxf' ? null : calibrationsOf(d.id) });
+      // unit_to_m: the server's unit table (lib/units.js), for the browser preview and the calibration units (no copy there)
+      return reply(res, 200, { ...d, header: c && c.header, ignored: c && c.ignored, warnings: c && c.warnings, calibrations: d.kind === 'dxf' ? null : calibrationsOf(d.id), unit_to_m: UNIT_TO_M });
     }
     if (sub === 'layers' && parts.length === 3 && method === 'GET') {
       need(me, 'admin', 'qs', 'viewer'); dxfOnly();
@@ -1181,7 +1182,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   }
 
   function tenderMeasurements(t) {
-    const all = db.prepare(`SELECT m.*, d.name AS drawing_name, r.no AS row_no, r.description AS row_description, r.unit AS row_unit,
+    const all = db.prepare(`SELECT m.*, d.name AS drawing_name, d.kind AS drawing_kind, d.units AS drawing_units, r.no AS row_no, r.description AS row_description, r.unit AS row_unit,
       c.region AS cal_region, c.scale AS cal_scale, c.verify_pct AS cal_verify_pct
       FROM measurements m JOIN drawings d ON d.id=m.drawing_id LEFT JOIN tender_rows r ON r.id=m.row_id LEFT JOIN calibrations c ON c.id=m.calibration_id WHERE m.tender_id=? ORDER BY m.id`).all(t.id);
     for (const x of all) {
@@ -1190,6 +1191,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       // which calibration a PDF/image quantity used (page or region) and its verify %
       x.calibration = x.calibration_id === null || x.cal_scale === null ? null : { id: x.calibration_id, region: x.cal_region !== null, scale: x.cal_scale, verify_pct: x.cal_verify_pct };
       delete x.cal_region; delete x.cal_scale; delete x.cal_verify_pct;
+      // a manual quantity's scale (metres per drawing/page unit), as the server used it: its calibration, or the DXF units
+      x.scale = x.tool !== 'manual' || x.metric === 'count' ? null : x.calibration ? x.calibration.scale
+        : x.drawing_kind === 'dxf' && hasUnit(x.drawing_units) ? UNIT_TO_M[x.drawing_units] : null;
     }
     return { measurements: all.filter(x => x.row_id !== null), unlinked: all.filter(x => x.row_id === null) };
   }

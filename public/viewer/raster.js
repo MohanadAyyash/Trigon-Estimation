@@ -22,6 +22,7 @@
 //   engine.toPage(sx, sy) -> [px, py], engine.toScreen(px, py) -> [sx, sy] (exact inverses; null before ready)
 //   opts.onDraw(ctx, engine): called each frame after the page, ctx in CSS pixels (overlays); engine.requestDraw()
 //   opts.onCursor(pagePt | null), opts.onClick(pagePt, event): a left click without a drag (a left drag pans)
+//   opts.onDrag(pageStart, pageEnd, event): a left drag while the left button is given to the tools (setPanOnLeft(false))
 //   opts.onError(error): a page render failed (the load itself rejects engine.ready)
 //   engine.setPanOnLeft(on): false gives the left button to the tools (pan stays on the middle/right button)
 //   engine.whenIdle() -> Promise once no render is pending or running (tests)
@@ -244,8 +245,9 @@ function create(container, opts) {
     window.removeEventListener('mouseup', onUp);
     const d = drag;
     drag = null;
-    if (!d || d.pan || d.moved || !o.onClick) return;
-    o.onClick(toPage(d.x0, d.y0), e);
+    if (!d || d.pan) return;
+    if (d.moved) { if (!panLeft && o.onDrag) { const [x, y] = pos(e); o.onDrag(toPage(d.x0, d.y0), toPage(x, y), e); } return; }
+    if (o.onClick) o.onClick(toPage(d.x0, d.y0), e);
   }
   function onMove(e) { mouse = pos(e); if (o.onCursor && V && toP) o.onCursor(toPage(mouse[0], mouse[1])); }
   function onLeave() { mouse = null; if (o.onCursor) o.onCursor(null); }

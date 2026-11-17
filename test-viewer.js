@@ -350,4 +350,24 @@ assert.ok(ACI.every(c => /^#[0-9a-f]{6}$/.test(c)));
   assert.ok(ids(TV.boxSelect(G, R, [499, 499.5, 501, 500.5], 'crossing', on)).includes(0));
 }
 
+// ---- measuring tools (public/viewer/tools.js, batch 3 Task 6): the pure helpers, in Node ----
+{
+  const TT = require('./public/viewer/tools.js'), calib = require('./lib/takeoff/calib.js');
+  // the preview picks the calibration exactly as the server does: the region holding the point (edges in, lower id on a
+  // shared edge), else the page; stored regions may be JSON text
+  const cals = [{ id: 5, region: null, scale: 0.05 }, { id: 3, region: [0, 0, 100, 100], scale: 0.02 }, { id: 2, region: '[100,0,200,100]', scale: 0.01 },
+    { id: 9, region: [300, 300, 400, 400], scale: 0.03 }];
+  for (const p of [[50, 50], [100, 50], [150, 100], [250, 50], [350, 350], [400, 400], [-1, -1], [0, 0], [200.0001, 50]])
+    assert.strictEqual(TT.calibrationFor(cals, p), calib.calibrationFor(cals, p), 'calibrationFor as the server at ' + p);
+  assert.strictEqual(TT.calibrationFor(cals, [100, 50]).id, 2, 'shared edge: the lower id');
+  assert.strictEqual(TT.calibrationFor(cals.slice(1), [250, 50]), null, 'no page calibration: none');
+  assert.strictEqual(TT.calibrationFor([], [0, 0]), null);
+  // R15 warnings: a polyline doubling back; a very sharp turn (open and closed); none for plain corners
+  assert.deepStrictEqual(TT.pathWarnings([[0, 0], [10, 0], [5, 0]], false), [{ code: 'back', at: 2 }]);
+  assert.deepStrictEqual(TT.pathWarnings([[0, 0], [10, 0], [0, 1]], false), [{ code: 'sharp', at: 2 }]);
+  assert.deepStrictEqual(TT.pathWarnings([[0, 0], [10, 0], [10, 10], [0, 10]], true), []);
+  assert.deepStrictEqual(TT.pathWarnings([[0, 0], [100, 5], [100, 10]], true), [{ code: 'sharp', at: 1 }]);
+  assert.deepStrictEqual(TT.pathWarnings([[0, 0], [10, 0], [20, 0]], false), [], 'straight on is no warning');
+}
+
 console.log('viewer core: all tests passed');

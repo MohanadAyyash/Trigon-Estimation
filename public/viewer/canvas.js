@@ -2,13 +2,17 @@
 // into a view, a selection, a hover and a snap point. No text, no quantities: the page (app.js) shows those.
 // Display only: every saved quantity is computed on the server from the exact parse cache.
 //
-//   TVCanvas.create(canvas, R, { alive, onSelect, onHover, onCursor }) -> viewer
+//   TVCanvas.create(canvas, R, { alive, onSelect, onHover, onCursor, onClick, onDrag, onDraw }) -> viewer
 //   TVCanvas.layerColor(aci) -> '#rrggbb' readable on the dark background
 //
 // Drawing: only TV.visible() entities, one draw per animation frame at most. The entities go into a cached base layer
 // (redrawn when the view, layers or selection change); hover outline, snap marker and rubber band are drawn over it.
 // window.__tvLastFrameMs = the last frame's duration (test hook). destroy() removes every listener; when alive() turns
 // false (the page changed), the next frame destroys the viewer.
+// Measuring tools (public/viewer/tools.js, batch 3 Task 6): setTool(true) gives the left button to the tool: a click calls
+// onClick(world point, event, snap) with snap = the snap point at the click (TV.snap, exact true vertex) when Snap is on,
+// a left drag calls onDrag(world start, world end, event); nothing is selected. onDraw(ctx, viewer) is called each frame
+// after the drawing (ctx in CSS pixels) for overlays; requestDraw() schedules a frame; toScreen/toPage convert.
 'use strict';
 (function () {
 const BG = '#1e1e1e', LIGHT = '#e0e0e0', SEL = '#ffa726', HI = '#26c6da', HOVER = 'rgba(255,255,255,0.45)', SNAP = '#00e676';
@@ -39,7 +43,7 @@ function create(canvas, R, opts) {
   const sel = new Uint8Array(n), hi = new Uint8Array(n);
   let nSel = 0, nHi = 0, handleIdx = null;
   let V = null, fitScale = 1, W = 0, H = 0, dpr = 1;
-  let mode = 'select', snapOn = false, mouse = null, moved = false, hover = -1, snapPt = null, band = null, drag = null;
+  let mode = 'select', toolOn = false, snapOn = false, mouse = null, moved = false, hover = -1, snapPt = null, band = null, drag = null;
   let baseDirty = true, raf = 0, dead = false;
   const base = document.createElement('canvas'), ctx = canvas.getContext('2d'), bctx = base.getContext('2d');
 
@@ -132,6 +136,7 @@ function create(canvas, R, opts) {
       ctx.lineWidth = 1; ctx.strokeStyle = win ? '#4fc3f7' : '#81c784'; ctx.strokeRect(x, y, w, h);
       ctx.setLineDash([]);
     }
+    if (o.onDraw) o.onDraw(ctx, api);
     window.__tvLastFrameMs = performance.now() - t0;
   }
   function schedule(full) {
@@ -186,7 +191,7 @@ function create(canvas, R, opts) {
     if (drag) return;
     const [x, y] = pos(e);
     if (e.button === 1 || e.button === 2) { e.preventDefault(); drag = { pan: true, x, y }; }
-    else if (e.button === 0) drag = { pan: false, x0: x, y0: y, shift: e.shiftKey };
+    else if (e.button === 0) drag = { pan: false, x0: x, y0: y, shift: e.shiftKey, tool: toolOn };
     else return;
     window.addEventListener('mousemove', onDragMove);
     window.addEventListener('mouseup', onUp);
@@ -195,6 +200,7 @@ function create(canvas, R, opts) {
     let [x, y] = pos(e);
     if (drag.pan) { V = TV.pan(V, x - drag.x, y - drag.y); drag.x = x; drag.y = y; schedule(true); return; }
     if (Math.abs(x - drag.x0) > DRAG_PX || Math.abs(y - drag.y0) > DRAG_PX) drag.moved = true;
+    if (drag.tool) return;
     [x, y] = clampPos(e);
     if (mode !== 'select' && (band || Math.abs(x - drag.x0) > DRAG_PX || Math.abs(y - drag.y0) > DRAG_PX)) { band = [drag.x0, drag.y0, x, y]; schedule(); }
   }
@@ -204,6 +210,12 @@ function create(canvas, R, opts) {
     const d = drag;
     drag = null;
     if (!d || d.pan) return;
+    if (d.tool) {   // a measuring tool: a click is a point (snapped when Snap is on), a drag a rectangle
+      const w = TV.toWorld(V, d.x0, d.y0);
+      if (!d.moved) { if (o.onClick) o.onClick(w, e, snapOn ? TV.snap(G, R, w[0], w[1], tol(SNAP_PX), layerOn) : null); }
+      else if (o.onDrag) { const [x, y] = pos(e); o.onDrag(w, TV.toWorld(V, x, y), e); }
+      return;
+    }
     if (band) [band[2], band[3]] = clampPos(e);
     if (band) {
       const a = TV.toWorld(V, band[0], band[1]), b = TV.toWorld(V, band[2], band[3]);
@@ -247,11 +259,15 @@ function create(canvas, R, opts) {
     if (ro) ro.disconnect(); else window.removeEventListener('resize', resize);
   }
 
-  return {
+  const api = {
     canvas, R,
     view: () => V,
     fit,
     setMode(m) { mode = m === 'window' || m === 'crossing' ? m : 'select'; },
+    setTool(on) { toolOn = !!on; band = null; schedule(); },
+    requestDraw: () => schedule(),
+    toScreen: (x, y) => V ? TV.toScreen(V, x, y) : null,
+    toPage: (sx, sy) => V ? TV.toWorld(V, sx, sy) : null,
     setSnap(on) { snapOn = !!on; moved = true; if (!snapOn) snapPt = null; schedule(); },
     snapPoint: () => snapPt,
     layerOn: i => layerOn[i] === 1,
@@ -288,6 +304,7 @@ function create(canvas, R, opts) {
     highlightedHandles: () => Array.from(indices(hi), i => R.handles[i]),
     destroy,
   };
+  return api;
 }
 
 window.TVCanvas = { create, layerColor };

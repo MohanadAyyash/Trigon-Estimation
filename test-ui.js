@@ -583,6 +583,11 @@ server.listen(0, async () => {
       await band([-1000, -1000], [10000, 2500]);
       assert.ok(await nSel() > 0, 'selection works before the units are confirmed');
       for (const mt of ['open_length', 'closed_perimeter', 'area', 'count']) assert.strictEqual(await v(mt), '—', 'no preview before units: ' + mt);
+      // a manual shape before the units are confirmed: "—" and why
+      await page.click('#tl-polyline');
+      { const [ax, ay] = await at(0, 0), [bx, by] = await at(5000, 0); await page.mouse.click(ax, ay + 40); await page.mouse.click(bx, by + 40); }
+      { const pt = await page.textContent('#tl-preview'); assert.ok(pt.includes('—') && pt.includes('confirm units'), 'DXF before units: ' + pt); }
+      await page.keyboard.press('Escape');
       assert.strictEqual((await page.textContent('#tv-blocks')).trim(), '', 'no block counts before units');
       assert.strictEqual(await page.$(D + ' #tv-link'), null, 'no Link before the units are confirmed');
       await page.click('#tv-close');
@@ -845,6 +850,7 @@ server.listen(0, async () => {
         await page.goto(`${origin}/#/tender/${pt}/drawings/${refused}`);
         await page.waitForSelector(DP + ' #dw-pages-error');
         assert.ok((await page.textContent(DP + ' #dw-pages-error')).includes('test refusal'), 'a 409 that is not "already registered" is shown');
+        assert.ok((await page.textContent(DP + ' #dw-pages-error')).includes('Reload the page to try again'), 'reload hint (Task 5 carry-over)');
         assert.strictEqual(await page.$(DP + ' #dw-pages-wait'), null, 'no "reading pages…" once it failed');
         await page.unroute('**/api/drawings/*/pages');
         { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'refusal logged'); errors.splice(i, 1); }
@@ -869,6 +875,242 @@ server.listen(0, async () => {
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
 
+    // ---- manual measuring and calibration tools (batch 3 Task 6) ----------------------------------------------------
+    {
+      const { makePdf } = require('./test/fixtures/make-takeoff.js');
+      for (const f of ['/viewer/tools.js', '/lib/takeoff/manual.js']) assert.ok(html.includes('src="' + f + '"'), 'index.html loads ' + f);
+      const mt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Measure' }, admin), 'measure tender')).id;
+      const rowM = (await ok(call('POST', `tenders/${mt}/rows`, { no: '1', description: 'Test kerb line', unit: 'm' }, admin), 'm row')).id;
+      const rowA = (await ok(call('POST', `tenders/${mt}/rows`, { no: '2', description: 'Test paving', unit: 'm2' }, admin), 'm2 row')).id;
+      const up = await fetch(`${base}tenders/${mt}/drawings?name=sheet`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: makePdf() });
+      assert.strictEqual(up.status, 202);
+      const pdfId = (await up.json()).id;
+      await ok(call('POST', `drawings/${pdfId}/pages`, { pages: [{ page: 1, width: 595, height: 842, rotation: 0 }, { page: 2, width: 842, height: 595, rotation: 90 }] }, admin), 'pages');
+      const DM = `#drawings[data-tender="${mt}"]`;
+      const rowQty = async r => (await call('GET', `tenders/${mt}/rows`, null, admin)).j.find(x => x.id === r).qty;
+      const listed = async () => (await call('GET', `tenders/${mt}/measurements`, null, admin)).j.measurements;
+      const idleM = () => page.evaluate(() => window.__tvViewer.whenIdle());
+      // whole client pixels of a page point (as the browser reports a click)
+      const scr = (x, y) => page.evaluate(([x, y]) => { const e = window.__tvViewer; e.canvas.scrollIntoView({ block: 'nearest' }); const s = e.toScreen(x, y), r = e.canvas.getBoundingClientRect(); return [Math.round(r.left + s[0]), Math.round(r.top + s[1])]; }, [x, y]);
+      const clickPage = async (x, y, mods) => { const [sx, sy] = await scr(x, y); if (mods) await page.keyboard.down(mods); await page.mouse.click(sx, sy); if (mods) await page.keyboard.up(mods); };
+      // an exact page point through the tools' own click handler (a mouse click lands on whole pixels)
+      const pick = (x, y) => page.evaluate(([x, y]) => window.__tvTools.pick([x, y]), [x, y]);
+      const pv = async () => { const v = await page.getAttribute('#tl-preview .v', 'data-qty'); return v === null ? null : Number(v); };
+      const expectQty = () => page.evaluate(() => TakeoffManual.manualQty(window.__tvTools.geom(), { scale: 0.05 }).qty);
+      const openM = async () => {
+        await page.click(DM + ' #tv-open');
+        await page.waitForSelector(DM + ' #tv-canvas[data-ready="1"]');
+        await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+        await idleM();
+      };
+      await page.goto(`${origin}/#/tender/${mt}/drawings/${pdfId}`);
+      await page.waitForSelector(`${DM} #tv-panel[data-drawing="${pdfId}"] #tv-open`);
+      await openM();
+      for (const b of ['line', 'polyline', 'area', 'rect', 'count', 'calibrate', 'verify', 'region', 'undo', 'finish', 'cancel']) assert.ok(await page.$('#tl-' + b), 'tool button ' + b);
+      assert.ok((await page.textContent('#tl-scale')).includes('not calibrated'), 'scale line: ' + await page.textContent('#tl-scale'));
+      // 1.1 before calibrating: "—" and why; the left drag does not pan while a tool is active (carry-over)
+      await page.click('#tl-polyline');
+      assert.strictEqual(await page.isVisible('#tl-hole'), false, 'Hole only while an area is open');
+      const v0 = await page.evaluate(() => ({ ...window.__tvViewer.view() }));
+      { const [sx, sy] = await scr(300, 300); await page.mouse.move(sx, sy); await page.mouse.down(); await page.mouse.move(sx + 60, sy + 40, { steps: 4 }); await page.mouse.up(); }
+      assert.deepStrictEqual(await page.evaluate(() => ({ ...window.__tvViewer.view() })), v0, 'no left-drag pan while a tool is active');
+      await clickPage(100, 600); await clickPage(300, 600);
+      let pt = await page.textContent('#tl-preview');
+      assert.ok(pt.includes('—') && pt.includes('calibrate first') && /preview/i.test(pt), 'no number before calibrating: ' + pt);
+      assert.strictEqual(await pv(), null);
+      // 4. Esc cancels (the shape and the tool)
+      await page.keyboard.press('Escape');
+      assert.deepStrictEqual(await page.evaluate(() => [window.__tvTools.tool(), window.__tvTools.pointCount()]), [null, 0], 'Esc cancels');
+      // a count needs no calibration (R14)
+      await page.click('#tl-count'); await clickPage(400, 400); await clickPage(450, 400);
+      assert.ok((await page.textContent('#tl-preview .v')).includes('2 nr'), 'count without calibration: ' + await page.textContent('#tl-preview'));
+      await page.click('#tl-cancel');
+      // 1.2 calibrate: two points 100 page units apart = 5 m
+      await page.click('#tl-calibrate');
+      await pick(100, 700); await pick(200, 700);
+      await page.waitForSelector(DM + ' #cal-form');
+      await page.fill('#cal-real', '5'); await page.selectOption('#cal-unit', 'm');
+      await page.click('#cal-save');
+      await page.waitForFunction(() => /1 pt = 0\.05 m/.test(document.querySelector('#tl-scale').textContent));
+      assert.strictEqual(db.prepare('SELECT scale FROM calibrations WHERE drawing_id=? AND region IS NULL').get(pdfId).scale, 0.05);
+      // 1.3 a polyline of 3 points clicked by the mouse: the preview is manualQty on those points (the server's formula)
+      await page.click('#tl-polyline');
+      await clickPage(100, 600); await clickPage(300, 600); await clickPage(300, 450);
+      const got = await page.evaluate(() => window.__tvTools.points());
+      [[100, 600], [300, 600], [300, 450]].forEach((p, k) => assert.ok(Math.hypot(got[k][0] - p[0], got[k][1] - p[1]) < 2, 'clicked point ' + k + ': ' + got[k]));
+      const want = await expectQty();
+      assert.strictEqual(await pv(), want, 'preview = manualQty');
+      assert.ok(Math.abs(want - 17.5) < 0.2 && (await page.textContent('#tl-preview')).includes(f2(want) + ' m'), 'preview shown: ' + await page.textContent('#tl-preview'));
+      // 3. Undo point: the last point goes and the preview follows
+      await page.click('#tl-undo');
+      assert.strictEqual((await page.evaluate(() => window.__tvTools.points())).length, 2);
+      assert.strictEqual(await pv(), await expectQty(), 'preview after undo');
+      await clickPage(300, 450);
+      const want3 = await expectQty(), sent = await page.evaluate(() => window.__tvTools.points());
+      // 1.4 Enter finishes; link to the m row → the row qty is the server's qty, equal to the preview
+      await page.keyboard.press('Enter');
+      await page.waitForSelector(DM + ' #lk-form');
+      assert.ok(!(await page.$(DM + ' #lk-metric')), 'no metric choice for a length');
+      await page.selectOption('#lk-row', String(rowM));
+      await page.click('#lk-save');
+      await page.waitForSelector(`${DM} #dw-measurements tr[data-row="${rowM}"]`);
+      let ms = await listed();
+      const mPoly = ms.find(m => m.row_id === rowM);
+      assert.strictEqual(mPoly.qty, want3, 'server qty = preview'); assert.strictEqual(await rowQty(rowM), mPoly.qty, 'row qty = server qty');
+      assert.deepStrictEqual(mPoly.geom, { tool: 'polyline', pts: sent }, 'the points drawn are the points saved');
+      // 1.5 the list: formula with its inputs, and which calibration
+      const fm = (await page.textContent(`${DM} #dw-measurements tr[data-row="${rowM}"] td.m-formula`)).trim();
+      assert.ok(fm.startsWith(`length ${f2(mPoly.base / 0.05)} pt × 0.05 m/pt = ${f2(mPoly.base)} m`), 'formula: ' + fm);
+      assert.ok(fm.includes('page calibration') && fm.includes('not verified'), 'calibration used: ' + fm);
+      assert.deepStrictEqual(await page.evaluate(() => [window.__tvTools.tool(), window.__tvTools.pointCount()]), ['polyline', 0], 'saved: the tool stays, the shape goes');
+      // R15: a polyline that doubles back is allowed, with a warning; Shift keeps the next point horizontal
+      await clickPage(100, 500); await clickPage(250, 500, 'Shift'); await clickPage(200, 500, 'Shift');
+      const sp = await page.evaluate(() => window.__tvTools.points());
+      assert.ok(sp[1][1] === sp[0][1] && sp[2][1] === sp[0][1], 'Shift: horizontal, exactly: ' + JSON.stringify(sp));
+      assert.ok((await page.textContent('#tl-warn')).includes('doubles back'), 'doubling back warned: ' + await page.textContent('#tl-warn'));
+      assert.ok(await pv() > 0, 'still measured');
+      await page.click('#tl-cancel');
+      // 2. an area with a hole → the m2 row: 24
+      await page.click('#tl-area');
+      for (const [x, y] of [[100, 100], [200, 100], [200, 220], [100, 220]]) await pick(x, y);
+      assert.ok(await page.isVisible('#tl-hole'), 'Hole shown for an area');
+      await page.click('#tl-hole');
+      for (const [x, y] of [[120, 120], [160, 120], [160, 180], [120, 180]]) await pick(x, y);
+      assert.ok(Math.abs(await pv() - 24) < 1e-9, 'area preview 24: ' + await pv());
+      await page.click('#tl-finish');
+      await page.waitForSelector(DM + ' #lk-form #lk-metric');
+      await page.selectOption('#lk-row', String(rowA));
+      await page.click('#lk-save');
+      await page.waitForSelector(`${DM} #dw-measurements tr[data-row="${rowA}"]`);
+      assert.ok(Math.abs(await rowQty(rowA) - 24) < 1e-9, 'm2 row 24');
+      // a self-intersecting outline: refused in words before it is sent
+      await page.click('#tl-area');
+      for (const [x, y] of [[400, 100], [500, 200], [500, 100], [400, 200]]) await pick(x, y);
+      assert.ok((await page.textContent('#tl-warn')).includes('crosses'), 'bowtie: ' + await page.textContent('#tl-warn'));
+      await page.click('#tl-finish');
+      assert.ok(!(await page.$(DM + ' #lk-form')), 'no link form for a shape the server refuses');
+      await page.click('#tl-cancel');
+      // edit a saved measurement: factor 2 and a label → the row doubles
+      await page.click(`${DM} #dw-measurements tr[data-row="${rowM}"] .m-edit`);
+      await page.waitForSelector(DM + ' #ed-form');
+      await page.fill('#ed-factor', '2'); await page.fill('#ed-label', 'Fake kerb');
+      await page.click('#ed-save');
+      await page.waitForFunction(r => /factor 2/.test((document.querySelector(`#dw-measurements tr[data-row="${r}"] td.m-formula`) || {}).textContent || ''), rowM);
+      assert.strictEqual(await rowQty(rowM), mPoly.qty * 2, 'edited factor');
+      assert.ok(await page.$(DM + ' #tv-canvas'), 'the viewer stays open after an edit');
+      // the saved measurements are drawn with their label and qty
+      await page.evaluate(() => window.__tvViewer.requestDraw()); await idleM();
+      const ovl = await page.evaluate(() => window.__tvTools.overlay());
+      assert.strictEqual(ovl.length, 2, 'two overlays'); assert.ok(ovl.some(x => x.text.startsWith('Fake kerb · ' + f2(mPoly.qty * 2))), JSON.stringify(ovl));
+      // 5. verify off by 2 %: a 200 pt line (10 m at this scale) said to be 9.8 m → +2.04 %, in the warning colour
+      await page.click('#tl-verify');
+      await pick(100, 650); await pick(300, 650);
+      await page.waitForSelector(DM + ' #cal-form');
+      await page.fill('#cal-real', '9.8');
+      await page.click('#cal-save');
+      await page.waitForSelector(DM + ' #vf-result');
+      assert.ok((await page.textContent('#vf-result')).includes('+2.04 %'), 'verify %: ' + await page.textContent('#vf-result'));
+      assert.ok(await page.$('#vf-result .pct-warn'), 'above 1 %: warning colour');
+      assert.notStrictEqual(await page.$eval('#vf-result .pct-warn', e => getComputedStyle(e).color), await page.$eval('#tl-scale', e => getComputedStyle(e).color), 'a colour of its own');
+      assert.ok((await page.textContent('#tl-scale')).replace(/[\u2066-\u2069]/g, '').includes('verified +2.04 %'), 'the scale line shows it');
+      // a region: dragged, then calibrated inside it; a verify line inside it verifies the region, one across it is refused
+      await page.click('#tl-region');
+      { const [ax, ay] = await scr(400, 300), [bx, by] = await scr(560, 500); await page.mouse.move(ax, ay); await page.mouse.down(); await page.mouse.move(bx, by, { steps: 5 }); await page.mouse.up(); }
+      await page.waitForFunction(() => window.__tvTools.tool() === 'calibrate');
+      assert.ok((await page.textContent('#tl-msg')).includes('inside it'), 'region: calibrate inside it');
+      await pick(420, 400); await pick(520, 400);
+      await page.waitForSelector(DM + ' #cal-form');
+      await page.fill('#cal-real', '2'); await page.click('#cal-save');
+      await page.waitForFunction(() => /Region 1: 1 pt = 0\.02 m/.test(document.querySelector('#tl-scale').textContent));
+      const regCal = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? AND region IS NOT NULL').get(pdfId);
+      assert.strictEqual(regCal.scale, 0.02);
+      await page.click('#tl-verify'); await pick(420, 350); await pick(520, 350);
+      await page.waitForSelector(DM + ' #cal-form'); await page.fill('#cal-real', '2'); await page.click('#cal-save');
+      await page.waitForFunction(() => /\+?0\.00 %/.test((document.querySelector('#vf-result') || {}).textContent || ''));
+      assert.ok(await page.$('#vf-result .pct-ok'), 'within 1 %');
+      assert.strictEqual(db.prepare('SELECT verify_pct FROM calibrations WHERE id=?').get(regCal.id).verify_pct, 0, 'the region was verified');
+      await page.click('#tl-verify'); await pick(500, 350); await pick(580, 350);
+      assert.ok((await page.textContent('#tl-msg')).includes('inside one region'), 'a verify line across a region edge: ' + await page.textContent('#tl-msg'));
+      assert.ok(!(await page.$(DM + ' #cal-form')), 'no verify form for it');
+      // the preview uses the region of the first point (as the server)
+      await page.click('#tl-line'); await pick(420, 450); await pick(520, 450);
+      await page.waitForSelector(DM + ' #lk-form');
+      assert.ok(Math.abs(await pv() - 2) < 1e-12, 'region scale in the preview: ' + await pv());
+      await page.keyboard.press('Escape');
+      assert.ok(!(await page.$(DM + ' #lk-form')), 'Esc closes the form with the shape');
+      // 6. re-calibrate with measurements: before/after, nothing changes until Apply
+      const beforeM = await rowQty(rowM);
+      await page.click('#tl-calibrate'); await pick(100, 700); await pick(200, 700);
+      await page.waitForSelector(DM + ' #cal-form');
+      await page.fill('#cal-real', '10'); await page.click('#cal-save');
+      await page.waitForSelector(DM + ' #cal-changes');
+      const tbl = await page.textContent('#cal-changes');
+      assert.ok(tbl.includes(f2(beforeM)) && tbl.includes(f2(beforeM * 2)) && tbl.includes(f2(24)) && tbl.includes(f2(96)), 'before/after: ' + tbl);
+      assert.strictEqual(await rowQty(rowM), beforeM, 'nothing changed before Apply');
+      { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 're-calibration 409 logged'); errors.splice(i, 1); }
+      await page.click('#cal-apply');
+      await page.waitForFunction(() => /Page: 1 pt = 0\.1 m/.test(document.querySelector('#tl-scale').textContent));
+      assert.ok(Math.abs(await rowQty(rowM) - beforeM * 2) < 1e-9 && Math.abs(await rowQty(rowA) - 96) < 1e-9, 'Apply changed the rows');
+      assert.ok((await page.textContent(`${DM} #dw-measurements tr[data-row="${rowA}"] td.m-formula`)).includes('(0.1 m/pt)²'), 'list follows the new scale');
+      // 10. screenshot (deviceScaleFactor 2): a shape being drawn over the saved ones
+      if (process.env.MEASURE_SCREENSHOT) {
+        const ctx2 = await browser.newContext({ viewport: { width: 1360, height: 1000 }, deviceScaleFactor: 2 });
+        const [ck, cv] = admin.split('=');
+        await ctx2.addCookies([{ name: ck, value: cv, url: origin }]);
+        const p2 = await ctx2.newPage();
+        p2.on('console', m => { if (m.type() === 'error') errors.push(m.text()); }); p2.on('pageerror', e => errors.push(String(e)));
+        await p2.goto(`${origin}/#/tender/${mt}/drawings/${pdfId}`);
+        await p2.click(DM + ' #tv-open'); await p2.waitForSelector(DM + ' #tv-canvas[data-ready="1"]');
+        await p2.evaluate(() => window.__tvViewer.whenIdle());
+        await p2.click('#tl-polyline');
+        for (const p of [[250, 300], [380, 300], [380, 420]]) await p2.evaluate(q => window.__tvTools.pick(q), p);
+        await p2.evaluate(() => window.__tvViewer.whenIdle());
+        await p2.locator('#tv-panel').screenshot({ path: process.env.MEASURE_SCREENSHOT });
+        await ctx2.close();
+      }
+      // 8. approved: no tools; the scale, the overlays and the list still work
+      await page.click('#tv-close');
+      // approved (a test shortcut: this tender has no priced rows to approve through the API; it takes the frozen price of
+      // the tender approved above, so the tender page reads like any approved one)
+      db.prepare("UPDATE tenders SET status='approved', frozen=(SELECT frozen FROM tenders WHERE id=?) WHERE id=?").run(full, mt);
+      await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');   // the same hash again would not draw the tab anew
+      await page.goto(`${origin}/#/tender/${mt}/drawings/${pdfId}`);
+      await page.waitForSelector(`${DM} #tv-panel[data-drawing="${pdfId}"] #tv-open`);
+      await openM();
+      assert.ok(!(await page.$(DM + ' #tl-tools')), 'read-only: no tools');
+      assert.ok(!(await page.$(DM + ' .m-edit')), 'read-only: no edit');
+      assert.ok((await page.textContent('#tl-scale')).includes('1 pt = 0.1 m'), 'read-only: the scale is shown');
+      await page.evaluate(() => window.__tvViewer.requestDraw()); await idleM();
+      assert.strictEqual((await page.evaluate(() => window.__tvTools.overlay())).length, 2, 'read-only: overlays drawn');
+      assert.ok((await page.textContent(`${DM} #dw-measurements tr[data-row="${rowA}"] td.m-formula`)).includes('page calibration'), 'read-only: the list');
+      await page.click('#tv-close');
+
+      // 7. DXF: the polyline tool snaps to true vertices (the marker shows); the saved length is the exact distance
+      await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+      await openViewer();
+      assert.ok((await page.textContent('#tl-scale')).includes('1 mm = 0.001 m'), 'DXF scale line: ' + await page.textContent('#tl-scale'));
+      assert.ok(!(await page.$('#tl-calibrate')), 'a DXF is calibrated by its units');
+      await page.click('#tl-polyline');
+      assert.ok(await page.isChecked('#tv-snap'), 'snap on with a tool');
+      { const [sx, sy] = await at(0, 0); await page.mouse.move(sx + 3, sy - 2); await frame(); }
+      assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.snapPoint()), { x: 0, y: 0, kind: 'end' }, 'snap marker at the vertex');
+      { const [sx, sy] = await at(0, 0); await page.mouse.click(sx + 3, sy - 2); }
+      // a double-click on the last point finishes (its second click is the same point, not a new one)
+      { const [sx, sy] = await at(3000, 4000); await page.mouse.move(sx - 2, sy + 3); await frame(); await page.mouse.dblclick(sx - 2, sy + 3); }
+      await page.waitForSelector(D + ' #lk-form');
+      assert.deepStrictEqual(await page.evaluate(() => window.__tvTools.geom()), { tool: 'polyline', pts: [[0, 0], [3000, 4000]] }, 'exact true vertices');
+      assert.strictEqual(await pv(), 5, 'preview 5 m');
+      await page.selectOption('#lk-row', String(kerbRowB));
+      await page.click('#lk-save');
+      await page.waitForFunction(() => /Saved: 5\.00 m/.test((document.querySelector('#tl-msg') || {}).textContent || ''));
+      const dm = (await call('GET', `tenders/${dwg}/measurements`, null, admin)).j.measurements.find(m => m.tool === 'manual');
+      assert.deepStrictEqual([dm.qty, dm.geom.pts], [5, [[0, 0], [3000, 4000]]], 'saved length = the exact distance');
+      assert.ok((await page.textContent(`${D} #dw-measurements tr[data-measurement="${dm.id}"] td.m-formula`)).includes('length 5,000.00 mm × 0.001 m/mm = 5.00 m'), 'DXF formula');
+      await page.click(`${D} #dw-measurements tr[data-measurement="${dm.id}"] .m-delete`);
+      await page.waitForFunction(id => !document.querySelector(`#dw-measurements tr[data-measurement="${id}"]`), dm.id);
+      await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    }
+
     // a submitted tender: read-only (no upload, link, delete or units controls), numbers still shown
     await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
@@ -877,6 +1119,8 @@ server.listen(0, async () => {
     assert.ok((await page.textContent(D + ' tr[data-layer="KERB"] td.m-open_length')).includes('5.00'), 'read-only still shows the numbers');
     await openViewer();
     assert.strictEqual(await page.$(D + ' #tv-link'), null, 'read-only: no Link selection');
+    assert.ok(!(await page.$(D + ' #tl-tools')), 'read-only: no measuring tools');
+    assert.ok((await page.textContent('#tl-scale')).includes('1 mm = 0.001 m'), 'read-only: the scale line');
     await page.click('#tv-none'); await page.check('#tv-layers [data-layer="KERB"] input');
     await clickAt(1500, 2000);
     assert.strictEqual(await nSel(), 1, 'read-only: selection still works');

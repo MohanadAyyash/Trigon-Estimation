@@ -495,7 +495,10 @@
   // The server measures; the UI never computes a quantity. No number is shown before the units are confirmed.
   const DW_UNITS = ['mm', 'cm', 'm', 'km', 'ft', 'in'];
   const DW_MAX = 100 * 1024 * 1024, DW_MAX_IMAGE = 50 * 1024 * 1024;
-  const metricLabel = m => ({ open_length: t('mt_open_length'), closed_perimeter: t('mt_closed_perimeter'), area: t('mt_area'), count: t('mt_count') })[m] || m;
+  const metricLabel = m => ({ open_length: t('mt_open_length'), closed_perimeter: t('mt_closed_perimeter'), area: t('mt_area'), count: t('mt_count'),
+    length: t('mt_length'), perimeter: t('mt_perimeter') })[m] || m;
+  const toolName = k => ({ line: t('tl_line'), polyline: t('tl_polyline'), area: t('tl_area'), rect: t('tl_rect'), count: t('tl_count'), calibrate: t('tl_calibrate'),
+    verify: t('tl_verify'), region: t('tl_region') })[k] || k;
   const dwStatusLabel = s => ({ parsing: t('dws_parsing'), pages: t('dws_pages'), ready: t('dws_ready'), failed: t('dws_failed') })[s] || s;
   const warnLabel = c => ({ unsupported_polyline: t('wc_unsupported_polyline'), self_intersecting: t('wc_self_intersecting'), hatch_open_loop: t('wc_hatch_open_loop'),
     hatch_no_boundary: t('wc_hatch_no_boundary'), hatch_loops_overlap: t('wc_hatch_loops_overlap'),
@@ -520,7 +523,7 @@
     setTimeout(tick, delay);
   }
   // a finished parse never wipes what the user is typing: wait while a link form is open or a relink row is chosen
-  const formsBusy = () => !!document.getElementById('lk-form') || [...document.querySelectorAll('select.rl-row')].some(x => x.value);
+  const formsBusy = () => !!document.querySelector('#lk-form, #cal-form, #ed-form') || [...document.querySelectorAll('select.rl-row')].some(x => x.value);
   function whenFormsFree(tok, fn) {
     if (tok !== routeTok) return;
     if (formsBusy()) setTimeout(() => whenFormsFree(tok, fn), 1000); else fn();
@@ -558,11 +561,17 @@
     const [list, ms, rows] = await Promise.all([api('GET', `tenders/${id}/drawings`), api('GET', `tenders/${id}/measurements`), api('GET', `tenders/${id}/rows`)]);
     const box = h('div', { id: 'drawings', 'data-tender': String(id) });
     viewerOpeners = new Map();
-    // after a selection is linked: the list again, in place (the viewer stays open)
+    // after a selection or a shape is linked or edited: the list again, in place, and the viewer's overlays (it stays open)
+    let msCur = ms;
     const refreshList = async () => {
-      const fresh = await api('GET', `tenders/${id}/measurements`), old = box.querySelector('#dw-measurements');
-      if (old) old.replaceWith(measurementList(fresh, rows, editable));
+      msCur = await api('GET', `tenders/${id}/measurements`);
+      const old = box.querySelector('#dw-measurements');
+      if (old) old.replaceWith(measurementList(msCur, rows, editable, refreshList));
+      if (activeViewer && activeViewer.redraw) activeViewer.redraw();
+      return msCur;
     };
+    // the manual measurements of a drawing, drawn over it by the viewer
+    const savedOf = did => [...msCur.measurements, ...msCur.unlinked].filter(m => m.drawing_id === did && m.tool === 'manual' && m.geom);
     if (!editable) box.append(h('p', { class: 'muted' }, canWrite() && T.status !== 'draft' ? t('dw_read_only_note') : t('read_only')));
     if (editable) box.append(uploadPanel(id));
     const cur = list.find(d => d.id === focusId) || [...list].reverse().find(d => d.status === 'ready') || list[list.length - 1] || null;
@@ -575,29 +584,29 @@
     // a PDF whose pages are not registered yet: this browser reads them (pdf.js) and tells the server, then the tab again.
     // A failure is shown (and not tried again until the page is reloaded).
     const pagesBox = h('div', { id: 'dw-pages' });
-    const pagesFail = msg => pagesBox.replaceChildren(h('div', { id: 'dw-pages-error', class: 'banner banner-red' }, h('strong', null, t('dw_pages_failed')), ': ', msg));
+    const pagesFail = msg => pagesBox.replaceChildren(h('div', { id: 'dw-pages-error', class: 'banner banner-red' }, h('strong', null, t('dw_pages_failed')), ': ', msg, ' ', h('span', { class: 'small' }, t('dw_pages_retry'))));
     if (editable) for (const d of list.filter(x => x.status === 'pages' && !pagesFailed.has(x.id))) readPages(d, msg => { if (cur && d.id === cur.id && pagesBox.isConnected) pagesFail(msg); });
     if (cur && cur.status === 'pages') {
       if (editable && pagesFailed.has(cur.id)) pagesFail(pagesFailed.get(cur.id));
       else pagesBox.append(h('p', { id: 'dw-pages-wait', class: 'muted' }, editable ? t('dws_pages') : t('dw_pages_later')));
     }
-    if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) box.append(rasterCard(cur));
+    if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) box.append(rasterCard(cur, rows, editable, savedOf, refreshList));
     else if (cur && cur.status === 'pages') box.append(pagesBox);
     else if (cur && cur.status === 'ready') {
       // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
-      try { await drawingPanel(box, cur, ms, rows, editable, refreshList); }
+      try { await drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf); }
       catch (e) { box.append(h('div', { id: 'dw-panel-error', class: 'banner banner-red' }, h('strong', null, t('dw_panel_failed')), ': ', e.message)); }
     }
     else if (cur && cur.status === 'failed') box.append(h('div', { class: 'banner banner-red' }, h('strong', null, t('dw_parse_failed')), ': ', cur.error || ''));
     else if (cur) box.append(h('p', { class: 'muted' }, t('dw_parsing')));
-    box.append(measurementList(ms, rows, editable));
+    box.append(measurementList(ms, rows, editable, refreshList));
     body.append(box);
   }
 
-  async function drawingPanel(box, cur, ms, rows, editable, refreshList) {
+  async function drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf) {
     const [d, lt] = await Promise.all([api('GET', 'drawings/' + cur.id), api('GET', `drawings/${cur.id}/layers`)]);
     const confirmed = lt.units_confirmed, measured = [...ms.measurements, ...ms.unlinked].some(m => m.drawing_id === d.id);
-    box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList));
+    box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList, editable, savedOf));
     // units: the suggestion is pre-selected, nothing is computed until Confirm
     const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable || measured });
     const ignored = Object.entries(d.ignored || {});
@@ -647,7 +656,6 @@
 
   // ---- drawing viewer (public/viewer/*.js): the drawing on a canvas, a selection and its preview ----
   // Display only: the preview is approximate and labelled so; a linked selection's qty comes from the server.
-  const UNIT_TO_M = { mm: 0.001, cm: 0.01, m: 1, km: 1000, ft: 0.3048, in: 0.0254 };   // as lib/units.js
   const kindName = k => ({ 0: t('tv_k_open'), 1: t('tv_k_closed'), 2: t('tv_k_insert'), 3: t('tv_k_text'), 4: t('tv_k_dropped'), 5: t('tv_k_nested') })[k] || String(k);
   // a count's per-block breakdown, "DOOR 10 · HINGE 20 nested" (spec 6.4: top-level inserts by name, nested ones apart).
   // list: [{ block, top, nested }]; nestedOn false: the nested numbers are marked as not counted
@@ -672,14 +680,15 @@
     } catch (e) { fail(e); }
   }
 
-  function viewerCard(d, lt, rows, canLink, refreshList) {
+  // canLink: a selection can be linked (editable, units confirmed); editable: the measuring tools are shown
+  function viewerCard(d, lt, rows, canLink, refreshList, editable, savedOf) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id) });
     const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
     const idle = (...extra) => { openBtn.disabled = false; sec.replaceChildren(title(), ...extra, openBtn); };
     idle();
     viewerOpeners.set(d.id, openViewer);
-    const f = lt.units_confirmed ? UNIT_TO_M[lt.units] : null;
+    const f = lt.units_confirmed ? d.unit_to_m[lt.units] : null;   // the server's unit table (GET drawings/:id)
 
     const errorBanner = msg => h('div', { id: 'tv-error', class: 'banner banner-red' }, h('strong', null, t('tv_unavailable')), ': ', msg);
     // one open at a time per card: a second Open or Show while loading waits for the same one. Any failure (the download,
@@ -720,12 +729,16 @@
         h('span', { class: 'tv-metric', 'data-metric': mt }, metricLabel(mt) + ' ', vals[mt] = h('span', { class: 'v num' }, '—'))), previewBlocks);
       const host = h('div', { id: 'tv-link-host' }), selListeners = new Set();
       const modeBtns = {};
+      let mp = null, cur = null;   // the measuring tools; the cursor in drawing units
+      const barBox = h('div'), infoBox = h('div');
       const modeBtn = (m, label) => modeBtns[m] = h('button', { id: 'tv-mode-' + m, class: 'small secondary' + (m === 'select' ? ' active' : ''), 'aria-pressed': m === 'select' ? 'true' : 'false', onclick: () => {
+        if (mp) mp.tools.cancel();   // a selection mode leaves the measuring tool
         eng.setMode(m);
         for (const [k, b] of Object.entries(modeBtns)) { b.classList.toggle('active', k === m); b.setAttribute('aria-pressed', k === m ? 'true' : 'false'); }
       } }, label);
       const snapCb = h('input', { type: 'checkbox', id: 'tv-snap', onchange: () => eng.setSnap(snapCb.checked) });
       const linkBtn = canLink ? h('button', { id: 'tv-link', class: 'small', onclick: () => {
+        if (mp) mp.tools.cancel();   // one link form at a time
         selListeners.clear();
         const form = linkForm({ drawing_id: d.id, tool: 'dxf_selection', metric: 'open_length', handles: () => eng.selectedHandles(), count: () => Number(selected.getAttribute('data-n')),
           onSelectionChange: fn => selListeners.add(fn), setNested: on => { nestedOn = on; showSel(); },
@@ -748,14 +761,15 @@
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
           h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
-        h('p', { class: 'muted small' }, t('tv_help')),
+        barBox,
+        h('p', { class: 'muted small' }, t('tv_help'), editable ? ' ' + t('tl_help_dxf') : ''),
         h('div', { class: 'tv-body' },
           h('aside', { id: 'tv-layers', class: 'tv-layers' }, h('div', { class: 'row' },
             h('button', { id: 'tv-all', class: 'small secondary', onclick: () => setAll(true) }, t('all')),
             h('button', { id: 'tv-none', class: 'small secondary', onclick: () => setAll(false) }, t('tv_none'))), layersBox),
           h('div', { class: 'tv-canvas-wrap' }, canvas)),
         h('div', { id: 'tv-status', class: 'tv-status small' }, cursor, selected, selBlocks, notes, highlightTxt, hover),
-        preview, saved, host);
+        preview, saved, host, infoBox);
 
       const units = d.units || '';
       const showCursor = w => { cursor.textContent = iso('X ' + w[0].toFixed(3) + '  Y ' + w[1].toFixed(3) + (units ? ' ' + units : '')); };
@@ -781,7 +795,19 @@
         notes.replaceChildren(...[dropped ? h('span', { class: 'tag warn-tag' }, t('dw_dropped', { n: dropped })) : null, noArea ? h('span', { class: 'tag warn-tag' }, t('dw_area_excluded', { n: noArea })) : null].filter(Boolean));
         for (const fn of selListeners) fn();
       };
-      const eng = TVCanvas.create(canvas, R, { alive: () => tok === routeTok, onSelect: showSel, onHover: showHover, onCursor: showCursor });
+      const eng = TVCanvas.create(canvas, R, { alive: () => tok === routeTok, onSelect: showSel, onHover: showHover,
+        onCursor: w => { showCursor(w); cur = w; },
+        // a measuring tool: the snap point when Snap is on (TV.snap: the exact true vertex, R7), else the cursor
+        onClick: (w, e, snap) => { if (mp) mp.tools.pick(snap ? [snap.x, snap.y] : w, e); },
+        onDrag: (a, b) => { if (mp) mp.tools.drag(a, b); },
+        onDraw: ctx => { if (mp) mp.draw(ctx); } });
+      mp = measurePanel({ d, kind: 'dxf', unit: lt.units || '', editable, rows, savedOf: () => savedOf(d.id), refreshList, alive: () => tok === routeTok,
+        dxfScale: () => f, cursor: () => { const sp = eng.snapPoint(); return sp ? [sp.x, sp.y] : cur; },
+        eng: { canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
+          setToolMode: on => { eng.setTool(on); if (on && !snapCb.checked) { snapCb.checked = true; eng.setSnap(true); } } } });
+      barBox.replaceWith(mp.bar || '');
+      infoBox.replaceWith(mp.info);
+      window.__tvTools = mp.tools;   // test hook
       const boxes = R.layers.map((l, i) => h('input', { type: 'checkbox', checked: eng.layerOn(i), onchange: ev => eng.setLayers([i], ev.target.checked) }));
       const setAll = on => { boxes.forEach(b => { b.checked = on; }); eng.setLayers(R.layers.map((l, i) => i), on); };
       layersBox.append(...R.layers.map((l, i) => h('label', { class: 'tv-layer', 'data-layer': l.name }, boxes[i],
@@ -802,7 +828,8 @@
             r.layersOn.length ? [' · ' + t('tv_layers_turned_on') + ': ', r.layersOn.map((i, k) => [k ? ', ' : '', h('span', { dir: 'auto' }, R.layers[i].name)])] : null));
           sec.scrollIntoView({ block: 'nearest' });
         },
-        close: () => { eng.destroy(); window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); },
+        redraw: () => eng.requestDraw(),
+        close: () => { mp.destroy(); eng.destroy(); window.__tvViewer = null; window.__tvTools = null; if (tok === routeTok && sec.isConnected) idle(); },
       };
     }
     return sec;
@@ -849,7 +876,7 @@
   }
 
   // ---- PDF page / image viewer (public/viewer/raster.js): the page on a canvas, zoom and pan; display only ----
-  function rasterCard(d) {
+  function rasterCard(d, rows, editable, savedOf, refreshList) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id), 'data-kind': d.kind });
     const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
@@ -875,27 +902,51 @@
       closeViewer();
       const tok = routeTok;
       openBtn.disabled = true;
+      // the calibrations and the server's unit table come with the drawing
+      const full = await api('GET', 'drawings/' + d.id);
+      if (tok !== routeTok) return;
       const wrap = h('div', { class: 'tv-canvas-wrap' }), cursor = h('span', { id: 'tv-cursor' });
+      let mp = null, cur = null;   // the measuring tools; the cursor in page units
       const showCursor = p => { cursor.textContent = p ? iso('X ' + p[0].toFixed(2) + '  Y ' + p[1].toFixed(2) + ' ' + unit) : ''; };
+      const barBox = h('div'), infoBox = h('div');
       sec.replaceChildren(title(), info,
         h('div', { class: 'row wrap tv-toolbar' },
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
-        h('p', { class: 'muted small' }, t('tv_raster_help')),
+        barBox,
+        h('p', { class: 'muted small' }, t('tv_raster_help'), editable ? ' ' + t('tl_help_raster') : ''),
         h('p', { class: 'muted', id: 'tv-loading' }, t('loading')),
-        wrap, h('div', { id: 'tv-status', class: 'tv-status small' }, cursor));
+        wrap, h('div', { id: 'tv-status', class: 'tv-status small' }, cursor), infoBox);
       const eng = TVRaster.create(wrap, { kind: d.kind, url: `/api/drawings/${d.id}/file`, page: d.page, pageW: d.page_w, pageH: d.page_h, rotation: d.rotation,
-        alive: () => tok === routeTok, onCursor: showCursor, onError: e => {   // a render failed: one banner, the latest reason
+        alive: () => tok === routeTok, onError: e => {   // a render failed: one banner, the latest reason
           if (!sec.isConnected) return;
           const b = errorBanner(why(e)), old = sec.querySelector('#tv-error');
           if (old) old.replaceWith(b); else sec.append(b);
-        } });
+        },
+        onCursor: p => { showCursor(p); cur = p; if (mp && mp.tools.tool()) eng.requestDraw(); },
+        onClick: (p, e) => { if (mp) mp.tools.pick(p, e); },
+        onDrag: (a, b) => { if (mp) mp.tools.drag(a, b); },
+        onDraw: ctx => { if (mp) mp.draw(ctx); } });
       eng.canvas.id = 'tv-canvas';
       window.__tvViewer = eng;   // test hook
-      const mine = activeViewer = { drawingId: d.id, highlight: () => {}, close: () => { eng.destroy(); if (window.__tvViewer === eng) window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); } };
+      // no snap on a page; Shift keeps a segment horizontal or vertical; a tool takes the left button (pan: middle/right)
+      mp = measurePanel({ d: full, kind: d.kind, unit, editable, rows, savedOf: () => savedOf(d.id), refreshList, alive: () => tok === routeTok,
+        cals: full.calibrations || [], units: Object.keys(full.unit_to_m || {}), cursor: () => cur, axisLock: true,
+        eng: { canvas: eng.canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
+          setToolMode: on => eng.setPanOnLeft(!on) } });
+      barBox.replaceWith(mp.bar || '');
+      infoBox.replaceWith(mp.info);
+      window.__tvTools = mp.tools;   // test hook
+      const mine = activeViewer = { drawingId: d.id, highlight: () => {}, redraw: () => eng.requestDraw(), close: () => {
+        mp.destroy(); eng.destroy();
+        if (window.__tvViewer === eng) window.__tvViewer = null;
+        if (window.__tvTools === mp.tools) window.__tvTools = null;
+        if (tok === routeTok && sec.isConnected) idle();
+      } };
       try { await eng.ready; } catch (e) {
         if (activeViewer !== mine || tok !== routeTok) return;   // closed or left while loading: nothing to report
-        activeViewer = null; eng.destroy(); if (window.__tvViewer === eng) window.__tvViewer = null;
+        activeViewer = null; mp.destroy(); eng.destroy(); if (window.__tvViewer === eng) window.__tvViewer = null;
+        if (window.__tvTools === mp.tools) window.__tvTools = null;
         throw e;
       }
       const l = sec.querySelector('#tv-loading');
@@ -903,6 +954,215 @@
       eng.canvas.setAttribute('data-ready', '1');
     }
     return sec;
+  }
+
+  // ---- measuring and calibration tools (public/viewer/tools.js) on either viewer ----
+  // The live value is TakeoffManual.manualQty (lib/takeoff/manual.js: the server's own formulas, called without its third
+  // argument so it validates the shape) at the scale the server would use: the calibration of the region holding the
+  // first point, else the page's (PDF/image), or the confirmed units (DXF, the server's unit table). Until then "—" and
+  // why. A count on a PDF/image needs no calibration (R14). It is a preview: the saved quantity comes from the server.
+  const GEOM_MSG = [[/must not self-intersect/, () => t('tl_e_self')], [/hole \d+ (lies outside|touches or crosses)|holes \d+ and \d+|inside hole/, () => t('tl_e_hole')],
+    [/repeated point/, () => t('tl_e_repeat')], [/has no area|size > 0/, () => t('tl_e_no_area')], [/too small at this scale/, () => t('tl_e_small')]];
+  // a shape refusal (the preview's or the server's) in the user's words; any other message as it is
+  const geomMsg = m => { for (const [re, f] of GEOM_MSG) if (re.test(m)) return f(); return m; };
+  const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+  const fmtPct = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');
+  // a calibration's verify %, in the warning colour above 1 %
+  const verifiedTag = c => fin(c.verify_pct) ? h('span', { class: Math.abs(c.verify_pct) > 1 ? 'pct-warn' : 'pct-ok' }, t('tl_verified', { pct: fmtPct(c.verify_pct) }))
+    : h('span', { class: 'muted' }, t('tl_not_verified'));
+  const MEASURE_TOOLS = ['line', 'polyline', 'area', 'rect', 'count'];
+
+  // c: { d (with id), kind: 'dxf'|'pdf'|'image', unit (label of a drawing/page unit), editable, rows, savedOf(), refreshList(),
+  //      alive(), cursor(), axisLock, dxfScale() (DXF), cals, units (PDF/image),
+  //      eng: { canvas, toScreen(p), toPage(sx, sy), requestDraw(), setToolMode(on) } }
+  // -> { bar (null when read only), info, tools, draw(ctx), destroy() }
+  function measurePanel(c) {
+    const raster = c.kind !== 'dxf';
+    let cals = c.cals || [], region = null;   // region: drawn, waiting for its calibration
+    const scaleEl = h('div', { id: 'tl-scale', class: 'small' });
+    const valEl = h('span', { class: 'v num' }, '—'), whyEl = h('span', { id: 'tl-why', class: 'muted' }), extraEl = h('span', { class: 'muted small' });
+    const previewEl = h('div', { id: 'tl-preview' }, h('strong', null, t('tl_preview') + ':'), valEl, whyEl, extraEl);
+    const warnEl = h('div', { id: 'tl-warn' }), msgEl = h('div', { id: 'tl-msg' }), vfBox = h('div'), calBox = h('div'), linkHost = h('div', { id: 'tl-link-host' });
+    const say = (text, cls) => msgEl.replaceChildren(...(text ? [h('p', { class: cls || 'small' }, text)] : []));
+
+    function showScale() {
+      if (!raster) { const s = c.dxfScale(); scaleEl.replaceChildren(s ? t('tl_scale_dxf', { u: c.unit, s: fmtScale(s) }) : h('span', { class: 'warn' }, t('tl_units_none'))); return; }
+      const page = cals.find(x => x.region === null), regs = cals.filter(x => x.region !== null);
+      scaleEl.replaceChildren(...(page ? [t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) }), ' · ', verifiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
+        ...regs.flatMap((x, k) => [' — ', t('tl_scale_region', { n: k + 1, u: c.unit, s: fmtScale(x.scale) }), ' · ', verifiedTag(x)]));
+    }
+    // { scale } or { reason }: as the server resolves it (modules/drawings.js createManual)
+    const scaleAt = g => {
+      if (!raster) { const s = c.dxfScale(); return s ? { scale: s } : { reason: t('tl_confirm_units') }; }
+      if (g.tool === 'count') return { scale: null };
+      const cal = TVTools.calibrationFor(cals, TakeoffManual.firstPoint(g));
+      return cal ? { scale: cal.scale } : { reason: t('tl_calibrate_first') };
+    };
+    function showPreview() {
+      const g = tools.geom(), tl = tools.tool();
+      valEl.textContent = '—'; valEl.removeAttribute('data-qty'); whyEl.textContent = ''; extraEl.textContent = '';
+      if (!g) { if (MEASURE_TOOLS.includes(tl)) whyEl.textContent = t('tl_add_points'); warnEl.replaceChildren(); return; }
+      const s = scaleAt(g);
+      let q = null, err = null;
+      try {
+        if (s.reason) TakeoffManual.validateGeom(g);   // no number, but a shape the server refuses is said at once
+        else q = TakeoffManual.manualQty(g, { scale: s.scale });
+      } catch (e) { err = e; }
+      if (s.reason) whyEl.textContent = s.reason;
+      if (q) {
+        valEl.textContent = (q.metric === 'count' ? fmtQ(q.qty) : fmt2(q.qty)) + ' ' + q.qty_unit;
+        valEl.setAttribute('data-qty', String(q.qty));
+        if (fin(q.perimeter)) extraEl.textContent = metricLabel('perimeter') + ' ' + fmt2(q.perimeter) + ' m';
+      }
+      // R15: allowed, but worth a look: a path doubling back; a very sharp turn (a ring that doubles back is refused above)
+      const paths = g.tool === 'line' || g.tool === 'polyline' ? [[g.pts, false]] : g.tool === 'area' ? [[g.outer, true], ...g.holes.map(x => [x, true])] : [];
+      const ws = paths.flatMap(([pts, closed]) => TVTools.pathWarnings(pts, closed).filter(w => !closed || w.code === 'sharp'));
+      warnEl.replaceChildren(...(err ? [h('p', { class: 'err small', title: err.message }, geomMsg(err.message))] : []),
+        ...ws.map(w => h('p', { class: 'warn small' }, w.code === 'back' ? t('tl_w_back', { i: w.at }) : t('tl_w_sharp', { i: w.at }))));
+    }
+
+    // Finish: a shape opens the link form (the batch 1/2 form), two points open the calibration or verify form
+    function onFinish(kind, data) {
+      say('');
+      if (!c.editable) return false;
+      if (kind === 'measure') {
+        const s = scaleAt(data);
+        if (s.reason) { say(t('tl_cannot_link', { why: s.reason }), 'err small'); return false; }
+        try { TakeoffManual.validateGeom(data); } catch (e) { say(geomMsg(e.message), 'err small'); return false; }
+        openLink(data);
+        return true;
+      }
+      if (kind === 'region') {
+        const r = [Math.min(data.p1[0], data.p2[0]), Math.min(data.p1[1], data.p2[1]), Math.max(data.p1[0], data.p2[0]), Math.max(data.p1[1], data.p2[1])];
+        if (!(r[2] > r[0] && r[3] > r[1])) return false;
+        region = r;
+        tools.setTool('calibrate');
+        say(t('tl_region_next'));
+        return false;
+      }
+      if (kind === 'verify') {
+        // the calibration being verified is the one of the line's first point; a line across a region edge checks nothing
+        const a = TVTools.calibrationFor(cals, data.p1), b = TVTools.calibrationFor(cals, data.p2);
+        if (!a) { say(t('vf_no_cal'), 'err small'); return false; }
+        if (a !== b) { say(t('vf_one_region'), 'err small'); return false; }
+        calForm(data, a);
+        return true;
+      }
+      calForm(data, null);
+      return true;
+    }
+    function openLink(g) {
+      const other = document.querySelector('#tv-link-host #lk-cancel');   // the viewer's selection form: one link form at a time
+      if (other) other.click();
+      linkHost.replaceChildren(linkForm({ drawing_id: c.d.id, tool: 'manual', geom: g, onSaved: async res => {
+        linkHost.replaceChildren(); tools.clear();
+        say(t('tl_saved', { qty: fmt2(res.qty), unit: res.qty_unit || '' }));
+        try { await c.refreshList(); } catch (e) { fail(e); }
+      } }, c.rows, () => { linkHost.replaceChildren(); tools.clear(); }));
+    }
+
+    async function reloadCals() {
+      const j = await api('GET', 'drawings/' + c.d.id);
+      cals = j.calibrations || [];
+      showScale(); showPreview(); c.eng.requestDraw();
+    }
+    // calibrate (page, or the region just drawn) or verify (cal: the calibration checked): the real length between the points
+    function calForm(p, cal) {
+      const isV = !!cal, reg = !isV && region ? region.slice() : null;
+      const real = inp('cal-real', '', { class: 'w-num', inputmode: 'decimal' }), unit = sel('cal-unit', 'm', (c.units || []).map(u => [u, u]));
+      const msg = h('div', { id: 'cal-msg' });
+      // gen: bumped by any change; a reply to an older request is not acted on, and a before/after table belongs to the
+      // numbers it was computed for (Apply re-sends exactly those)
+      let gen = 0;
+      const changed = () => { gen++; msg.replaceChildren(); };
+      real.addEventListener('input', changed); unit.addEventListener('change', changed);
+      const close = () => { calBox.replaceChildren(); tools.clear(); };
+      const done = async res => {
+        region = null; calBox.replaceChildren(); tools.cancel();
+        say(t('cal_done', { u: c.unit, s: fmtScale(res.calibration.scale), n: res.changes.length }));
+        await reloadCals();
+        if (res.changes.length) await c.refreshList();
+      };
+      const changesTable = (changes, body) => {
+        const ms = new Map(c.savedOf().map(m => [m.id, m])), rowName = id => { const r = c.rows.find(x => x.id === id); return r ? rowText(r) : '—'; };
+        const apply = h('button', { id: 'cal-apply', onclick: async () => {
+          apply.disabled = true;
+          try { await done(await api('POST', `drawings/${c.d.id}/calibrations`, { ...body, apply: true })); }
+          catch (e) { apply.disabled = false; msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message)); }
+        } }, t('cal_apply'));
+        msg.replaceChildren(h('p', { class: 'warn' }, t('cal_changes')),
+          h('div', { class: 'scroll' }, table([t('m_label'), t('row'), t('cal_before'), t('cal_after'), t('unit')], changes.map(x => {
+            const m = ms.get(x.measurement_id) || {};
+            return h('tr', null, h('td', null, h('span', { dir: 'auto' }, m.label || '#' + x.measurement_id)), h('td', null, h('span', { dir: 'auto' }, x.row_id === null ? '—' : rowName(x.row_id))),
+              h('td', { class: 'num' }, fmt2(x.old_qty)), h('td', { class: 'num' }, fmt2(x.new_qty)), h('td', null, m.qty_unit || ''));
+          }), { class: 'grid', id: 'cal-changes' })), h('div', { class: 'row' }, apply));
+      };
+      const save = h('button', { id: 'cal-save', onclick: async () => {
+        let r;
+        try { r = strictNum(real.value, t('cal_real')); } catch (e) { msg.replaceChildren(h('p', { class: 'err' }, e.message)); return; }
+        const body = { p1: p.p1, p2: p.p2, real: r, unit: unit.value, ...(reg ? { region: reg } : {}) };
+        const g = gen;
+        save.disabled = true;
+        try {
+          if (isV) {
+            const res = await api('POST', `drawings/${c.d.id}/calibrations/${cal.id}/verify`, body);
+            vfBox.replaceChildren(h('p', { id: 'vf-result', class: 'small' }, t('vf_result') + ': ', h('span', { class: res.warning ? 'pct-warn' : 'pct-ok' }, fmtPct(res.pct)),
+              res.warning ? ' — ' + t('vf_warn') : ''));
+            calBox.replaceChildren(); tools.cancel();
+            await reloadCals();
+            return;
+          }
+          await done(await api('POST', `drawings/${c.d.id}/calibrations`, body));
+        } catch (e) {
+          save.disabled = false;
+          if (g !== gen) msg.replaceChildren(h('p', { class: 'warn' }, t('lk_changed_save_again')));
+          else if (!isV && e.status === 409 && e.body && Array.isArray(e.body.changes)) changesTable(e.body.changes, body);   // nothing changes before Apply
+          else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message));
+        }
+      } }, isV ? t('vf_save') : t('cal_save'));
+      const dist = Math.hypot(p.p2[0] - p.p1[0], p.p2[1] - p.p1[1]);
+      calBox.replaceChildren(h('div', { id: 'cal-form', class: 'lk-form' }, h('h3', null, isV ? t('vf_title') : reg ? t('cal_region_title') : t('cal_title')),
+        h('p', { class: 'small muted' }, t('cal_points', { d: fmt2(dist), u: c.unit })),
+        h('div', { class: 'form-grid' }, field(t('cal_real'), real), field(t('cal_unit'), unit)), msg,
+        h('div', { class: 'row' }, save, h('button', { id: 'cal-cancel', class: 'secondary', onclick: close }, t('cancel')))));
+      real.focus();
+    }
+
+    const tools = TVTools.create({ canvas: c.eng.canvas, toScreen: c.eng.toScreen, toPage: c.eng.toPage, requestDraw: c.eng.requestDraw, axisLock: !!c.axisLock,
+      alive: c.alive, cursor: c.cursor, onFinish,
+      onNote: (k, n) => say(k === 'same_point' ? t('tl_same_point') : t('tl_need_points', { n }), 'warn small'),
+      overlay: () => ({
+        saved: c.savedOf().map(m => ({ id: m.id, geom: m.geom, color: m.color, text: (m.label ? m.label + ' · ' : '') + (m.metric === 'count' ? fmtQ(m.qty) : fmt2(m.qty)) + ' ' + (m.qty_unit || '') })),
+        cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: '1 ' + c.unit + ' = ' + fmtScale(x.scale) + ' m' })) : [],
+        region,
+      }),
+      onChange: () => {
+        if (tools.tool() !== 'calibrate') region = null;
+        if (!tools.isDone()) { linkHost.replaceChildren(); calBox.replaceChildren(); }   // Esc, Cancel or another tool: the form goes with its shape
+        showBar(); showPreview();
+      } });
+
+    const btns = {};
+    const TOOLS = raster ? [...MEASURE_TOOLS, 'calibrate', 'verify', 'region'] : MEASURE_TOOLS;   // a DXF is calibrated by its units
+    const bar = c.editable ? h('div', { id: 'tl-tools', class: 'row wrap tv-toolbar' }, h('span', { class: 'small muted' }, t('tl_measure') + ':'),
+      TOOLS.map(k => btns[k] = h('button', { id: 'tl-' + k, class: 'small secondary', 'aria-pressed': 'false', onclick: () => { say(''); tools.setTool(k); } }, toolName(k))),
+      btns.hole = h('button', { id: 'tl-hole', class: 'small secondary', onclick: () => tools.hole() }, t('tl_hole')),
+      btns.undo = h('button', { id: 'tl-undo', class: 'small secondary', onclick: () => tools.undo() }, t('tl_undo')),
+      btns.finish = h('button', { id: 'tl-finish', class: 'small', onclick: () => tools.finish() }, t('tl_finish')),
+      btns.cancel = h('button', { id: 'tl-cancel', class: 'small secondary', onclick: () => { say(''); tools.cancel(); } }, t('tl_cancel'))) : null;
+    function showBar() {
+      const tl = tools.tool();
+      c.eng.setToolMode(!!tl);
+      if (!bar) return;
+      for (const k of TOOLS) { btns[k].classList.toggle('active', k === tl); btns[k].setAttribute('aria-pressed', k === tl ? 'true' : 'false'); }
+      btns.hole.style.display = tl === 'area' ? '' : 'none';
+      btns.hole.disabled = tools.isDone();
+      btns.undo.disabled = !tl || tools.isDone() || !tools.pointCount();
+      btns.finish.disabled = !tl || tools.isDone();
+      btns.cancel.disabled = !tl;
+    }
+    showScale(); showBar(); showPreview();
+    return { bar, info: h('div', { class: 'tl-info' }, scaleEl, previewEl, warnEl, msgEl, vfBox, calBox, linkHost), tools, draw: ctx => tools.draw(ctx), destroy: () => tools.destroy() };
   }
 
   // drawing-level warnings, one line per code with how many and the first few entity handles
@@ -960,18 +1220,23 @@
   // target: a layer metric or block count ({ tool, layer, metric, block? }) or a viewer selection
   // ({ tool: 'dxf_selection', metric, handles(), count(), onSelectionChange(fn), onSaved(result) }: a metric picker;
   // a change of the selection drops the confirmations like a change of row, metric or numbers)
+  // A drawn shape ({ tool: 'manual', geom, onSaved }, batch 3) takes the same form: an area or a rect picks area or perimeter,
+  // and it may be a deduction (subtracted from the row).
   function linkForm(target, rows, close) {
-    const isSel = target.tool === 'dxf_selection';
-    let metric = target.metric;
-    const isLen = () => metric === 'open_length' || metric === 'closed_perimeter';
+    const isSel = target.tool === 'dxf_selection', isMan = target.tool === 'manual';
+    const closed = isMan && (target.geom.tool === 'area' || target.geom.tool === 'rect');
+    let metric = isMan ? (target.geom.tool === 'count' ? 'count' : closed ? 'area' : 'length') : target.metric;
+    const isLen = () => ['open_length', 'closed_perimeter', 'length', 'perimeter'].includes(metric);
     const count = metric === 'count';
-    const metricSel = isSel ? sel('lk-metric', metric, ['open_length', 'closed_perimeter', 'area', 'count'].map(x => [x, metricLabel(x)])) : null;
+    const metricSel = isSel ? sel('lk-metric', metric, ['open_length', 'closed_perimeter', 'area', 'count'].map(x => [x, metricLabel(x)]))
+      : closed ? sel('lk-metric', metric, ['area', 'perimeter'].map(x => [x, metricLabel(x)])) : null;
     const rowSel = sel('lk-row', '', rowOpts(rows));
-    const w = isSel || isLen() ? inp('lk-width', '', { class: 'w-num', inputmode: 'decimal' }) : null, dp = !isSel && count ? null : inp('lk-depth', '', { class: 'w-num', inputmode: 'decimal' });
+    const w = isSel || closed || isLen() ? inp('lk-width', '', { class: 'w-num', inputmode: 'decimal' }) : null, dp = !isSel && count ? null : inp('lk-depth', '', { class: 'w-num', inputmode: 'decimal' });
     const fac = inp('lk-factor', '', { class: 'w-num', inputmode: 'decimal', placeholder: '1' }), label = inp('lk-label', '', { maxlength: 200 });
     // a block count: include the inserts nested in blocks (dxf_blocks when the block has nested ones; a selection's count)
     const nested = isSel || (count && target.has_nested) ? h('input', { type: 'checkbox', id: 'lk-nested' }) : null;
     const nestedF = nested ? field(t('lk_nested'), nested, 'check') : null;
+    const deduct = isMan ? h('input', { type: 'checkbox', id: 'lk-deduct' }) : null;
     const wF = w ? field(t('width'), w) : null, dpF = dp ? field(t('depth'), dp) : null, dimsNote = h('p', { class: 'muted small' }, t('lk_dims_note'));
     const shown = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };   // .field sets display, so not [hidden]
     const showDims = () => { shown(wF, isLen()); shown(dpF, metric !== 'count'); shown(dimsNote, isLen() || metric === 'area'); shown(nestedF, metric === 'count'); };
@@ -982,6 +1247,8 @@
     const clear = () => { gen++; cb.reset(); msg.replaceChildren(); };
     rowSel.addEventListener('change', clear);
     for (const x of [w, dp, fac]) if (x) x.addEventListener('input', clear);
+    if (deduct) deduct.addEventListener('change', clear);
+    if (closed) metricSel.addEventListener('change', () => { metric = metricSel.value; showDims(); clear(); });
     const selWhat = isSel ? h('span', { id: 'lk-sel-n' }, t('tv_selection_n', { n: target.count() })) : null;
     if (isSel) {
       metricSel.addEventListener('change', () => {
@@ -992,11 +1259,13 @@
       nested.addEventListener('change', () => { clear(); target.setNested(nested.checked); });
       target.onSelectionChange(() => { clear(); selWhat.textContent = t('tv_selection_n', { n: target.count() }); });
     }
-    const what = isSel ? selWhat : target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
+    const what = isMan ? t('lk_shape', { shape: toolName(target.geom.tool), n: TakeoffManual.pointCount(target.geom) }) : isSel ? selWhat : target.tool === 'dxf_blocks' ? [h('span', { dir: 'auto' }, target.layer), ' / ', h('span', { dir: 'auto' }, target.block), ' — ' + metricLabel('count')]
       : [h('span', { dir: 'auto' }, target.layer), ' — ' + metricLabel(target.metric)];
     const save = h('button', { id: 'lk-save', onclick: async () => {
-      const b = { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, metric, ...cb.flags() };
-      if (isSel) {
+      const b = isMan ? { row_id: rowSel.value ? Number(rowSel.value) : null, tool: 'manual', geom: target.geom, ...(closed ? { metric } : {}), ...cb.flags() }
+        : { row_id: rowSel.value ? Number(rowSel.value) : null, tool: target.tool, metric, ...cb.flags() };
+      if (isMan) { if (deduct.checked) b.deduct = true; }
+      else if (isSel) {
         b.handles = target.handles();
         if (metric === 'count' && nested.checked) b.nested = true;
         if (!b.handles.length) { msg.replaceChildren(h('p', { class: 'err' }, t('tv_nothing_selected'))); return; }
@@ -1016,7 +1285,10 @@
         save.disabled = false;
         // a refusal of what was sent before a change: no confirm box (it would go out with the new choice)
         if (g !== gen) msg.replaceChildren(h('p', { class: 'warn', id: 'lk-changed' }, t('lk_changed_save_again')));
-        else linkRefusal(e, msg, cb.add, isSel, isSel && metric === 'count' && !b.nested && target.hasNested());
+        else {
+          if (isMan) e.message = geomMsg(e.message);   // a shape the server refuses, in words
+          linkRefusal(e, msg, cb.add, isSel, isSel && metric === 'count' && !b.nested && target.hasNested());
+        }
         return;
       }
       flash(t('saved'), 'ok');
@@ -1024,12 +1296,13 @@
     } }, t('lk_save'));
     return h('div', { id: 'lk-form', class: 'lk-form' }, h('h3', null, t('lk_title')), h('p', null, t('lk_what') + ': ', what),
       h('div', { class: 'form-grid' }, metricSel ? field(t('m_metric'), metricSel) : null, field(t('lk_row'), rowSel, 'wide'), wF, dpF, field(t('lk_factor'), fac),
-        field(t('lk_label'), label), nestedF),
+        field(t('lk_label'), label), nestedF, deduct ? field(t('lk_deduct'), deduct, 'check') : null),
       dimsNote, msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'lk-cancel', class: 'secondary', onclick: close }, t('cancel'))));
   }
 
-  // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink
-  function measurementList(ms, rows, editable) {
+  // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink. onChanged: refresh after
+  // an edit (the tab's list and the viewer's overlays, in place); else the tab is drawn again
+  function measurementList(ms, rows, editable, onChanged) {
     // a selection count: its stored per-block breakdown (summaries saved before it have { block, count } only)
     const selBlocks = m => {
       const bl = m.metric === 'count' && m.selection_summary && Array.isArray(m.selection_summary.blocks) ? m.selection_summary.blocks : [];
@@ -1042,13 +1315,33 @@
       }
       return h('div', { class: 'small muted m-blocks' }, blockBreakdown([...by.values()], !!m.nested));
     };
-    const src = m => m.tool === 'dxf_selection' ? [h('span', { class: 'm-sel' }, t('m_selection', { n: m.handles_count || 0 })), ' ',
+    const src = m => m.tool === 'manual' ? h('span', { class: 'm-man' }, t('m_manual') + ': ' + toolName(m.geom && m.geom.tool))
+      : m.tool === 'dxf_selection' ? [h('span', { class: 'm-sel' }, t('m_selection', { n: m.handles_count || 0 })), ' ',
       h('button', { class: 'small secondary m-show', onclick: () => showSelection(m) }, t('m_show')), selBlocks(m)]
       : [h('span', { dir: 'auto' }, m.layer), m.block ? [' / ', h('span', { dir: 'auto' }, m.block), m.nested ? h('span', { class: 'tag' }, t('lk_nested')) : null] : null];
     // spec 5.6: the formula with its inputs, "<metric> <base> <unit> × width w × depth d × factor f = qty unit" (width/depth
     // only when given, factor only when not 1). A measurement saved before `base` was stored derives it from qty when every
     // factor is known; otherwise only the qty is shown.
+    // a drawn shape (spec 5.6, batch 3): the shape in drawing/page units × the scale it used, then the batch 1 factors:
+    // "length 110.00 pt × 0.1 m/pt = 11.00 m × width 0.5 = 5.50 m2"; a deduction ends "× −1"
+    const manualHow = m => {
+      const u = m.drawing_kind === 'pdf' ? t('tv_unit_pt') : m.drawing_kind === 'image' ? t('tv_unit_px') : (m.drawing_units || '');
+      const extras = (fin(m.width) ? ' × ' + t('f_width') + ' ' + fmtQ(m.width) : '') + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '')
+        + (fin(m.factor) && m.factor !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(m.factor) : '') + (m.deduct ? ' × −1' : '');
+      const tail = extras && fin(m.qty) ? extras + ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : '';
+      if (!fin(m.base)) return metricLabel(m.metric) + (fin(m.qty) ? ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : '');
+      if (m.metric === 'count' || !fin(m.scale)) return metricLabel(m.metric) + ' ' + (m.metric === 'count' ? fmtQ(m.base) + ' nr' : fmt2(m.base) + (m.metric === 'area' ? ' m2' : ' m'))
+        + (tail || (fin(m.qty) && m.qty !== m.base ? ' = ' + fmt2(m.qty) + ' ' + (m.qty_unit || '') : ''));
+      const shape = m.metric === 'area' ? fmt2(m.base / (m.scale * m.scale)) + ' ' + u + '² × (' + fmtScale(m.scale) + ' m/' + u + ')² = ' + fmt2(m.base) + ' m2'
+        : fmt2(m.base / m.scale) + ' ' + u + ' × ' + fmtScale(m.scale) + ' m/' + u + ' = ' + fmt2(m.base) + ' m';
+      return metricLabel(m.metric) + ' ' + shape + tail;
+    };
+    // which calibration a drawn quantity used (page or region, and its verify %), or the DXF units
+    const calLine = m => m.tool !== 'manual' || m.metric === 'count' ? null
+      : m.calibration ? h('div', { class: 'small muted m-cal' }, m.calibration.region ? t('m_cal_region') : t('m_cal_page'), ' · ', verifiedTag(m.calibration))
+      : m.drawing_kind === 'dxf' ? h('div', { class: 'small muted m-cal' }, t('m_cal_units', { u: m.drawing_units || '—' })) : null;
     const how = m => {
+      if (m.tool === 'manual') return manualHow(m);
       const w = m.width === null || m.width === undefined ? 1 : m.width, d = m.depth === null || m.depth === undefined ? 1 : m.depth, f = m.factor;
       const known = [w, d, f].every(x => fin(x) && x > 0);
       const base = fin(m.base) ? m.base : known && fin(m.qty) ? m.qty / (w * d * f) : null;
@@ -1059,7 +1352,50 @@
         + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '') + (fin(f) && f !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(f) : '') + tail;
     };
     const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null,
-      m.mixed ? h('span', { class: 'tag' }, t('m_mixed')) : null];
+      m.mixed ? h('span', { class: 'tag' }, t('m_mixed')) : null, m.deduct ? h('span', { class: 'tag' }, t('m_deduct')) : null];
+    // a drawn shape: label, row, width, depth, factor and deduction can change (its geometry cannot: delete and draw again)
+    const edit = m => editable && m.tool === 'manual' ? h('button', { class: 'small secondary m-edit', onclick: ev => {
+      const old = document.getElementById('ed-row');
+      if (old) old.remove();
+      const er = h('tr', { id: 'ed-row' }, h('td', { colspan: 9 }, editForm(m, () => er.remove())));
+      ev.target.closest('tr').after(er);
+    } }, t('edit')) : null;
+    function editForm(m, close) {
+      const len = m.metric === 'length' || m.metric === 'perimeter', count = m.metric === 'count';
+      const numIn = (id, v) => inp(id, v === null || v === undefined ? '' : String(v), { class: 'w-num', inputmode: 'decimal' });
+      const rowSel = sel('ed-row-sel', m.row_id === null ? '' : String(m.row_id), rowOpts(rows)), label = inp('ed-label', m.label || '', { maxlength: 200 });
+      const w = len ? numIn('ed-width', m.width) : null, dp = count ? null : numIn('ed-depth', m.depth), fac = numIn('ed-factor', m.factor === 1 ? null : m.factor);
+      const deduct = h('input', { type: 'checkbox', id: 'ed-deduct', checked: !!m.deduct });
+      const msg = h('div', { id: 'ed-msg' }), cb = confirmBoxes('ed-');
+      const clear = () => { cb.reset(); msg.replaceChildren(); };   // a confirmation belongs to the values it was given for
+      for (const x of [rowSel, deduct]) x.addEventListener('change', clear);
+      for (const x of [w, dp, fac, label]) if (x) x.addEventListener('input', clear);
+      const save = h('button', { id: 'ed-save', onclick: async () => {
+        const b = {};
+        try {
+          const num = (el, k, name) => { const v = blank(el.value) ? null : strictNum(el.value, name); if (v !== (fin(m[k]) ? m[k] : null)) b[k] = v; };
+          if (w) num(w, 'width', t('width'));
+          if (dp) num(dp, 'depth', t('depth'));
+          const f = blank(fac.value) ? 1 : strictNum(fac.value, t('lk_factor'));
+          if (f !== m.factor) b.factor = f;
+        } catch (e) { msg.replaceChildren(h('p', { class: 'err' }, e.message)); return; }
+        const lab = label.value.trim() || null;
+        if (lab !== (m.label || null)) b.label = lab;
+        if (rowSel.value && Number(rowSel.value) !== m.row_id) b.row_id = Number(rowSel.value);
+        if (deduct.checked !== !!m.deduct) b.deduct = deduct.checked;
+        if (!Object.keys(b).length) { msg.replaceChildren(h('p', { class: 'muted' }, t('ed_nothing'))); return; }
+        save.disabled = true;
+        try { await api('PUT', 'measurements/' + m.id, { ...b, ...cb.flags() }); }
+        catch (e) { save.disabled = false; linkRefusal(e, msg, cb.add); return; }
+        flash(t('saved'), 'ok');
+        close();
+        if (onChanged) { try { await onChanged(); } catch (e) { fail(e); } } else rerender();
+      } }, t('save'));
+      return h('div', { id: 'ed-form', class: 'lk-form' }, h('h3', null, t('ed_title')),
+        h('div', { class: 'form-grid' }, field(t('lk_row'), rowSel, 'wide'), w ? field(t('width'), w) : null, dp ? field(t('depth'), dp) : null, field(t('lk_factor'), fac),
+          field(t('lk_label'), label), field(t('lk_deduct'), deduct, 'check')),
+        msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'ed-cancel', class: 'secondary', onclick: close }, t('cancel'))));
+    }
     const del = m => editable ? h('button', { class: 'small danger m-delete', onclick: async ev => {
       if (!confirm(t('m_delete_confirm'))) return;
       ev.target.disabled = true;
@@ -1077,8 +1413,8 @@
       return h('div', null, h('div', { class: 'row' }, rs, go), msg, cb.el);
     };
     const line = (m, last) => h('tr', { 'data-measurement': String(m.id), 'data-row': m.row_id === null ? null : String(m.row_id) },
-      h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m)),
-      h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, del(m)));
+      h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m), calLine(m)),
+      h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, edit(m), ' ', del(m)));
     const heads = [t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
     return h('section', { class: 'card', id: 'dw-measurements' }, h('h2', null, t('measurements')),
       ms.unlinked.length ? [h('h3', { class: 'err' }, t('m_unlinked') + ' (' + ms.unlinked.length + ')'),

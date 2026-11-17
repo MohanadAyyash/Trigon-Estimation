@@ -159,4 +159,15 @@ dl.kv dd { margin: 0; }
 #tv-canvas { display: block; width: 100%; height: 100%; background: #1e1e1e; cursor: crosshair; border-radius: 4px; }
 .tv-status, #tv-preview { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 6px; }
 #tv-selected { font-weight: 600; }
+/* measuring tools (batch 3 Task 6) */
+/* the status line keeps its height: text appearing under the canvas must not move the page while points are clicked */
+.tv-status { min-height: 1.5em; }
+#tl-tools .small.muted { margin-inline-end: 2px; }
+#tl-scale { margin-top: 6px; }
+#tl-preview { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; margin-top: 4px; }
+#tl-preview .v { font-weight: 600; }
+#tl-warn p, #tl-msg p { margin: 4px 0; }
+.pct-warn { color: var(--red); font-weight: 600; }
+.pct-ok { color: var(--green); }
+.m-cal { margin-top: 2px; }
 @media (max-width: 800px) { .tv-body { grid-template-columns: 1fr; } .tv-layers { max-height: 200px; } }

@@ -1714,6 +1714,10 @@ server.listen(0, async () => {
       const listed = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === mPoly.id);
       assert.deepStrictEqual(listed.geom, poly);
       assert.deepStrictEqual(listed.calibration, { id: pageCal.id, region: false, scale: 0.05, verify_pct: null });
+      // Task 6: the list carries the scale the quantity used and the drawing's kind/units (the formula "350 pt × 0.05 m/pt");
+      // a drawing exposes the server's unit table, so the browser never keeps its own copy
+      assert.deepStrictEqual([listed.scale, listed.drawing_kind, listed.drawing_units], [0.05, 'pdf', null]);
+      assert.deepStrictEqual((await call('GET', `drawings/${P1}`, null, viewer)).j.unit_to_m, require('./lib/units').UNIT_TO_M);
 
       // an area with a hole onto an m2 row → (10000 − 400) × 0.05² = 24; a length on it → 400 (known units must match)
       const mArea = await ok(measure(P1, { row_id: rM2, geom: area }), 'area');
@@ -1834,6 +1838,9 @@ server.listen(0, async () => {
       const mDxf = await ok(measure(dx.j.id, { row_id: rDxf, geom: geo }), 'dxf polyline');
       near(mDxf.qty, 5.0005, 'mm'); assert.strictEqual(mDxf.qty, TM.manualQty(geo, { scale: 0.001 }).qty); assert.strictEqual(mDxf.calibration_id, null);
       near(qtyOf(rDxf), 5.0005, 'dxf row');
+      { const l = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === mDxf.id);
+        assert.deepStrictEqual([l.scale, l.drawing_kind, l.drawing_units, l.calibration], [0.001, 'dxf', 'mm', null], 'DXF: the scale of its units'); }
+      assert.deepStrictEqual((await call('GET', `drawings/${dx.j.id}`, null, viewer)).j.unit_to_m, require('./lib/units').UNIT_TO_M);
       const mDxf2 = await ok(measure(dx.j.id, { row_id: rDxf, geom: { tool: 'line', pts: [[0, 0], [5000, 0]] } }), 'dxf line');
       near(mDxf2.qty, 5, '5000 mm'); near(qtyOf(rDxf), 10.0005, 'dxf row');
       await ok(put(mDxf2.id, { factor: 2 }), 'dxf factor'); near(qtyOf(rDxf), 15.0005, 'dxf row after factor');
