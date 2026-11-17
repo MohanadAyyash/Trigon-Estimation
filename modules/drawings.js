@@ -202,8 +202,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const workers = { alive: 0, peak: 0, started: 0 };   // test hook: parse workers alive now / at most / ever started
   // test hook: hooks.beforeUnitTx(attempt), when a test sets it, runs (awaited) between a unit change's async recomputation
   // and its tx, so a test can change measurements inside that window. null (nothing runs) unless a test sets it.
-  const hooks = { beforeUnitTx: null };
-  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
+  // hooks.beforeMeasureTx (same idea): runs between a layer/block measurement's summary read and its tx.
+  const hooks = { beforeUnitTx: null, beforeMeasureTx: null };
+  // R8: a tender with a drawing replacement waiting for accept or cancel is not submitted or approved (tenders.js)
+  const hasPendingReplacement = tid => !!db.prepare('SELECT 1 FROM drawings WHERE tender_id=? AND pending=1 LIMIT 1').get(tid);
+  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, hasPendingReplacement, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
 
   // ---- upload: stream to a temp file while hashing; 413 the moment the limit is passed -----------------------
   // a received file is held until its drawing row is written; a file that ends with no drawing row (the tender was
@@ -458,6 +461,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     notPending(o);
     if (o.parent_id !== null) bad('replace the whole PDF: use its first page');
     if (o.replaced_by !== null) bad('this drawing has been replaced already: replace its newest version', 409);
+    if (o.status !== 'ready') bad(`drawing is ${o.status}: a new version can be uploaded once it is ready`, 409);
     if (pendingFor(o)) bad('this drawing already has a pending replacement: accept or cancel it first', 409);
     return o;
   }
@@ -545,7 +549,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     return out;
   }
-  const cannotRescale = m => bad(`measurement ${m.id} cannot be recomputed at the new scale (calibration or units)`, 409);
+  // a quantity that cannot be recomputed the same way: 409 for a calibration or unit change; in a replacement compare,
+  // the one item is blocked cannot_recompute (rescale: true marks these errors)
+  const rescaleFail = msg => { throw Object.assign(new Error(msg), { status: 409, rescale: true }); };
+  const cannotRescale = m => rescaleFail(`measurement ${m.id} cannot be recomputed at the new scale (calibration or units)`);
   // { qty, base } of a stored manual measurement under the calibration `cal`: manualQty on its stored geometry with its
   // own width/depth/factor/deduct. The geometry was validated when it was saved, so it is not validated again (R13);
   // anything that cannot be recomputed exactly the same way stops the change (409).
@@ -588,12 +595,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // R12/R16: a point of a PDF page (unrotated user space, points, absolute) or an image (pixels) lies within
   // [x0 − w, x0 + 2w] × [y0 − h, y0 + 2h] (x0/y0: the PDF page box origin, 0 for an image); anything further out was taken
   // in another coordinate space. named: [[name, [x, y]], …] (already finite).
+  const inPage = (d, p) => {
+    const w = d.page_w, h = d.page_h, x0 = d.page_x0 || 0, y0 = d.page_y0 || 0;
+    return p[0] >= x0 - w && p[0] <= x0 + 2 * w && p[1] >= y0 - h && p[1] <= y0 + 2 * h;
+  };
   const onPage = (d, named) => {
     if (d.kind !== 'pdf' && d.kind !== 'image') return;
-    const w = d.page_w, h = d.page_h, x0 = d.page_x0 || 0, y0 = d.page_y0 || 0;
-    if (!(w > 0) || !(h > 0)) bad('the page size of this drawing is not known yet', 409);
-    for (const [name, p] of named)
-      if (!(p[0] >= x0 - w && p[0] <= x0 + 2 * w && p[1] >= y0 - h && p[1] <= y0 + 2 * h)) bad(`${name} is outside the page (${w} × ${h}): points must lie within −1 to 2 page widths and heights`);
+    if (!(d.page_w > 0) || !(d.page_h > 0)) bad('the page size of this drawing is not known yet', 409);
+    for (const [name, p] of named) if (!inPage(d, p)) bad(`${name} is outside the page (${d.page_w} × ${d.page_h}): points must lie within −1 to 2 page widths and heights`);
   };
   // a pure-function refusal (lib/takeoff/calib.js, lib/takeoff/manual.js) is a 400 with its message
   const calc = fn => { try { return fn(); } catch (e) { if (e.status) throw e; bad(e.message); } };
@@ -726,7 +735,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   function dxfRescale(m, base) {
     if (!finNum(base) || !(base > 0)) cannotRescale(m);
     const qty = dxfQty(base, m);
-    if (!Number.isFinite(qty) || qty > MAX_QTY) bad(`measurement ${m.id}: the quantity ${qty} would be out of range: it must be at most ${MAX_QTY}`, 409);
+    if (!Number.isFinite(qty) || qty > MAX_QTY) rescaleFail(`measurement ${m.id}: the quantity ${qty} would be out of range: it must be at most ${MAX_QTY}`);
     return { qty, base };
   }
   // what unitChanges read: a measurement saved, edited or deleted meanwhile changes it
@@ -776,13 +785,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // only. Each new qty is computed by the code that created the measurement: a layer metric or block count from the new
   // drawing's scaled layer table, a selection by totalling its handles on the new cache (select worker, selectionBase),
   // all through dxfQty (dxfRescale); a manual shape by manualQty on its stored geometry (manualRescale) with the new
-  // drawing's units (DXF) or the calibration it was saved with, copied to the same page at accept (PDF/image). What
-  // matches and the status, reason and options come from lib/takeoff/compare.js.
+  // drawing's units (DXF) or the calibration it was saved with, copied to the same page at accept (PDF/image).
+  // The creation gates are evaluated on the new drawing by the create code (layerGates, selectionGates): one that fires
+  // and was never confirmed blocks the item (confirm_needed, R7). A manual shape on a PDF page or an image must lie on
+  // the new page (onPage's bounds, R12/R16), else off_page (R9). A qty that cannot be recomputed blocks its item only
+  // (cannot_recompute, R9). What matches and the status, reason and options come from lib/takeoff/compare.js.
+  // a matched DXF item: its new qty, or blocked confirm_needed when a gate fires now that it never confirmed (R7)
+  const gated = (m, now, new_qty) => {
+    const gates = compare.gatesToConfirm(now, m);
+    return gates.length ? { reason: 'confirm_needed', gates, new_qty } : { new_qty };
+  };
   async function compareReplacement(nd) {
     const old = drawingRow(nd.replaces_id);
     if (!old) bad('the drawing this version replaces is missing', 409);
     const result = (ready, items, extra = {}) => ({ ready, ...extra, items, totals: { rows: compare.rowTotals(items) } });
     const items = [];
+    // one item: r() gives its compare.item input; a rescale failure blocks this item only
+    const add = async (m, r) => {
+      let x;
+      try { x = await r(); } catch (e) { if (!e.rescale) throw e; x = { reason: 'cannot_recompute' }; }
+      items.push(compare.item(m, x));
+    };
     if (nd.kind === 'dxf') {
       // the units are pre-filled from the old drawing's (old_units); the user confirms them on the new one
       const units = { needs_units: nd.units === null, old_units: old.units };
@@ -790,41 +813,55 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (nd.status !== 'ready') return result(false, [], units);
       if (nd.units === null) return result(true, [], units);
       const f = UNIT_TO_M[nd.units];
-      let layers = null;
-      const newLayers = async () => layers || (layers = scaledTable((await readSummary(nd.sha256)).raw, nd.units).layers);
+      let lt = null;
+      const newTable = async () => lt || (lt = scaledTable((await readSummary(nd.sha256)).raw, nd.units));
       for (const m of db.prepare('SELECT * FROM measurements WHERE drawing_id=? ORDER BY id').all(old.id)) {
-        let r;
-        if (m.tool === 'manual') r = { review: true, new_qty: m.metric === 'count' ? m.qty : manualRescale(m, { scale: f }).qty };
-        else if (m.tool === 'dxf_layer' || m.tool === 'dxf_blocks') {
-          r = (m.tool === 'dxf_layer' ? compare.layerMatch : compare.blockMatch)(await newLayers(), m);
-          if (r.base !== undefined) r = { new_qty: dxfRescale(m, r.base).qty };
-        } else if (m.tool === 'dxf_selection') r = await compareSelection(m, old, nd, f);
-        else cannotRescale(m);
-        items.push(compare.item(m, r));
+        await add(m, async () => {
+          if (m.tool === 'manual') return { review: true, new_qty: m.metric === 'count' ? m.qty : manualRescale(m, { scale: f }).qty };
+          if (m.tool === 'dxf_layer' || m.tool === 'dxf_blocks') {
+            const t = await newTable(), x = (m.tool === 'dxf_layer' ? compare.layerMatch : compare.blockMatch)(t.layers, m);
+            if (x.base === undefined) return x;
+            const g = layerGates(t, t.layers.find(l => l.layer === m.layer), m);
+            return gated(m, { incomplete: !!g.incomplete, duplicate: g.duplicates > 0, mixed_blocks: false }, dxfRescale(m, x.base).qty);
+          }
+          if (m.tool === 'dxf_selection') return compareSelection(m, old, nd, f);
+          return cannotRescale(m);
+        });
       }
       return result(true, items, { needs_units: false });
     }
     // PDF / image: page n of the old file is page n of the new one
-    if (nd.status !== 'ready') return result(false, [], { needs_units: false });
-    const newPages = new Set(db.prepare('SELECT page FROM drawings WHERE id=? OR parent_id=?').all(nd.id, nd.id).map(x => x.page));
+    if (nd.status !== 'ready') return result(false, [], { needs_units: false, new_pages: [] });
+    const newPages = new Map(db.prepare('SELECT * FROM drawings WHERE id=? OR parent_id=? ORDER BY page').all(nd.id, nd.id).map(x => [x.page, x]));
+    const oldPages = new Set(db.prepare('SELECT page FROM drawings WHERE id=? OR parent_id=?').all(old.id, old.id).map(x => x.page));
     for (const m of db.prepare(`SELECT m.*, d.page AS on_page FROM measurements m JOIN drawings d ON d.id=m.drawing_id
       WHERE d.id=? OR d.parent_id=? ORDER BY m.id`).all(old.id, old.id)) {
-      if (!newPages.has(m.on_page)) { items.push(compare.item(m, { reason: 'page_missing' })); continue; }
-      let qty = m.qty;
-      if (m.metric !== 'count') {
-        const c = m.calibration_id === null ? null : db.prepare('SELECT scale FROM calibrations WHERE id=? AND drawing_id=?').get(m.calibration_id, m.drawing_id);
-        if (!c) cannotRescale(m);
-        qty = manualRescale(m, c).qty;
-      }
-      items.push(compare.item(m, { review: true, new_qty: qty }));
+      await add(m, () => {
+        const page = newPages.get(m.on_page);
+        if (!page) return { reason: 'page_missing' };
+        const g = parseGeom(m.geom);
+        let pts = null;
+        try { pts = manual.points(g); } catch (e) { /* unreadable: below */ }
+        if (!pts) return cannotRescale(m);
+        if (!(page.page_w > 0) || !(page.page_h > 0) || !pts.every(p => inPage(page, p))) return { reason: 'off_page' };
+        let qty = m.qty;
+        if (m.metric !== 'count') {
+          const c = m.calibration_id === null ? null : db.prepare('SELECT scale FROM calibrations WHERE id=? AND drawing_id=?').get(m.calibration_id, m.drawing_id);
+          if (!c) cannotRescale(m);
+          qty = manualRescale(m, c).qty;
+        }
+        return { review: true, new_qty: qty };
+      });
     }
-    return result(true, items, { needs_units: false });
+    // R10: pages of the new file with no old counterpart (information only)
+    return result(true, items, { needs_units: false, new_pages: [...newPages.keys()].filter(p => !oldPages.has(p)) });
   }
   // a selection on the new drawing: each stored handle must be there with its stored geomKey (compare.selectionMatch).
-  // All matched (and the same number of entities used) → its total on the new cache; otherwise blocked, with the qty of
-  // the handles that still match (keep_matched_qty; null when none). A stored row without a geomKey (saved before
-  // batch 2) takes its key from the old drawing's cache when that cache gives the stored selection back exactly;
-  // otherwise it never matches. Nothing is written.
+  // All matched (and the same number of entities used) → its total on the new cache, gated like a new selection
+  // (selectionGates: incomplete, duplicates within it, mixed blocks); otherwise blocked, with the qty of the handles that
+  // still match (keep_matched_qty; null when none; Task 3 gates the subset when it is kept). A stored row without a
+  // geomKey (saved before batch 2) takes its key from the old drawing's cache when that cache gives the stored selection
+  // back exactly; otherwise it never matches. Nothing is written.
   async function compareSelection(m, old, nd, f) {
     const stored = db.prepare('SELECT handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid').all(m.id).map(h => ({ ...h }));
     const handles = stored.map(h => h.handle), total = hs => totalSelection(nd.sha256, hs, m.metric, !!m.nested);
@@ -838,7 +875,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     const sel = await total(handles);
     const x = compare.selectionMatch(stored, new Map(sel.used_handles.map((h, i) => [h, sel.used_keys[i]])), sel.unknown);
-    if (x.all && sel.used === m.handles_count) return { new_qty: dxfRescale(m, selectionBase(sel.base, m.metric, f)).qty };
+    if (x.all && sel.used === m.handles_count) {
+      const g = selectionGates(sel);
+      // duplicates with other selections on the row (crossDuplicates) are by geomKey: unchanged when every key matches
+      return gated(m, { incomplete: g.incomplete, duplicate: g.duplicates > 0, mixed_blocks: g.mixed !== null }, dxfRescale(m, selectionBase(sel.base, m.metric, f)).qty);
+    }
     let keep = null;
     if (x.matched.length) {
       const k = await total(x.matched);
@@ -1235,30 +1276,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     const c = await readSummary(d.sha256), lt = scaledTable(c.raw, d.units);
     const layer = lt.layers.find(l => l.layer === m.layer);
     if (!layer) bad('layer not found in this drawing: ' + m.layer);
-    let base, handles, incomplete = null;
-    // shapes on the layer that the parser could not measure (dropped): no metric of that layer is the whole story
-    const dropped = layer.dropped || 0;
-    if (m.tool === 'dxf_layer') {
-      base = layer[m.metric]; handles = layer.entities;
-      // closed shapes left out of the area, or approximated curves: the layer total is not the whole story
-      const area_excluded = m.metric === 'area' ? layer.area_excluded || 0 : 0, approx = layer.approx || 0;
-      if (area_excluded || approx || dropped) incomplete = { area_excluded, approx, dropped };
-    } else {
-      if (dropped) incomplete = { area_excluded: 0, approx: 0, dropped };
+    let base, handles;
+    if (m.tool === 'dxf_layer') { base = layer[m.metric]; handles = layer.entities; }
+    else {
       const bl = (layer.blocks || []).find(x => x.name === m.block);
       if (!bl) bad(`block ${m.block} not found on layer ${m.layer}`);
       base = bl.top + (m.nested ? bl.nested : 0); handles = base;
     }
+    const { incomplete, duplicates } = layerGates(lt, layer, m);
     if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', ...incomplete });
-    // the same geometry drawn twice on the source layer (or the same block twice at one point): counted in the total,
-    // never merged, so the user confirms it. Layer metrics take the layer's warnings, a block count its block's.
-    const duplicates = (lt.warnings || []).filter(w => w.code === 'possible_duplicate' && w.detail && w.detail.layer === m.layer
-      && (m.tool === 'dxf_blocks' ? w.detail.block === m.block : w.detail.block === undefined)).reduce((s, w) => s + w.detail.count, 0);
     if (duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', duplicates });
     if (!finNum(base) || !(base > 0)) bad(`nothing to measure: ${m.layer} ${m.block ? m.block + ' ' : ''}${m.metric} is ${base}`);
     m.qty = dxfQty(base, m);
     if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
     m.drawing_id = d.id;
+    if (hooks.beforeMeasureTx) await hooks.beforeMeasureTx();
     const out = tx(() => {
       mustDraft(tenderRow(t.id));
       // the table read above must still describe this drawing (units could change before the first measurement)
@@ -1278,6 +1310,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       return { id, qty: m.qty, qty_unit: m.qty_unit, row_qty: recompute(m.row_id), incomplete: !!incomplete, duplicate: !!duplicates };
     });
     return reply(res, 200, out);
+  }
+
+  // The creation gates of a layer or block measurement (shared by create and the replacement compare), from the scaled
+  // layer table lt and the measurement's layer row:
+  // - incomplete: shapes on the layer the parser could not measure (dropped: every metric, a block count too), closed
+  //   shapes left out of an area, approximated curves (a layer metric): the total is not the whole story;
+  // - duplicates: the same geometry twice on the layer (or the same block twice at one point), counted in the total.
+  //   Layer metrics take the layer's warnings, a block count its block's.
+  function layerGates(lt, layer, m) {
+    const dropped = layer.dropped || 0;
+    let incomplete = null;
+    if (m.tool === 'dxf_layer') {
+      const area_excluded = m.metric === 'area' ? layer.area_excluded || 0 : 0, approx = layer.approx || 0;
+      if (area_excluded || approx || dropped) incomplete = { area_excluded, approx, dropped };
+    } else if (dropped) incomplete = { area_excluded: 0, approx: 0, dropped };
+    const duplicates = (lt.warnings || []).filter(w => w.code === 'possible_duplicate' && w.detail && w.detail.layer === m.layer
+      && (m.tool === 'dxf_blocks' ? w.detail.block === m.block : w.detail.block === undefined)).reduce((s, w) => s + w.detail.count, 0);
+    return { incomplete, duplicates };
+  }
+  // the creation gates of a selection from its worker totals (shared by create and the replacement compare): incomplete
+  // (dropped, closed shapes without area, approximated curves), duplicates within the selection, and a count over several
+  // block names (mixed: { name: count } sorted, or null). counted: the block pairs that took part in a count.
+  function selectionGates(sel) {
+    const counted = sel.blocks.filter(x => x.count > 0), byName = new Map();
+    for (const x of counted) byName.set(x.block, (byName.get(x.block) || 0) + x.count);
+    const mixed = byName.size > 1 ? Object.fromEntries([...byName].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) : null;
+    return { incomplete: sel.dropped > 0 || sel.area_null > 0 || sel.approx > 0, duplicates: sel.duplicates, mixed, counted };
   }
 
   // ---- selections: totals from the full parse cache, in a worker through the parse queue (never on this thread) ----
@@ -1301,12 +1360,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (!sel.used) bad('nothing in the selection can be measured as ' + m.metric);
     const base = selectionBase(sel.base, m.metric, UNIT_TO_M[d.units]);
     m.handles_count = sel.used; m.drawing_id = d.id;
-    const counted = sel.blocks.filter(x => x.count > 0);
-    m.sel = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(counted.map(x => x.layer + '\0' + x.block)) };
     // spec 6.4: a count is by block name; a count over several names (DOOR + WINDOW, or DOOR + its nested HINGE) is confirmed
-    const byName = new Map();
-    for (const x of counted) byName.set(x.block, (byName.get(x.block) || 0) + x.count);
-    const mixed = byName.size > 1 ? Object.fromEntries([...byName].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) : null;
+    const gates = selectionGates(sel), { counted, mixed } = gates;
+    m.sel = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(counted.map(x => x.layer + '\0' + x.block)) };
     const summary = JSON.stringify({ metric: m.metric, by_layer: sel.by_layer, skipped: sel.skipped, ...(m.metric === 'count' ? { nested: m.nested, blocks: sel.blocks } : {}) });
     const out = tx(() => {
       mustDraft(tenderRow(t.id));
@@ -1316,10 +1372,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       canMeasure(cur);
       const overlapping = overlapCount(m, d.sha256, t.id, -1);
       // exact copies within the selection, and copies of entities other selections on the row already measured
-      const duplicates = sel.duplicates + crossDuplicates(m, d.sha256, t.id, -1);
+      const duplicates = gates.duplicates + crossDuplicates(m, d.sha256, t.id, -1);
       const counts = { dropped: sel.dropped, area_null: sel.area_null, approx: sel.approx, duplicates, overlapping };
       // the batch 1 gates and bodies (the link form keys on them), with the selection's counts added
-      const incomplete = sel.dropped > 0 || sel.area_null > 0 || sel.approx > 0;
+      const incomplete = gates.incomplete;
       if (incomplete && !m.confirm_incomplete) conflictBody({ error: 'layer quantity is incomplete', area_excluded: sel.area_null, approx: sel.approx, dropped: sel.dropped, ...counts });
       if (duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', ...counts });
       if (mixed && !m.confirm_mixed_blocks) conflictBody({ error: 'selection contains several blocks', blocks: mixed });

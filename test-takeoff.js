@@ -267,6 +267,7 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
     { layer: 'MH', open_length: 0, closed_perimeter: 0, area: 0, blocks: [{ name: 'MH1', top: 2, nested: 1 }, { name: 'MH2', top: 0, nested: 3 }, { name: 'GULLY', top: 1, nested: 0 }] },
     { layer: 'PAVING', open_length: 0, closed_perimeter: 40, area: 100, blocks: [] },
     { layer: 'TEXT', open_length: 0, closed_perimeter: 0, area: 0, blocks: [] },
+    { layer: 'PITS', open_length: 0, closed_perimeter: 0, area: 0, blocks: [{ name: 'MH9', top: 4, nested: 0 }, { name: 'PIT', top: 1, nested: 0 }] },
   ];
   const m = (id, o) => ({ id, row_id: 1, tool: 'dxf_layer', label: null, qty: 5, qty_unit: 'm', metric: 'open_length', layer: 'KERB', block: null, nested: 0, ...o });
   // same layer and metric → its base; the item is `same` when the qty is unchanged
@@ -290,11 +291,14 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
   assert.deepStrictEqual(C.blockMatch(layers, blk), { base: 2 });
   assert.deepStrictEqual(C.blockMatch(layers, { ...blk, nested: 1 }), { base: 3 });
   assert.strictEqual(C.item(blk, { new_qty: 2 }).status, 'changed');
-  // a block gone from its layer → blocked block_missing, relink to the block names counted there (MH2 has nested inserts only)
+  // a block gone from its layer → blocked block_missing; relink to the other blocks counted on its layer (MH2 has nested
+  // inserts only) and to the same block name on any other layer (PITS/MH9), never to unrelated pairs (PITS/PIT)
   const b2 = { ...blk, block: 'MH9' };
-  assert.deepStrictEqual(C.blockMatch(layers, b2), { reason: 'block_missing', relink_choices: ['GULLY', 'MH1'] });
-  assert.deepStrictEqual(C.blockMatch(layers, { ...b2, nested: 1 }), { reason: 'block_missing', relink_choices: ['GULLY', 'MH1', 'MH2'] });
-  assert.deepStrictEqual(C.blockMatch(layers, { ...b2, layer: 'NOPE' }), { reason: 'block_missing', relink_choices: [] });
+  assert.deepStrictEqual(C.blockMatch(layers, b2), { reason: 'block_missing', relink_choices: [{ layer: 'MH', block: 'GULLY' }, { layer: 'MH', block: 'MH1' }, { layer: 'PITS', block: 'MH9' }] });
+  assert.deepStrictEqual(C.blockMatch(layers, { ...b2, nested: 1 }).relink_choices.map(x => x.block), ['GULLY', 'MH1', 'MH2', 'MH9']);
+  // the layer renamed (MANHOLES → MH): the same block name on any layer
+  assert.deepStrictEqual(C.blockMatch(layers, { ...blk, layer: 'MANHOLES' }), { reason: 'block_missing', relink_choices: [{ layer: 'MH', block: 'MH1' }] });
+  assert.deepStrictEqual(C.blockMatch(layers, { ...b2, layer: 'NOPE', block: 'NONE' }), { reason: 'block_missing', relink_choices: [] });
   assert.deepStrictEqual(C.item(b2, C.blockMatch(layers, b2)).options, ['delete', 'relink']);
   // selection: matched by handle AND geomKey. One handle reused for different geometry → not matched, geometry_changed
   const stored = [{ handle: 'A', geom_key: 'ka' }, { handle: 'B', geom_key: 'kb' }, { handle: 'C', geom_key: 'kc' }];
@@ -316,11 +320,27 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
     status: 'review', reason: 'manual_check', options: ['mark_reviewed'] });
   assert.deepStrictEqual(C.item(man, { reason: 'page_missing' }), { measurement_id: 7, row_id: 1, tool: 'manual', label: 'Fake line', old_qty: 2, new_qty: null, qty_unit: 'm',
     status: 'blocked', reason: 'page_missing', options: ['delete'] });
-  // row totals: Σ old and Σ new of the drawing's items per row (first seen first); new is null while an item of the row
-  // is blocked; unlinked measurements have no row
+  // R7: a creation gate that fires on the new drawing and was never confirmed → blocked confirm_needed (which gates),
+  // options delete / confirm, with the qty it gets when confirmed; a gate confirmed at creation (stored flag 1) stays quiet
+  const flags = { incomplete: 0, duplicate: 0, mixed: 0 };
+  assert.deepStrictEqual(C.gatesToConfirm({ incomplete: false, duplicate: false, mixed_blocks: false }, flags), []);
+  assert.deepStrictEqual(C.gatesToConfirm({ incomplete: true, duplicate: true, mixed_blocks: true }, flags), ['incomplete', 'duplicate', 'mixed_blocks']);
+  assert.deepStrictEqual(C.gatesToConfirm({ incomplete: true, duplicate: true, mixed_blocks: false }, { ...flags, duplicate: 1 }), ['incomplete']);
+  assert.deepStrictEqual(C.gatesToConfirm({ incomplete: true, duplicate: false, mixed_blocks: true }, { incomplete: 1, duplicate: 0, mixed: 1 }), []);
+  assert.deepStrictEqual(C.item(m(13), { reason: 'confirm_needed', gates: ['duplicate'], new_qty: 8 }), { measurement_id: 13, row_id: 1, tool: 'dxf_layer', label: null, old_qty: 5, new_qty: 8,
+    qty_unit: 'm', status: 'blocked', reason: 'confirm_needed', gates: ['duplicate'], options: ['delete', 'confirm'] });
+  // R9: a shape off the new page, or a qty that cannot be recomputed → blocked, delete only
+  for (const reason of ['off_page', 'cannot_recompute']) {
+    assert.deepStrictEqual(C.item(man, { reason }), { measurement_id: 7, row_id: 1, tool: 'manual', label: 'Fake line', old_qty: 2, new_qty: null, qty_unit: 'm', status: 'blocked', reason, options: ['delete'] });
+    assert.deepStrictEqual(C.item(sel, { reason }).options, ['delete']);
+  }
+  // row totals per row and unit (R10: m never added to m2): Σ old and Σ new of the drawing's items (first seen first);
+  // new is null while an item of the row and unit is blocked; unlinked measurements have no row
   const items = [C.item(m(1), { new_qty: 6 }), C.item(m(8, { row_id: 2, qty: 3 }), { new_qty: 3 }), C.item(m(9, { qty: 1.5 }), { review: true, new_qty: 1.25 }),
-    C.item(m(10, { row_id: 3 }), { reason: 'layer_missing', relink_choices: [] }), C.item(m(11, { row_id: 3, qty: 1 }), { new_qty: 2 }), C.item(m(12, { row_id: null }), { new_qty: 9 })];
-  assert.deepStrictEqual(C.rowTotals(items), [{ row_id: 1, old: 6.5, new: 7.25 }, { row_id: 2, old: 3, new: 3 }, { row_id: 3, old: 6, new: null }]);
+    C.item(m(10, { row_id: 3 }), { reason: 'layer_missing', relink_choices: [] }), C.item(m(11, { row_id: 3, qty: 1 }), { new_qty: 2 }), C.item(m(12, { row_id: null }), { new_qty: 9 }),
+    C.item(m(14, { qty: 4, qty_unit: 'm2' }), { new_qty: 5 })];
+  assert.deepStrictEqual(C.rowTotals(items), [{ row_id: 1, qty_unit: 'm', old: 6.5, new: 7.25 }, { row_id: 2, qty_unit: 'm', old: 3, new: 3 }, { row_id: 3, qty_unit: 'm', old: 6, new: null },
+    { row_id: 1, qty_unit: 'm2', old: 4, new: 5 }]);
   assert.deepStrictEqual(C.rowTotals([]), []);
 }
 

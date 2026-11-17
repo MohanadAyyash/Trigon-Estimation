@@ -2315,7 +2315,8 @@ server.listen(0, async () => {
       assert.deepStrictEqual(byId.get(mMan.id), { measurement_id: mMan.id, row_id: rM, tool: 'manual', label: 'Fake drawn edge', old_qty: mMan.qty, new_qty: mMan.qty, qty_unit: 'm',
         status: 'review', reason: 'manual_check', options: ['mark_reviewed'] });
       // row totals of this drawing's measurements: new is unknown while a row has a blocked item
-      assert.deepStrictEqual(c.totals, { rows: [{ row_id: rM, old: mLayer.qty + mSel.qty + mMan.qty, new: null }, { row_id: rM2, old: mArea.qty, new: null }, { row_id: rNr, old: 1, new: 2 }] });
+      assert.deepStrictEqual(c.totals, { rows: [{ row_id: rM, qty_unit: 'm', old: mLayer.qty + mSel.qty + mMan.qty, new: null }, { row_id: rM2, qty_unit: 'm2', old: mArea.qty, new: null },
+        { row_id: rNr, qty_unit: 'nr', old: 1, new: 2 }] });
       assert.deepStrictEqual(await cmp(qs), c, 'the same for qs');
       // read only: nothing stored, nothing audited
       assert.strictEqual(snap(), s2); assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM audit_log').get().n, nAudit);
@@ -2342,6 +2343,55 @@ server.listen(0, async () => {
         const st = db.prepare('UPDATE measurement_handles SET geom_key=? WHERE measurement_id=? AND handle=?');
         for (const k of keys) st.run(k.geom_key, mSel.id, k.handle);
       }
+      // R9: a qty that cannot be recomputed blocks its own item only (cannot_recompute, delete), never the whole compare
+      db.prepare("UPDATE measurements SET geom='not a shape' WHERE id=?").run(mMan.id);
+      try {
+        c = await cmp();
+        assert.deepStrictEqual(c.items.find(x => x.measurement_id === mMan.id), { measurement_id: mMan.id, row_id: rM, tool: 'manual', label: 'Fake drawn edge', old_qty: mMan.qty, new_qty: null,
+          qty_unit: 'm', status: 'blocked', reason: 'cannot_recompute', options: ['delete'] });
+        assert.deepStrictEqual(c.items.filter(x => x.measurement_id !== mMan.id), [...byId.values()].filter(x => x.measurement_id !== mMan.id), 'the other items as before');
+      } finally { db.prepare('UPDATE measurements SET geom=? WHERE id=?').run(JSON.stringify({ tool: 'polyline', pts: [[0, 0], [1000, 0], [1000, 1000]] }), mMan.id); }
+      assert.strictEqual(snap(), s2, 'restored');
+      // R8: a tender with a pending drawing replacement is not submitted or approved
+      r = await call('POST', `tenders/${T}/submit`, null, qs);
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'a drawing replacement is pending');
+      db.prepare("UPDATE tenders SET status='submitted' WHERE id=?").run(T);   // a state the API no longer reaches: approve refuses too
+      try {
+        r = await call('POST', `tenders/${T}/approve`, { expected_P: 0 }, admin);
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'a drawing replacement is pending');
+      } finally { db.prepare("UPDATE tenders SET status='draft' WHERE id=?").run(T); }
+      // R7: the creation gates are evaluated on the new drawing. v2 draws KERB's line twice (a possible duplicate) and adds
+      // an MLINE to EDGE (not measured: dropped) → both layer measurements are blocked confirm_needed with their gate and
+      // the qty they get when confirmed; the selection of E1 + E2 is unaffected (its own entities have no gate), and a
+      // layer measurement saved with confirm_duplicate stays quiet
+      {
+        const T3 = (await ok(call('POST', 'tenders', { title: 'Test Revisions Gates', kind: 'rta' }, qs), 'tender 3')).id;
+        const r3 = (await ok(call('POST', `tenders/${T3}/rows`, { description: 'Fake edging', unit: 'm' }, qs), 'row')).id;
+        const v1g = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...tables([layerRec('KERB'), layerRec('EDGE'), layerRec('TWIN')]),
+          ...sec('ENTITIES', [...line('RK', 'KERB', 0, 0, 3000, 4000), ...line('E1', 'EDGE', 0, 0, 1000, 0), ...line('E2', 'EDGE', 0, 100, 2000, 100),
+            ...line('W1', 'TWIN', 0, 0, 0, 500), ...line('W2', 'TWIN', 0, 0, 0, 500)])]);
+        const v2g = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...tables([layerRec('KERB'), layerRec('EDGE'), layerRec('TWIN')]),
+          ...sec('ENTITIES', [...line('RK', 'KERB', 0, 0, 3000, 4000), ...line('RK2', 'KERB', 0, 0, 3000, 4000), ...line('E1', 'EDGE', 0, 0, 1000, 0), ...line('E2', 'EDGE', 0, 100, 2000, 100),
+            [0, 'MLINE'], [5, 'DM'], [8, 'EDGE'], ...line('W1', 'TWIN', 0, 0, 0, 500), ...line('W2', 'TWIN', 0, 0, 0, 500)])]);
+        const g1 = (await upload(T3, 'Fake gates A', Buffer.from(v1g), qs)).j.id;
+        await waitDone(g1, qs); await ok(call('PUT', `drawings/${g1}/units`, { units: 'mm' }, qs), 'units');
+        const gK = await mOk({ row_id: r3, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length' }, g1);
+        const gE = await mOk({ row_id: r3, tool: 'dxf_layer', layer: 'EDGE', metric: 'open_length' }, g1);
+        const gS = await mOk({ row_id: r3, tool: 'dxf_selection', metric: 'open_length', handles: ['E1', 'E2'] }, g1);
+        const gW = await mOk({ row_id: r3, tool: 'dxf_layer', layer: 'TWIN', metric: 'open_length', confirm_duplicate: true }, g1);
+        assert.strictEqual(db.prepare('SELECT duplicate FROM measurements WHERE id=?').get(gW.id).duplicate, 1);
+        const g2 = await replace(g1, 'Fake gates B', Buffer.from(v2g));
+        assert.strictEqual(g2.s, 202, JSON.stringify(g2.j));
+        await waitDone(g2.j.id, qs); await ok(call('PUT', `drawings/${g2.j.id}/units`, { units: 'mm' }, qs), 'units');
+        const gc = await ok(call('GET', `drawings/${g2.j.id}/compare`, null, viewer), 'compare gates');
+        const gi = new Map(gc.items.map(x => [x.measurement_id, x]));
+        assert.deepStrictEqual(gi.get(gK.id), { measurement_id: gK.id, row_id: r3, tool: 'dxf_layer', label: null, old_qty: 5, new_qty: 10, qty_unit: 'm', status: 'blocked', reason: 'confirm_needed',
+          gates: ['duplicate'], options: ['delete', 'confirm'] });
+        assert.deepStrictEqual([gi.get(gE.id).status, gi.get(gE.id).reason, gi.get(gE.id).gates, gi.get(gE.id).new_qty, gi.get(gE.id).options], ['blocked', 'confirm_needed', ['incomplete'], 3, ['delete', 'confirm']]);
+        assert.deepStrictEqual([gi.get(gS.id).status, gi.get(gS.id).new_qty], ['same', 3]);
+        assert.deepStrictEqual([gi.get(gW.id).status, gi.get(gW.id).new_qty], ['same', 1], 'confirmed at creation: no gate');
+        await ok(call('DELETE', `tenders/${T3}`, null, qs), 'tidy');
+      }
       // a selection entity gone from the new drawing → handles_missing
       {
         const T2 = (await ok(call('POST', 'tenders', { title: 'Test Revisions Gone', kind: 'rta' }, qs), 'tender 2')).id;
@@ -2350,7 +2400,17 @@ server.listen(0, async () => {
         await waitDone(g1, qs); await ok(call('PUT', `drawings/${g1}/units`, { units: 'mm' }, qs), 'units');
         const gs = await mOk({ row_id: r2, tool: 'dxf_selection', metric: 'open_length', handles: ['RK', 'E2'] }, g1);
         const gone = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...sec('ENTITIES', [...line('E2', 'EDGE', 0, 100, 2000, 100)])]);
-        const g2 = (await replace(g1, 'Fake gone B', Buffer.from(gone))).j.id;
+        // Review Focus 3 inside a create's window: the replacement is uploaded after the layer table was read, before the
+        // tx → the in-tx guard refuses the measurement (without it, it would be saved on the old drawing unseen)
+        let gr = null;
+        const nG = db.prepare('SELECT COUNT(*) n FROM measurements WHERE drawing_id=?').get(g1).n;
+        ctx.drawings._hooks.beforeMeasureTx = async () => { if (!gr) gr = await replace(g1, 'Fake gone B', Buffer.from(gone)); };
+        try { r = await measure({ row_id: r2, tool: 'dxf_layer', layer: 'EDGE', metric: 'open_length' }, g1); }
+        finally { ctx.drawings._hooks.beforeMeasureTx = null; }
+        assert.ok(gr, 'the hook ran'); assert.strictEqual(gr.s, 202, JSON.stringify(gr.j));
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, PENDING);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM measurements WHERE drawing_id=?').get(g1).n, nG, 'nothing saved');
+        const g2 = gr.j.id;
         await waitDone(g2, qs); await ok(call('PUT', `drawings/${g2}/units`, { units: 'mm' }, qs), 'units');
         const gi = (await ok(call('GET', `drawings/${g2}/compare`, null, viewer), 'compare')).items;
         assert.deepStrictEqual(gi.map(x => [x.measurement_id, x.status, x.reason, x.keep_matched_qty, x.options]), [[gs.id, 'blocked', 'handles_missing', 2, ['delete', 'keep_matched']]]);
@@ -2371,7 +2431,9 @@ server.listen(0, async () => {
         assert.ok(fs.existsSync(path.join(bdir, 'drawings', n.sha256 + '.dxf')), 'the pending file is mirrored');
       }
 
-      // approved tender: replace → 409 (before the body); compare is still readable; a Rev copies the accepted rows only
+      // approved tender (forced in the database: R8 stops submit/approve while a replacement is pending, so this state is
+      // reached only by data from before; the Rev must still skip the pending row): replace → 409 (before the body);
+      // compare is still readable; a Rev copies the accepted rows only
       db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
       try {
         r = await replace(D1, 'Fake site plan C', V2);
@@ -2394,18 +2456,23 @@ server.listen(0, async () => {
         await ok(call('POST', `drawings/${P2}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 2, unit: 'm' }, qs), 'cal 2');
         const q1 = await mOk({ row_id: rM, tool: 'manual', geom: { tool: 'line', pts: [[10, 10], [10, 50]] } }, P1);   // 40 × 0.05 = 2 m
         const q2 = await mOk({ row_id: rM, tool: 'manual', geom: { tool: 'line', pts: [[10, 10], [60, 10]] } }, P2);   // 50 × 0.02 = 1 m
-        rel(q1.qty, 2, 'page 1'); rel(q2.qty, 1, 'page 2');
+        const q3 = await mOk({ row_id: rM, tool: 'manual', geom: { tool: 'line', pts: [[500, 1200], [500, 1240]] } }, P1);   // on both page boxes: 2 m
+        rel(q1.qty, 2, 'page 1'); rel(q2.qty, 1, 'page 2'); rel(q3.qty, 2, 'page 1, second');
         // a page row is not replaced on its own; a DXF does not replace a PDF
         r = await replace(P2, 'Fake sheets B', makeOffsetPdf());
         assert.strictEqual(r.s, 400); assert.strictEqual(r.j.error, 'replace the whole PDF: use its first page');
         r = await replace(P1, 'Fake sheets B', V2);
         assert.strictEqual(r.s, 400); assert.strictEqual(r.j.error, 'a new version of a PDF or an image must be a PDF or an image');
+        // R8: a drawing is replaced once it is ready (a PDF: its pages registered)
+        const unreg = await upload(T, 'Fake sheets unregistered', makePdf(), qs);
+        r = await replace(unreg.j.id, 'Fake sheets unregistered B', makePdf());
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'drawing is pages: a new version can be uploaded once it is ready');
         const nv = await replace(P1, 'Fake sheets B', makeOffsetPdf());
         assert.strictEqual(nv.s, 202, JSON.stringify(nv.j));
         const NP = nv.j.id;
         assert.deepStrictEqual([dRow(NP).pending, dRow(NP).replaces_id, dRow(NP).status, dRow(NP).kind], [1, P1, 'pages', 'pdf']);
         // pages not registered yet: not ready
-        assert.deepStrictEqual(await ok(call('GET', `drawings/${NP}/compare`, null, viewer), 'compare'), { ready: false, needs_units: false, items: [], totals: { rows: [] } });
+        assert.deepStrictEqual(await ok(call('GET', `drawings/${NP}/compare`, null, viewer), 'compare'), { ready: false, needs_units: false, new_pages: [], items: [], totals: { rows: [] } });
         // the old pages (both) take no calibration change while the replacement is pending
         const s3 = snap();
         for (const [what, p] of [['calibrate page 2', call('POST', `drawings/${P2}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 3, unit: 'm' }, qs)],
@@ -2424,10 +2491,12 @@ server.listen(0, async () => {
         r = await call('POST', `drawings/${NP}/calibrations`, { p1: [OFFSET_PAGE.x0, OFFSET_PAGE.y0], p2: [OFFSET_PAGE.x0 + 100, OFFSET_PAGE.y0], real: 5, unit: 'm' }, qs);
         assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, IS_PENDING);
         c = await ok(call('GET', `drawings/${NP}/compare`, null, viewer), 'compare pdf');
-        assert.deepStrictEqual(c, { ready: true, needs_units: false, items: [
-          { measurement_id: q1.id, row_id: rM, tool: 'manual', label: null, old_qty: q1.qty, new_qty: q1.qty, qty_unit: 'm', status: 'review', reason: 'manual_check', options: ['mark_reviewed'] },
-          { measurement_id: q2.id, row_id: rM, tool: 'manual', label: null, old_qty: q2.qty, new_qty: null, qty_unit: 'm', status: 'blocked', reason: 'page_missing', options: ['delete'] }],
-        totals: { rows: [{ row_id: rM, old: q1.qty + q2.qty, new: null }] } });
+        // R9: v2's page box is [1000, 2000] + 595 × 842: q1 (near 0, 0) lies off it → off_page; q3 lies on it → review
+        assert.deepStrictEqual(c, { ready: true, needs_units: false, new_pages: [], items: [
+          { measurement_id: q1.id, row_id: rM, tool: 'manual', label: null, old_qty: q1.qty, new_qty: null, qty_unit: 'm', status: 'blocked', reason: 'off_page', options: ['delete'] },
+          { measurement_id: q2.id, row_id: rM, tool: 'manual', label: null, old_qty: q2.qty, new_qty: null, qty_unit: 'm', status: 'blocked', reason: 'page_missing', options: ['delete'] },
+          { measurement_id: q3.id, row_id: rM, tool: 'manual', label: null, old_qty: q3.qty, new_qty: q3.qty, qty_unit: 'm', status: 'review', reason: 'manual_check', options: ['mark_reviewed'] }],
+        totals: { rows: [{ row_id: rM, qty_unit: 'm', old: q1.qty + q2.qty + q3.qty, new: null }] } });
         // a 2-page replacement: page n's row replaces old page n; both pending, listed under the rows they replace
         const pb = await upload(T, 'Fake sheets two', makePdf(), qs);
         const [B1, B2] = (await ok(call('POST', `drawings/${pb.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages')).drawings.map(x => x.id);
@@ -2436,12 +2505,15 @@ server.listen(0, async () => {
         assert.deepStrictEqual([NB1, NB2].map(id => [dRow(id).pending, dRow(id).replaces_id, dRow(id).parent_id, dRow(id).rev]), [[1, B1, null, 2], [1, B2, NB1, 2]]);
         list = await ok(call('GET', `tenders/${T}/drawings`, null, viewer), 'list');
         assert.deepStrictEqual(list.map(x => [x.id, x.pending_replacement ? x.pending_replacement.id : null]),
-          [[D1, N], [P1, NP], [P2, null], [B1, NB1], [B2, NB2]], 'pending rows listed under the rows they replace only');
+          [[D1, N], [P1, NP], [P2, null], [unreg.j.id, null], [B1, NB1], [B2, NB2]], 'pending rows listed under the rows they replace only');
         // an image is replaced by a PDF (pdf/image → pdf or image)
         const im = await upload(T, 'Fake photo', makePng(40, 30), qs);
         const ni = await replace(im.j.id, 'Fake photo B', makePdf());
         assert.strictEqual(ni.s, 202, JSON.stringify(ni.j));
         assert.deepStrictEqual([dRow(ni.j.id).kind, dRow(ni.j.id).pending, dRow(ni.j.id).replaces_id], ['pdf', 1, im.j.id]);
+        // R10: its page 2 has no old counterpart: listed as new (information only)
+        await ok(call('POST', `drawings/${ni.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages');
+        assert.deepStrictEqual(await ok(call('GET', `drawings/${ni.j.id}/compare`, null, viewer), 'compare'), { ready: true, needs_units: false, new_pages: [2], items: [], totals: { rows: [] } });
       }
     }
 

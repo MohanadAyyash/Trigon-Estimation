@@ -527,7 +527,9 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       });
       return reply(res, 200, tenderView(tenderRow(t.id)));
     };
-    if (sub === 'submit') { need(me, 'admin', 'qs'); return move('draft', 'submitted', 'submit'); }
+    // R8 (batch 4): a drawing replacement waiting for accept or cancel stops submit and approve
+    const noPendingDrawing = () => { if (ctx.drawings && ctx.drawings.hasPendingReplacement(t.id)) conflict('a drawing replacement is pending'); };
+    if (sub === 'submit') { need(me, 'admin', 'qs'); noPendingDrawing(); return move('draft', 'submitted', 'submit'); }
     if (sub === 'return') { need(me, 'admin'); return move('submitted', 'draft', 'return'); }
     if (sub === 'send') { need(me, 'admin', 'qs'); return move('approved', 'sent', 'send'); }
     if (sub === 'reprice') {
@@ -554,6 +556,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       if (!finNum(b.expected_P)) bad('expected_P (the price P shown when approving) must be a number');
       const cur = tenderRow(t.id);
       if (cur.status !== 'submitted') conflict(`tender is ${cur.status}: approve needs submitted`);
+      noPendingDrawing();
       const c = compute(cur, margin), override = b.override_stale === true;
       const stale = c.blocking.some(x => x.code === 'snapshot_stale');
       const blocking = c.blocking.filter(x => !(override && x.code === 'snapshot_stale'));
