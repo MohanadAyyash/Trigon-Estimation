@@ -673,6 +673,49 @@ server.listen(0, async () => {
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
 
+    // ---- batch 4 Task 1: units of a measured DXF: before/after table, nothing changes before Apply, a fresh list (R18) ----
+    {
+      const lineU = (hd, layer, x0, y0, x1, y1) => [[0, 'LINE'], [5, hd], [8, layer], [10, x0], [20, y0], [11, x1], [21, y1]];
+      const FIXU = dxf([...dsec('ENTITIES', [...lineU('UK', 'KERB', 0, 0, 3000, 4000)])]);   // 5000 units: 5 m in mm
+      const ut = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Units' }, admin), 'units tender')).id;
+      const rowU = (await ok(call('POST', `tenders/${ut}/rows`, { no: '1', description: 'Test unit kerb', unit: 'm' }, admin), 'units row')).id;
+      const up = await fetch(`${base}tenders/${ut}/drawings?name=units`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(FIXU) });
+      assert.strictEqual(up.status, 202);
+      const uid = (await up.json()).id;
+      for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(uid).status === 'parsing';) {
+        if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
+      }
+      await ok(call('PUT', `drawings/${uid}/units`, { units: 'mm' }, admin), 'units mm');
+      await ok(call('POST', `drawings/${uid}/measurements`, { row_id: rowU, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', label: 'Fake kerb layer' }, admin), 'measure');
+      const DU = `#drawings[data-tender="${ut}"]`;
+      const rq = async () => (await call('GET', `tenders/${ut}/rows`, null, admin)).j.find(x => x.id === rowU).qty;
+      const took409 = msg => { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, msg); errors.splice(i, 1); };
+      await page.goto(`${origin}/#/tender/${ut}/drawings/${uid}`);
+      await page.waitForSelector(DU + ' #dw-change-units');
+      assert.strictEqual(await page.$(DU + ' #dw-confirm-units'), null, 'measured: Change units, not Confirm');
+      await page.selectOption('#dw-unit-select', 'm');
+      await page.click('#dw-change-units');
+      await page.waitForSelector(DU + ' #units-changes');
+      { const cells = await page.$$eval('#units-changes tbody tr', rs => rs.map(r => [...r.cells].map(c => c.textContent.trim())));
+        assert.deepStrictEqual(cells, [['Fake kerb layer', '1 — Test unit kerb', f2(5), f2(5000), 'm']], 'before/after'); }
+      assert.ok((await page.textContent('#dw-units-msg')).includes('from mm to m'), 'says the change');
+      assert.strictEqual(await rq(), 5, 'nothing changed before Apply');
+      assert.strictEqual(db.prepare('SELECT units FROM drawings WHERE id=?').get(uid).units, 'mm');
+      took409('unit change 409 logged');
+      // someone measures between the review and Apply: refused, the fresh list (with the new one's label) shown
+      await ok(call('POST', `drawings/${uid}/measurements`, { row_id: rowU, tool: 'manual', label: 'Fake late line', geom: { tool: 'line', pts: [[0, 0], [0, 1000]] } }, admin), 'measured meanwhile');
+      await page.click('#units-apply');
+      await page.waitForSelector(DU + ' #units-again');
+      { const cells = await page.$$eval('#units-changes tbody tr', rs => rs.map(r => [...r.cells].map(c => c.textContent.trim())));
+        assert.deepStrictEqual(cells.map(c => [c[0], c[2], c[3]]), [['Fake kerb layer', f2(5), f2(5000)], ['Fake late line', f2(1), f2(1000)]], 'the fresh list'); }
+      assert.strictEqual(await rq(), 6, 'nothing changed');
+      took409('stale apply 409 logged');
+      await page.click('#units-apply');
+      await page.waitForSelector(DU + ' #dw-layers[data-units="m"]');
+      assert.strictEqual(await rq(), 6000, 'Apply changed the row');
+      assert.strictEqual(db.prepare('SELECT units FROM drawings WHERE id=?').get(uid).units, 'm');
+    }
+
     // ---- PDF and image viewer (batch 3 Task 5): pages read by the browser, rendered by the vendored pdf.js ----------
     {
       const { makePdf, PDF_RECTS, makePng, makeOffsetPdf, OFFSET_RECT } = require('./test/fixtures/make-takeoff.js');
@@ -914,6 +957,9 @@ server.listen(0, async () => {
       const v0 = await page.evaluate(() => ({ ...window.__tvViewer.view() }));
       { const [sx, sy] = await scr(300, 300); await page.mouse.move(sx, sy); await page.mouse.down(); await page.mouse.move(sx + 60, sy + 40, { steps: 4 }); await page.mouse.up(); }
       assert.deepStrictEqual(await page.evaluate(() => ({ ...window.__tvViewer.view() })), v0, 'no left-drag pan while a tool is active');
+      // batch 4 carry-over: that drag added no point, and says so
+      assert.strictEqual(await page.evaluate(() => window.__tvTools.pointCount()), 0, 'a drag adds no point');
+      assert.ok((await page.textContent('#tl-msg')).includes('Point not added: the mouse moved'), 'drag-click hint: ' + await page.textContent('#tl-msg'));
       await clickPage(100, 600); await clickPage(300, 600);
       let pt = await page.textContent('#tl-preview');
       assert.ok(pt.includes('—') && pt.includes('calibrate first') && /preview/i.test(pt), 'no number before calibrating: ' + pt);
@@ -1045,8 +1091,14 @@ server.listen(0, async () => {
       const beforeM = await rowQty(rowM);
       await page.click('#tl-calibrate'); await pick(100, 700); await pick(200, 700);
       await page.waitForSelector(DM + ' #cal-form');
+      // batch 4 carry-over: a measurement another user saved before this first list shows its label (the list is read first)
+      const other = await ok(call('POST', `drawings/${pdfId}/measurements`, { tool: 'manual', row_id: rowM, label: 'Fake other kerb', geom: { tool: 'line', pts: [[100, 500], [200, 500]] } }, admin), 'measured by another user');
       await page.fill('#cal-real', '10'); await page.click('#cal-save');
       await page.waitForSelector(DM + ' #cal-changes');
+      { const cells = (await page.$$eval('#cal-changes tbody tr', rs => rs.map(r => [...r.cells].map(c => c.textContent.trim())))).find(x => x[0] === 'Fake other kerb');
+        assert.ok(cells, 'the first list shows the label: ' + await page.textContent('#cal-changes')); assert.strictEqual(cells[4], 'm');
+        assert.ok(!(await page.textContent('#cal-changes')).includes('#' + other.id), 'no "#id"'); }
+      await ok(call('DELETE', 'measurements/' + other.id, null, admin), 'tidy');
       const tbl = await page.textContent('#cal-changes');
       assert.ok(tbl.includes(f2(beforeM)) && tbl.includes(f2(beforeM * 2)) && tbl.includes(f2(24)) && tbl.includes(f2(96)), 'before/after: ' + tbl);
       assert.strictEqual(await rowQty(rowM), beforeM, 'nothing changed before Apply');
@@ -1217,7 +1269,7 @@ server.listen(0, async () => {
     await ok(call('POST', `tenders/${dwg}/submit`, null, admin), 'submit drawings tender');
     await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
     await page.click('#tab-drawings'); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
-    for (const s of ['#dw-upload', '#dw-confirm-units', '.lk-btn', '.m-delete']) assert.strictEqual(await page.$(D + ' ' + s), null, 'read-only: no ' + s);
+    for (const s of ['#dw-upload', '#dw-confirm-units', '#dw-change-units', '.lk-btn', '.m-delete']) assert.strictEqual(await page.$(D + ' ' + s), null, 'read-only: no ' + s);
     assert.ok((await page.textContent(D + ' tr[data-layer="KERB"] td.m-open_length')).includes('5.00'), 'read-only still shows the numbers');
     await openViewer();
     assert.strictEqual(await page.$(D + ' #tv-link'), null, 'read-only: no Link selection');

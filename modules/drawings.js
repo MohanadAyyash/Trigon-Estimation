@@ -504,7 +504,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     return out;
   }
-  const cannotRescale = m => bad(`measurement ${m.id} cannot be recomputed with another calibration`, 409);
+  const cannotRescale = m => bad(`measurement ${m.id} cannot be recomputed at the new scale (calibration or units)`, 409);
   // { qty, base } of a stored manual measurement under the calibration `cal`: manualQty on its stored geometry with its
   // own width/depth/factor/deduct. The geometry was validated when it was saved, so it is not validated again (R13);
   // anything that cannot be recomputed exactly the same way stops the change (409).
@@ -653,6 +653,78 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     return reply(res, 200, out);
   }
 
+  // ---- DXF units (spec 6.6): set before measuring; changed after measuring only through before/after (R18) --------
+  // Every non-count measurement of the drawing with the qty and base it gets under the units `to`, recomputed by the code
+  // that created it: a layer metric from the scaled layer table (scaledTable), a selection by totalling its stored handles
+  // again (select worker, selectionBase), both through dxfQty; a manual shape through manualRescale (manualQty). So a
+  // length moves by k, an area by k², and width/depth (metres) never scale. Counts (dxf_blocks, count selections and
+  // manual counts) do not depend on the units and are never listed. Anything that cannot be recomputed the same way → 409.
+  // Async (summary, workers): runs outside the tx; the caller checks inside its tx that nothing changed meanwhile.
+  async function unitChanges(d, to) {
+    const f = UNIT_TO_M[to], out = [];
+    let lt = null;
+    for (const m of db.prepare("SELECT * FROM measurements WHERE drawing_id=? AND (metric IS NULL OR metric<>'count') ORDER BY id").all(d.id)) {
+      let q;
+      if (m.tool === 'manual') q = manualRescale(m, { scale: f });
+      else if (m.tool === 'dxf_layer') {
+        if (!lt) lt = scaledTable((await readSummary(d.sha256)).raw, to);
+        const l = lt.layers.find(x => x.layer === m.layer);
+        q = dxfRescale(m, l ? l[m.metric] : null);
+      } else if (m.tool === 'dxf_selection') {
+        const handles = db.prepare('SELECT handle FROM measurement_handles WHERE measurement_id=? ORDER BY rowid').all(m.id).map(x => x.handle);
+        const sel = await totalSelection(d.sha256, handles, m.metric, !!m.nested);
+        if (sel.unknown || sel.used !== m.handles_count) cannotRescale(m);
+        q = dxfRescale(m, selectionBase(sel.base, m.metric, f));
+      } else cannotRescale(m);
+      out.push({ measurement_id: m.id, row_id: m.row_id, old_qty: m.qty, new_qty: q.qty, base: q.base });
+    }
+    return out;
+  }
+  function dxfRescale(m, base) {
+    if (!finNum(base) || !(base > 0)) cannotRescale(m);
+    const qty = dxfQty(base, m);
+    if (!Number.isFinite(qty) || qty > MAX_QTY) bad(`measurement ${m.id}: the quantity ${qty} would be out of range: it must be at most ${MAX_QTY}`, 409);
+    return { qty, base };
+  }
+  // what unitChanges read: a measurement saved, edited or deleted meanwhile changes it
+  const unitInputs = did => JSON.stringify(db.prepare('SELECT * FROM measurements WHERE drawing_id=? ORDER BY id').all(did));
+
+  // PUT /drawings/:id/units { units, apply?, expect? }. No measurement listed (none yet, counts only, the same units): set.
+  // Otherwise 409 with the before/after list; apply: true with the reviewed list (R18) stores the units, the listed
+  // quantities and the rows' totals in one tx (an imported row keeps its client qty; its measured total is checked).
+  async function setUnits(req, res, d, t, me) {
+    const b = await ctx.readBody(req);
+    for (const k of Object.keys(b)) if (!['units', 'apply', 'expect'].includes(k)) bad('unknown field: ' + k);
+    if (!hasUnit(b.units)) bad('units must be one of ' + Object.keys(UNIT_TO_M).join(', '));
+    const apply = optBool(b, 'apply'), expect = cleanExpect(b, apply);
+    const listed = changes => changes.map(({ measurement_id, row_id, old_qty, new_qty }) => ({ measurement_id, row_id, old_qty, new_qty }));
+    // the recomputation is async: if a measurement or the drawing changed before the tx, it is done again
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = drawingRow(d.id);
+      if (!before) bad('drawing not found', 404);
+      if (before.status !== 'ready') bad(`drawing is ${before.status}: units can be set once it is ready`, 409);
+      const seen = unitInputs(d.id);
+      const changes = before.units === b.units ? [] : await unitChanges(before, b.units);
+      const out = tx(() => {
+        mustDraft(tenderRow(t.id));
+        const cur = drawingRow(d.id);
+        if (!cur || cur.status !== 'ready') bad(`drawing is ${cur ? cur.status : 'gone'}: units can be set once it is ready`, 409);
+        if (cur.units !== before.units || cur.sha256 !== before.sha256 || unitInputs(d.id) !== seen) return null;
+        if (changes.length && !apply) conflictBody({ error: 'unit change changes measured quantities', changes: listed(changes) });
+        if (apply && !reviewed(expect, changes)) conflictBody({ error: 'the measured quantities changed: review the changes again', changes: listed(changes) });
+        db.prepare('UPDATE drawings SET units=? WHERE id=?').run(b.units, d.id);
+        const upd = db.prepare('UPDATE measurements SET qty=?, base=? WHERE id=?');
+        for (const c of changes) upd.run(c.new_qty, c.base, c.measurement_id);
+        const rows = [...new Set(changes.map(c => c.row_id).filter(r => r !== null))];
+        for (const r of rows) recompute(r);
+        audit(me, 'units', 'drawings', d.id, { from: cur.units, to: b.units, ...(changes.length ? { changed: changes.length, rows: rows.length } : {}) });
+        return { ...drawingRow(d.id), changes: listed(changes) };
+      });
+      if (out) return reply(res, 200, out);
+    }
+    bad('the drawing kept changing while its quantities were recomputed: try again', 409);
+  }
+
   // the file's download name: the drawing name with its extension, percent-encoded (RFC 5987/8187: ' ( ) * too), so no
   // name can break the header
   const dispositionName = (name, ext) => {
@@ -719,22 +791,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (sub === 'file' && parts.length === 3 && method === 'GET') return serveFile(req, res, d, me);
     if (sub === 'pages' && parts.length === 3 && method === 'POST') return registerPages(req, res, d, t, me);
     if (sub === 'calibrations' && parts.length >= 3 && parts.length <= 5) return calibrationApi(req, res, parts, d, t, me);
-    if (sub === 'units' && parts.length === 3 && method === 'PUT') {
-      need(me, 'admin', 'qs'); mustDraft(t); dxfOnly();
-      const b = await ctx.readBody(req);
-      for (const k of Object.keys(b)) if (k !== 'units') bad('unknown field: ' + k);
-      if (!hasUnit(b.units)) bad('units must be one of ' + Object.keys(UNIT_TO_M).join(', '));
-      tx(() => {
-        mustDraft(tenderRow(t.id));
-        const st = drawingRow(d.id).status;
-        if (st !== 'ready') bad(`drawing is ${st}: units can be set once it is ready`, 409);
-        if (db.prepare('SELECT 1 FROM measurements WHERE drawing_id=? LIMIT 1').get(d.id)) bad('units cannot change after measuring (batch 4 adds a before/after flow)', 409);
-        const from = drawingRow(d.id).units;
-        db.prepare('UPDATE drawings SET units=? WHERE id=?').run(b.units, d.id);
-        audit(me, 'units', 'drawings', d.id, { from, to: b.units });
-      });
-      return reply(res, 200, drawingRow(d.id));
-    }
+    if (sub === 'units' && parts.length === 3 && method === 'PUT') { need(me, 'admin', 'qs'); mustDraft(t); dxfOnly(); return setUnits(req, res, d, t, me); }
     if (sub === 'measurements' && parts.length === 3 && method === 'POST') return createMeasurement(req, res, d, t, me);
     return false;
   }
@@ -770,6 +827,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const FAMILY = { open_length: ['open_length', 'closed_perimeter'], closed_perimeter: ['open_length', 'closed_perimeter'], area: ['area'], count: ['count'] };
   const MFIELDS = ['row_id', 'tool', 'layer', 'metric', 'block', 'nested', 'handles', 'width', 'depth', 'factor', 'label', 'color', 'confirm_uom', 'confirm_overlap', 'confirm_incomplete', 'confirm_duplicate', 'confirm_mixed_blocks'];
   const finNum = v => typeof v === 'number' && Number.isFinite(v);
+  // the DXF tools' qty from their base (metres, m2 or nr): base × (width ?? 1) × (depth ?? 1) × factor (width/depth in metres)
+  const dxfQty = (base, m) => base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
+  // a selection's base from its total in drawing units: lengths × f, areas × f², counts as they are (f = UNIT_TO_M[units])
+  const selectionBase = (raw, metric, f) => metric === 'count' ? raw : metric === 'area' ? raw * f * f : raw * f;
   const optBool = (b, k) => { if (b[k] !== undefined && typeof b[k] !== 'boolean') bad(k + ' must be true or false'); return b[k] === true; };
   const optText = (b, k, max) => {
     if (b[k] === undefined || b[k] === null) return null;
@@ -1065,7 +1126,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       && (m.tool === 'dxf_blocks' ? w.detail.block === m.block : w.detail.block === undefined)).reduce((s, w) => s + w.detail.count, 0);
     if (duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', duplicates });
     if (!finNum(base) || !(base > 0)) bad(`nothing to measure: ${m.layer} ${m.block ? m.block + ' ' : ''}${m.metric} is ${base}`);
-    m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
+    m.qty = dxfQty(base, m);
     if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
     m.drawing_id = d.id;
     const out = tx(() => {
@@ -1107,8 +1168,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     const sel = await totalSelection(d.sha256, m.handles, m.metric, m.nested);
     if (sel.unknown) bad('selection contains entities not in this drawing');
     if (!sel.used) bad('nothing in the selection can be measured as ' + m.metric);
-    const f = UNIT_TO_M[d.units];
-    const base = m.metric === 'count' ? sel.base : m.metric === 'area' ? sel.base * f * f : sel.base * f;
+    const base = selectionBase(sel.base, m.metric, UNIT_TO_M[d.units]);
     m.handles_count = sel.used; m.drawing_id = d.id;
     const counted = sel.blocks.filter(x => x.count > 0);
     m.sel = { handles: new Set(sel.used_handles), keys: new Set(sel.used_keys), layers: new Set(Object.keys(sel.by_layer)), pairs: new Set(counted.map(x => x.layer + '\0' + x.block)) };
@@ -1132,7 +1192,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (duplicates && !m.confirm_duplicate) conflictBody({ error: 'possible duplicates on this layer', ...counts });
       if (mixed && !m.confirm_mixed_blocks) conflictBody({ error: 'selection contains several blocks', blocks: mixed });
       if (!finNum(base) || !(base > 0)) bad('nothing in the selection can be measured as ' + m.metric);
-      m.qty = base * (m.width ?? 1) * (m.depth ?? 1) * m.factor;
+      m.qty = dxfQty(base, m);
       if (!Number.isFinite(m.qty) || m.qty > MAX_QTY) bad(`the quantity ${m.qty} is out of range: it must be at most ${MAX_QTY}`);
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap, counts, overlapping);
       const id = Number(db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,created,created_by)

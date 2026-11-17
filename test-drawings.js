@@ -500,7 +500,7 @@ server.listen(0, async () => {
       assert.strictEqual(w.alive, 0);
     }
 
-    // ---- ctx.drawings hooks; units cannot change after measuring ------------------------------------------
+    // ---- ctx.drawings hooks; units cannot change unseen after measuring ---------------------------------------
     {
       assert.strictEqual(typeof ctx.drawings.hasMeasurements, 'function');
       const rowA = 501, rowB = 502;
@@ -512,8 +512,10 @@ server.listen(0, async () => {
       assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowA), { qty: 7.5, unit: 'm', count: 2, units: [{ unit: 'm', qty: 7.5, count: 2 }], incomplete: false, duplicate: false });
       ins.run(id, tid, rowB, 1, 'm'); ins.run(id, tid, rowB, 1, 'm2');
       assert.deepStrictEqual(ctx.drawings.rowMeasuredQty(rowB), { qty: null, unit: null, count: 2, units: [{ unit: 'm', qty: 1, count: 1 }, { unit: 'm2', qty: 1, count: 1 }], incomplete: false, duplicate: false }, 'mixed units: never one total');
+      // batch 4: no longer refused outright: the before/after list (Task 1 section below)
       const r = await call('PUT', `drawings/${id}/units`, { units: 'm' }, qs);
-      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'units cannot change after measuring (batch 4 adds a before/after flow)');
+      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'unit change changes measured quantities');
+      assert.strictEqual(r.j.changes.length, 5, 'every measurement listed');
       // the second drawing (same file) has no measurements: its units can still be set
       assert.strictEqual((await call('PUT', `drawings/${up2.j.id}/units`, { units: 'mm' }, qs)).s, 200);
     }
@@ -2019,6 +2021,128 @@ server.listen(0, async () => {
       assert.strictEqual(a.row_id, null); assert.strictEqual(a.from_row_id, rT);
       await ok(put(tDed.id, { row_id: rT }), 'link again'); near(qtyOf(rT), 4, 'linked again');
       assert.match((await put(tPos.id, { row_id: 'x' })).j.error, /row_id/, 'row_id: a row id or null');
+    }
+
+    // ---- batch 4 Task 1: changing the units of a measured DXF goes through before/after (R18 expect) ------------------
+    {
+      const { writeXlsx } = require('./lib/xlsx.js');
+      const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
+      const rel = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) <= 1e-12 * Math.max(Math.abs(a), Math.abs(b)), `${msg}: expected ≈${b}, got ${a}`);
+      const audits = action => db.prepare("SELECT detail FROM audit_log WHERE action=? ORDER BY id").all(action).map(a => JSON.parse(a.detail));
+      // KERB: one line of 5000 units (5 m in mm); ASPHALT: a 10000-unit square (100 m2 in mm); MH: one MH1 insert
+      const FIXU = dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...tables([layerRec('KERB'), layerRec('ASPHALT'), layerRec('MH')]),
+        ...sec('BLOCKS', [[0, 'BLOCK'], [2, 'MH1'], [70, 0], [10, 0], [20, 0], [0, 'ENDBLK']]),
+        ...sec('ENTITIES', [...line('UK', 'KERB', 0, 0, 3000, 4000), ...lwp('UA', sq(0, 0, 10000), true, 'ASPHALT'), ...insert('UM', 'MH1', 'MH')])]);
+      const T = (await ok(call('POST', 'tenders', { title: 'Test Unit Change', kind: 'rta' }, qs), 'tender')).id;
+      const BOQ = { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Fake imported asphalt', 'm2', 95]] }]).toString('base64'),
+        sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } };
+      await ok(call('POST', `tenders/${T}/import`, BOQ, qs), 'import');
+      const rowsOf = async () => ok(call('GET', `tenders/${T}/rows`, null, viewer), 'rows');
+      const rI = (await rowsOf()).find(r => r.description === 'Fake imported asphalt').id;
+      const newRow = async (description, unit) => (await ok(call('POST', `tenders/${T}/rows`, { description, unit }, qs), 'row ' + description)).id;
+      const rM = await newRow('Fake kerb', 'm'), rM2 = await newRow('Fake paving', 'm2'), rM3 = await newRow('Fake concrete', 'm3'), rNr = await newRow('Fake manholes', 'nr');
+      const up = await upload(T, 'Fake unit plan', Buffer.from(FIXU), qs);
+      assert.strictEqual(up.s, 202);
+      const D = up.j.id;
+      assert.strictEqual((await waitDone(D, qs)).status, 'ready');
+      await ok(call('PUT', `drawings/${D}/units`, { units: 'mm' }, qs), 'units mm');
+      const measure = (b, did = D) => ok(call('POST', `drawings/${did}/measurements`, { confirm_overlap: true, ...b }, qs), 'measure ' + JSON.stringify(b).slice(0, 80));
+      const kerb = { tool: 'dxf_layer', layer: 'KERB', metric: 'open_length' }, asph = { tool: 'dxf_layer', layer: 'ASPHALT', metric: 'area' };
+      const mLayer = await measure({ row_id: rM, ...kerb, label: 'Fake kerb layer' });
+      const mVolL = await measure({ row_id: rM3, ...kerb, width: 0.5, depth: 0.2 });   // m × width × depth (metres): scales by k
+      const mArea = await measure({ row_id: rI, ...asph });                           // m2 on the imported row: scales by k²
+      const mVolA = await measure({ row_id: rM3, ...asph, depth: 0.1 });               // m2 × depth (metres): scales by k²
+      const mSelL = await measure({ row_id: rM, tool: 'dxf_selection', metric: 'open_length', handles: ['UK'] });
+      const mSelA = await measure({ row_id: rM2, tool: 'dxf_selection', metric: 'area', handles: ['UA'] });
+      const mPoly = await measure({ row_id: rM, tool: 'manual', geom: { tool: 'polyline', pts: [[0, 0], [1000, 0], [1000, 1000]] } });
+      const mRect = await measure({ row_id: rM2, tool: 'manual', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } });
+      // counts: never listed (a count does not depend on the units)
+      const mBlk = await measure({ row_id: rNr, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' });
+      const mSelC = await measure({ row_id: rNr, tool: 'dxf_selection', metric: 'count', handles: ['UM'] });
+      const mCnt = await measure({ row_id: rNr, tool: 'manual', geom: { tool: 'count', pts: [[5, 5], [6, 6]] } });
+      rel(mLayer.qty, 5, 'KERB 5000 mm = 5 m'); rel(mVolL.qty, 0.5, 'm3 from a length'); rel(mArea.qty, 100, 'ASPHALT 100 m2'); rel(mVolA.qty, 10, 'm3 from an area');
+      rel(mSelL.qty, 5, 'selection length'); rel(mSelA.qty, 100, 'selection area'); rel(mPoly.qty, 2, 'polyline'); rel(mRect.qty, 2, 'rect');
+      const mRow = id => db.prepare('SELECT * FROM measurements WHERE id=?').get(id);
+      const qtyOf = id => db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(id).qty;
+      const snap = () => JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(T), db.prepare('SELECT id, qty FROM tender_rows WHERE tender_id=? ORDER BY id').all(T),
+        db.prepare('SELECT units FROM drawings WHERE id=?').get(D)]);
+      const s0 = snap(), nUnits = audits('units').length;
+      // 1. mm → m: 409 with every non-count measurement, new_qty from the creation code with the new unit
+      //    (lengths × 1000, areas × 1000², volumes from a length × 1000, from an area × 1000²); nothing changed
+      let r = await call('PUT', `drawings/${D}/units`, { units: 'm' }, qs);
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'unit change changes measured quantities');
+      const k = 1000, want = [[mLayer, rM, k], [mVolL, rM3, k], [mArea, rI, k * k], [mVolA, rM3, k * k], [mSelL, rM, k], [mSelA, rM2, k * k], [mPoly, rM, k], [mRect, rM2, k * k]];
+      assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), want.map(([m]) => m.id), 'every non-count measurement, counts excluded');
+      for (const [i, [m, row, f]] of want.entries()) {
+        const c = r.j.changes[i];
+        assert.deepStrictEqual(Object.keys(c).sort(), ['measurement_id', 'new_qty', 'old_qty', 'row_id']);
+        assert.strictEqual(c.row_id, row); assert.strictEqual(c.old_qty, m.qty); rel(c.new_qty, m.qty * f, 'new qty of ' + m.id);
+      }
+      assert.strictEqual(snap(), s0, 'nothing changed without apply'); assert.strictEqual(audits('units').length, nUnits);
+      const expectOf = changes => changes.map(c => ({ measurement_id: c.measurement_id, new_qty: c.new_qty }));
+      const reviewedList = expectOf(r.j.changes);
+      // 3. apply without expect → 400 (and the other malformed bodies); a viewer → 403; nothing changed
+      for (const [b, re] of [[{ units: 'm', apply: true }, /needs expect/], [{ units: 'm', expect: reviewedList }, /goes with apply/], [{ units: 'm', apply: 'yes', expect: reviewedList }, /apply must be true or false/],
+        [{ units: 'm', apply: true, expect: [{ measurement_id: mLayer.id }] }, /new_qty/], [{ units: 'm', apply: true, expect: reviewedList, x: 1 }, /unknown field/]]) {
+        const x = await call('PUT', `drawings/${D}/units`, b, qs);
+        assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, re, JSON.stringify(b));
+      }
+      assert.strictEqual((await call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: reviewedList }, viewer)).s, 403);
+      assert.strictEqual(snap(), s0, 'nothing changed by a refused apply');
+      // 4. a measurement saved between the review and Apply → 409 with the fresh list (it is in it); a changed qty → 409 too
+      const mLate = await measure({ row_id: rM, tool: 'manual', geom: { tool: 'line', pts: [[0, 0], [0, 400]] } });
+      const s1 = snap();
+      r = await call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: reviewedList }, qs);
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'the measured quantities changed: review the changes again');
+      assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), [...want.map(([m]) => m.id), mLate.id], 'the fresh list');
+      rel(r.j.changes.at(-1).new_qty, mLate.qty * k, 'the late one');
+      const fresh = expectOf(r.j.changes);
+      r = await call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: fresh.map((x, i) => i ? x : { ...x, new_qty: x.new_qty * 2 }) }, qs);
+      assert.strictEqual(r.s, 409); assert.strictEqual(snap(), s1, 'nothing changed');
+      // 2. apply with the reviewed list: units, measurements and rows in one go; 6. the rows are recomputed (the imported
+      //    row too: its client qty stays, its measured total is checked)
+      const real = ctx.tenders.recomputeTakeoffQty, seen = [];
+      ctx.tenders.recomputeTakeoffQty = id => { seen.push(id); return real(id); };
+      let applied;
+      try { applied = await ok(call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: fresh }, qs), 'apply'); }
+      finally { ctx.tenders.recomputeTakeoffQty = real; }
+      assert.strictEqual(applied.units, 'm'); assert.strictEqual(applied.changes.length, 9);
+      assert.deepStrictEqual([...new Set(seen)].sort((a, b) => a - b), [rI, rM, rM2, rM3].sort((a, b) => a - b), 'every row of a changed measurement recomputed');
+      for (const c of fresh) { const m = mRow(c.measurement_id); assert.strictEqual(m.qty, c.new_qty, 'stored as reviewed'); }
+      rel(mRow(mLayer.id).base, 5000, 'layer base in m'); rel(mRow(mSelA.id).base, 1e8, 'selection base m2');
+      rel(qtyOf(rM), 5000 + 5000 + 2000 + 400, 'm row'); rel(qtyOf(rM2), 1e8 + 2e6, 'm2 row'); rel(qtyOf(rM3), 500 + 1e7, 'm3 row');
+      assert.strictEqual(qtyOf(rI), 95, 'the client qty never changes');
+      rel((await rowsOf()).find(x => x.id === rI).measured_qty, 1e8, 'imported row measured total');
+      for (const m of [mBlk, mSelC, mCnt]) assert.strictEqual(mRow(m.id).qty, m.qty, 'counts unchanged');
+      assert.strictEqual(qtyOf(rNr), mBlk.qty + mSelC.qty + mCnt.qty);
+      assert.deepStrictEqual(audits('units').at(-1), { from: 'mm', to: 'm', changed: 9, rows: 4 }, 'audit: a summary only');
+      // the same numbers as measuring again in the new units (the creation code)
+      for (const [m, b] of [[mLayer, { row_id: rM, ...kerb }], [mVolL, { row_id: rM3, ...kerb, width: 0.5, depth: 0.2 }], [mArea, { row_id: rM2, ...asph }], [mVolA, { row_id: rM3, ...asph, depth: 0.1 }],
+        [mSelA, { row_id: rM2, tool: 'dxf_selection', metric: 'area', handles: ['UA'] }], [mRect, { row_id: rM2, tool: 'manual', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } }]]) {
+        const again = await measure(b);
+        assert.strictEqual(again.qty, mRow(m.id).qty, 'measured again in m: ' + JSON.stringify(b).slice(0, 60));
+        await ok(call('DELETE', 'measurements/' + again.id, null, qs), 'tidy');
+      }
+      // the same units again: nothing to review, nothing changes
+      const s2 = snap();
+      assert.strictEqual((await ok(call('PUT', `drawings/${D}/units`, { units: 'm' }, qs), 'same units')).changes.length, 0);
+      assert.strictEqual(snap(), s2);
+      // a drawing with counts only: nothing to review, the units change at once (5. counts are never listed)
+      const up2 = await upload(T, 'Fake count plan', Buffer.from(FIXU), qs);
+      assert.strictEqual((await waitDone(up2.j.id, qs)).status, 'ready');
+      await ok(call('PUT', `drawings/${up2.j.id}/units`, { units: 'mm' }, qs), 'units mm');
+      const c2 = await measure({ row_id: rNr, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' }, up2.j.id);
+      const u2 = await ok(call('PUT', `drawings/${up2.j.id}/units`, { units: 'cm' }, qs), 'counts only');
+      assert.strictEqual(u2.units, 'cm'); assert.deepStrictEqual(u2.changes, []); assert.strictEqual(mRow(c2.id).qty, c2.qty);
+      // a quantity that cannot be recomputed the same way (an entity of the selection is no longer in the drawing) stops the
+      // change: 409 with the reason, nothing changed
+      const sx = await measure({ row_id: rM, tool: 'dxf_selection', metric: 'open_length', handles: ['UK'] }, up2.j.id);
+      db.prepare("INSERT INTO measurement_handles(measurement_id, handle, geom_key) VALUES(?, 'GONE', NULL)").run(sx.id);
+      db.prepare('UPDATE measurements SET handles_count=handles_count+1 WHERE id=?').run(sx.id);
+      const rowBefore = qtyOf(rM);
+      r = await call('PUT', `drawings/${up2.j.id}/units`, { units: 'm' }, qs);
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, `measurement ${sx.id} cannot be recomputed at the new scale (calibration or units)`);
+      assert.strictEqual(db.prepare('SELECT units FROM drawings WHERE id=?').get(up2.j.id).units, 'cm'); assert.strictEqual(mRow(sx.id).qty, sx.qty); assert.strictEqual(qtyOf(rM), rowBefore);
     }
 
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------

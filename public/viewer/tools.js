@@ -88,6 +88,8 @@ function create(o) {
     return true;
   }
   function drag(p0, p1) {
+    // a click that moved more than a few pixels with a point tool adds nothing: say so (never dropped silently)
+    if (tool && tool !== 'rect' && tool !== 'region' && !done) { if (o.onNote) o.onNote('drag'); return; }
     if ((tool !== 'rect' && tool !== 'region') || done || ring.length || !p0 || !p1) return;
     ring = [p0, p1];
     finish();

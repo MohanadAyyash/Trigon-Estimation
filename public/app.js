@@ -608,15 +608,42 @@
     const confirmed = lt.units_confirmed, measured = [...ms.measurements, ...ms.unlinked].some(m => m.drawing_id === d.id);
     box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList, editable, savedOf));
     // units: the suggestion is pre-selected, nothing is computed until Confirm
-    const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable || measured });
+    const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable });
     const ignored = Object.entries(d.ignored || {});
+    // measured: a unit change shows the before/after list and changes nothing before Apply (R18: Apply sends that list;
+    // a fresh list from the server, e.g. someone measured meanwhile, is shown to be reviewed again)
+    const unitMsg = h('div', { id: 'dw-units-msg' });
+    unitSel.addEventListener('change', () => unitMsg.replaceChildren());
+    const unitsTable = async (changes, units, again) => {
+      let byId = new Map();
+      try { const all = await api('GET', `tenders/${d.tender_id}/measurements`); byId = new Map([...all.measurements, ...all.unlinked].map(m => [m.id, m])); } catch (e) { /* shown by id */ }
+      const apply = h('button', { id: 'units-apply', onclick: async () => {
+        apply.disabled = true;
+        try { await api('PUT', `drawings/${d.id}/units`, { units, apply: true, expect: changes.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty })) }); rerender(); }
+        catch (e) {
+          apply.disabled = false;
+          if (e.status === 409 && e.body && Array.isArray(e.body.changes)) await unitsTable(e.body.changes, units, true);
+          else unitMsg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message)));
+        }
+      } }, t('cal_apply'));
+      unitMsg.replaceChildren(...(again ? [h('p', { id: 'units-again', class: 'err' }, t('cal_review_again'))] : []), h('p', { class: 'warn' }, t('dw_units_changes', { from: lt.units, to: units })),
+        changesGrid(changes, byId, rows, 'units-changes'),
+        h('div', { class: 'row' }, apply, h('button', { id: 'units-cancel', class: 'secondary', onclick: () => { unitSel.value = lt.units; unitMsg.replaceChildren(); } }, t('cancel'))));
+    };
     box.append(h('section', { class: 'card', id: 'dw-units' }, h('h2', null, t('dw_units_title'), ' — ', h('span', { dir: 'auto' }, d.name || '')),
       h('p', { class: 'muted small' }, d.suggested_units ? t('dw_suggested', { u: d.suggested_units }) : t('dw_no_suggested')),
-      h('div', { class: 'row wrap' }, unitSel, editable && !measured ? h('button', { id: 'dw-confirm-units', onclick: async ev => {
+      h('div', { class: 'row wrap' }, unitSel, editable ? h('button', { id: measured ? 'dw-change-units' : 'dw-confirm-units', onclick: async ev => {
         if (!unitSel.value) return flash(t('dw_choose_units'));
+        const units = unitSel.value;
         ev.target.disabled = true;
-        try { await api('PUT', `drawings/${d.id}/units`, { units: unitSel.value }); rerender(); } catch (e) { fail(e); ev.target.disabled = false; }
-      } }, t('dw_confirm_units')) : null),
+        try { await api('PUT', `drawings/${d.id}/units`, { units }); rerender(); }
+        catch (e) {
+          ev.target.disabled = false;
+          if (measured && e.status === 409 && e.body && Array.isArray(e.body.changes)) await unitsTable(e.body.changes, units, false);
+          else fail(e);
+        }
+      } }, measured ? t('dw_change_units') : t('dw_confirm_units')) : null),
+      unitMsg,
       confirmed ? h('p', { class: 'small' }, h('span', { class: 'tag good' }, t('dw_units_confirmed', { u: lt.units }))) : h('p', { class: 'warn' }, t('dw_units_note')),
       ignored.length ? h('p', { id: 'dw-ignored', class: 'small muted' }, t('dw_ignored') + ': ', ignored.map(([k, n]) => k + ' × ' + n).join(', ')) : null,
       drawingWarnings((lt.warnings || []).filter(w => w.code !== 'possible_duplicate'))));
@@ -979,6 +1006,17 @@
     : h('span', { class: 'muted' }, t('tl_not_verified'));
   const MEASURE_TOOLS = ['line', 'polyline', 'area', 'rect', 'count'];
 
+  // the before/after table of a change that rescales measured quantities (re-calibration, unit change): changes
+  // [{ measurement_id, row_id, old_qty, new_qty }], byId: the measurements (label, unit) by id, rows: the tender rows
+  function changesGrid(changes, byId, rows, id) {
+    const rowName = rid => { const r = rows.find(x => x.id === rid); return r ? rowText(r) : '—'; };
+    return h('div', { class: 'scroll' }, table([t('m_label'), t('row'), t('cal_before'), t('cal_after'), t('unit')], changes.map(x => {
+      const m = byId.get(x.measurement_id) || {};
+      return h('tr', null, h('td', null, h('span', { dir: 'auto' }, m.label || '#' + x.measurement_id)), h('td', null, h('span', { dir: 'auto' }, x.row_id === null ? '—' : rowName(x.row_id))),
+        h('td', { class: 'num' }, fmt2(x.old_qty)), h('td', { class: 'num' }, fmt2(x.new_qty)), h('td', null, m.qty_unit || ''));
+    }), { class: 'grid', id }));
+  }
+
   // c: { d (with id), kind: 'dxf'|'pdf'|'image', unit (label of a drawing/page unit), editable, rows, savedOf(), refreshList(),
   //      alive(), cursor(), axisLock, dxfScale() (DXF), cals, units (PDF/image),
   //      eng: { canvas, toScreen(p), toPage(sx, sy), requestDraw(), setToolMode(on) } }
@@ -1098,7 +1136,7 @@
       // R18: Apply sends the list shown here; if the server finds another one (someone measured meanwhile), the fresh list
       // is shown to be reviewed again and nothing changes
       const changesTable = (changes, body, again) => {
-        const ms = new Map(c.savedOf().map(m => [m.id, m])), rowName = id => { const r = c.rows.find(x => x.id === id); return r ? rowText(r) : '—'; };
+        const ms = new Map(c.savedOf().map(m => [m.id, m]));
         const apply = h('button', { id: 'cal-apply', onclick: async () => {
           apply.disabled = true;
           const g = gen, expect = changes.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty }));
@@ -1115,11 +1153,7 @@
           }
         } }, t('cal_apply'));
         msg.replaceChildren(...(again ? [h('p', { id: 'cal-again', class: 'err' }, t('cal_review_again'))] : []), h('p', { class: 'warn' }, t('cal_changes')),
-          h('div', { class: 'scroll' }, table([t('m_label'), t('row'), t('cal_before'), t('cal_after'), t('unit')], changes.map(x => {
-            const m = ms.get(x.measurement_id) || {};
-            return h('tr', null, h('td', null, h('span', { dir: 'auto' }, m.label || '#' + x.measurement_id)), h('td', null, h('span', { dir: 'auto' }, x.row_id === null ? '—' : rowName(x.row_id))),
-              h('td', { class: 'num' }, fmt2(x.old_qty)), h('td', { class: 'num' }, fmt2(x.new_qty)), h('td', null, m.qty_unit || ''));
-          }), { class: 'grid', id: 'cal-changes' })), h('div', { class: 'row' }, apply));
+          changesGrid(changes, ms, c.rows, 'cal-changes'), h('div', { class: 'row' }, apply));
       };
       const save = h('button', { id: 'cal-save', onclick: async () => {
         let r;
@@ -1140,7 +1174,11 @@
         } catch (e) {
           save.disabled = false;
           if (g !== gen) msg.replaceChildren(h('p', { class: 'warn' }, t('lk_changed_save_again')));
-          else if (!isV && e.status === 409 && e.body && Array.isArray(e.body.changes)) changesTable(e.body.changes, body);   // nothing changes before Apply
+          else if (!isV && e.status === 409 && e.body && Array.isArray(e.body.changes)) {   // nothing changes before Apply
+            // the list read first: a measurement someone else saved shows its label and unit (not "#id")
+            try { await c.refreshList(); } catch (e2) { /* shown by id */ }
+            changesTable(e.body.changes, body);
+          }
           else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message)));
         }
       } }, isV ? t('vf_save') : t('cal_save'));
@@ -1154,7 +1192,7 @@
 
     const tools = TVTools.create({ canvas: c.eng.canvas, toScreen: c.eng.toScreen, toPage: c.eng.toPage, requestDraw: c.eng.requestDraw, axisLock: !!c.axisLock,
       alive: c.alive, cursor: c.cursor, onFinish,
-      onNote: (k, n) => say(k === 'same_point' ? t('tl_same_point') : t('tl_need_points', { n }), 'warn small'),
+      onNote: (k, n) => say(k === 'same_point' ? t('tl_same_point') : k === 'drag' ? t('tl_drag_ignored') : t('tl_need_points', { n }), 'warn small'),
       overlay: () => ({
         saved: c.savedOf().map(m => ({ id: m.id, geom: m.geom, color: m.color, text: (m.label ? m.label + ' · ' : '') + (m.metric === 'count' ? fmtQ(m.qty) : fmt2(m.qty)) + ' ' + (m.qty_unit || '') })),
         cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: t('tl_scale_dxf', { u: c.unit, s: fmtScale(x.scale) }) })) : [],
