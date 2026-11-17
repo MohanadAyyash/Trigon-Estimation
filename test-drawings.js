@@ -1294,6 +1294,7 @@ server.listen(0, async () => {
         [{ pages: [{ ...pages[0], width: '595' }, pages[1]] }, /width/], [{ pages: [{ ...pages[0], rotation: 45 }, pages[1]] }, /rotation/],
         [{ pages: [pages[0], { ...pages[1], page: 1 }] }, /exactly once/], [{ pages: [pages[0], { ...pages[1], page: 3 }] }, /exactly once/],
         [{ pages: [{ ...pages[0], page: 1.5 }] }, /page/], [{ pages: [{ ...pages[0], note: 'x' }] }, /unknown field/],
+        [{ pages: [{ ...pages[0], x0: '1000' }, pages[1]] }, /x0/], [{ pages: [{ ...pages[0], y0: -1e7 - 1 }, pages[1]] }, /y0/], [{ pages: [pages[0], { ...pages[1], x0: null }] }, /x0/],
         [{ pages: Array.from({ length: 2001 }, (_, i) => ({ page: i + 1, width: 10, height: 10, rotation: 0 })) }, /1 to 2000/],
       ];
       for (const [b, re] of badPages) { const r = await call('POST', `drawings/${up.j.id}/pages`, b, qs); assert.strictEqual(r.s, 400, JSON.stringify(b).slice(0, 80)); assert.match(r.j.error, re); }
@@ -1309,6 +1310,7 @@ server.listen(0, async () => {
         [true, 'pdf', 'ready', 1, 595, 842, 0, null, psha, 'Plans', T],
         [false, 'pdf', 'ready', 2, 842, 595, 90, up.j.id, psha, 'Plans — p2', T]]);
       assert.deepStrictEqual(pr.j.drawings.map(x => x.id), all.map(x => x.id), 'the reply lists the page rows');
+      assert.deepStrictEqual(all.map(x => [x.page_x0, x.page_y0]), [[0, 0], [0, 0]], 'no x0/y0: the page box starts at 0');
       const pa = db.prepare("SELECT detail FROM audit_log WHERE action='pages' AND entity_id=?").get(String(up.j.id));
       assert.deepStrictEqual(JSON.parse(pa.detail), { pages: 2 });
       // a second pages call → 409 (also on a page row)
@@ -1322,9 +1324,9 @@ server.listen(0, async () => {
       {
         const one = await upload(T, 'Single', PDF, qs);
         assert.strictEqual(one.s, 202);
-        assert.strictEqual((await call('POST', `drawings/${one.j.id}/pages`, { pages: [{ page: 1, width: 420.5, height: 297.25, rotation: 270 }] }, qs)).s, 200);
+        assert.strictEqual((await call('POST', `drawings/${one.j.id}/pages`, { pages: [{ page: 1, width: 420.5, height: 297.25, rotation: 270, x0: 12.5, y0: -7.25 }] }, qs)).s, 200);
         const o = row(one.j.id);
-        assert.deepStrictEqual([o.status, o.page, o.page_w, o.page_h, o.rotation], ['ready', 1, 420.5, 297.25, 270]);
+        assert.deepStrictEqual([o.status, o.page, o.page_w, o.page_h, o.rotation, o.page_x0, o.page_y0], ['ready', 1, 420.5, 297.25, 270, 12.5, -7.25], 'the page box origin is stored (R16)');
         assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE parent_id=?').get(one.j.id).n, 0);
       }
 
@@ -1389,9 +1391,10 @@ server.listen(0, async () => {
         const nd = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(rv.j.id), od = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(T);
         assert.strictEqual(nd.length, n);
         nd.forEach((x, i) => {
-          for (const k of ['kind', 'name', 'sha256', 'bytes', 'status', 'page', 'page_w', 'page_h', 'rotation']) assert.strictEqual(x[k], od[i][k], k);
+          for (const k of ['kind', 'name', 'sha256', 'bytes', 'status', 'page', 'page_w', 'page_h', 'rotation', 'page_x0', 'page_y0']) assert.strictEqual(x[k], od[i][k], k);
           assert.strictEqual(x.parent_id, od[i].parent_id === null ? null : nd[od.findIndex(o => o.id === od[i].parent_id)].id, 'parent_id remapped');
         });
+        assert.ok(nd.some(x => x.page_x0 === 12.5 && x.page_y0 === -7.25), 'the page box origin is copied (R16)');
         const child = nd.find(x => x.parent_id !== null);
         assert.ok(child && nd.find(x => x.id === child.parent_id).tender_id === rv.j.id);
         // the copied 'pages' row can register its pages in the draft Rev
@@ -1622,7 +1625,7 @@ server.listen(0, async () => {
     // ---- batch 3 Task 4: manual measurements (line, polyline, area with holes, rect, count) on PDF, image and DXF ------
     {
       const TM = require('./lib/takeoff/manual.js');
-      const { makePdf, PDF_PAGES, makePng } = require('./test/fixtures/make-takeoff.js');
+      const { makePdf, PDF_PAGES, makePng, makeOffsetPdf, OFFSET_PAGE } = require('./test/fixtures/make-takeoff.js');
       const near = (a, b, msg) => assert.ok(typeof a === 'number' && Math.abs(a - b) < 1e-9, `${msg}: expected ≈${b}, got ${a}`);
       const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
       const audits = action => db.prepare("SELECT detail FROM audit_log WHERE action=? ORDER BY id").all(action).map(a => JSON.parse(a.detail));
@@ -1656,6 +1659,25 @@ server.listen(0, async () => {
       for (const b of [{ p1: [0, 0], p2: [1191, 0], real: 5, unit: 'm' }, { p1: [0, -843], p2: [0, 0], real: 5, unit: 'm' }, { region: [0, 0, 100, 1685], p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }]) {
         const x = await call('POST', `drawings/${P1}/calibrations`, b, qs);
         assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, /outside the page/);
+      }
+      // R16: a page box that does not start at 0 (MediaBox [1000 2000 1595 2842]): points stay absolute, the bound is
+      // centred on the box origin
+      {
+        const off = await upload(T, 'Offset sheet', makeOffsetPdf(), qs);
+        const [PO] = (await ok(call('POST', `drawings/${off.j.id}/pages`, { pages: [{ ...OFFSET_PAGE }] }, qs), 'offset pages')).drawings;
+        assert.deepStrictEqual([PO.page_w, PO.page_h, PO.rotation, PO.page_x0, PO.page_y0], [595, 842, 270, 1000, 2000]);
+        const c = await call('POST', `drawings/${PO.id}/calibrations`, { p1: [1100, 2100], p2: [1300, 2100], real: 10, unit: 'm' }, qs);
+        assert.strictEqual(c.s, 200, 'absolute points on an offset page are accepted: ' + JSON.stringify(c.j));
+        // [x0 − w, x0 + 2w] × [y0 − h, y0 + 2h] = [405, 2190] × [1158, 3684]
+        for (const b of [{ p1: [404, 2100], p2: [1100, 2100], real: 5, unit: 'm' }, { p1: [1100, 2100], p2: [2191, 2100], real: 5, unit: 'm' },
+          { p1: [1100, 1157], p2: [1100, 2100], real: 5, unit: 'm' }, { p1: [1100, 3685], p2: [1100, 2100], real: 5, unit: 'm' }, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }]) {
+          const x = await call('POST', `drawings/${PO.id}/calibrations`, b, qs);
+          assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, /outside the page/);
+        }
+        const e = await call('POST', `drawings/${PO.id}/calibrations`, { p1: [405, 1158], p2: [2190, 3684], real: 5, unit: 'm', apply: true }, qs);
+        assert.strictEqual(e.s, 200, 'the bound edges are inside: ' + JSON.stringify(e.j));
+        // leave the tender as the checks below expect it
+        db.prepare('DELETE FROM calibrations WHERE drawing_id=?').run(PO.id); db.prepare('DELETE FROM drawings WHERE id=?').run(PO.id);
       }
 
       // bad bodies → 400, nothing stored (validation before the calibration lookup)

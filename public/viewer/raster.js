@@ -6,8 +6,13 @@
 //   TVRaster.pdfjs() -> Promise<pdf.js module> (vendored /vendor/pdfjs, loaded once, worker set; never a CDN)
 //
 // Coordinates (R12):
-//   page    = what is stored. PDF: unrotated PDF user space (points, y up), as pdf.js viewport.convertToPdfPoint gives;
-//             a page's /Rotate never changes a page point or a length. Image: pixels, y down, origin at the top-left.
+//   page    = what is stored. PDF: unrotated PDF user space (points, y up), absolute: a page box that does not start at
+//             (0, 0) keeps its own coordinates (R16), as pdf.js viewport.convertToPdfPoint gives; a page's /Rotate never
+//             changes a page point or a length. Image: pixels, y down, origin at the top-left, in the frame the browser
+//             displays (R17): createImageBitmap applies the EXIF orientation. Orientations that keep the size (2, 3, 4, and
+//             5–8 on a square image) are accepted in that displayed frame; lengths are unaffected (a mirror or turn is an
+//             isometry). One that swaps width and height no longer matches the size the server read from the file
+//             header: refused with error.code 'image_frame' ({ width, height } displayed, { pageW, pageH } stored).
 //   display = the page as shown: the pdf.js viewport at scale 1 with the row's rotation (y down); an image's pixels.
 //   world   = (display x, −display y): the core.js view (TV.makeView/zoomAt/pan/toScreen, y up) works unchanged on it.
 //   screen  = CSS pixels in the canvas.
@@ -72,9 +77,10 @@ function create(container, opts) {
       if (dead) return;
       img = await createImageBitmap(new Blob([ab]));
       if (dead) { img.close(); return; }
-      // the stored size is read from the file header; a decoded image of another size (e.g. EXIF orientation) would put
-      // every point in the wrong place: refuse rather than show it shifted
-      if (img.width !== o.pageW || img.height !== o.pageH) throw new Error('image size ' + img.width + ' × ' + img.height + ' ≠ ' + o.pageW + ' × ' + o.pageH);
+      // the stored size is read from the file header; a displayed image of another size (EXIF orientation 5–8) would put
+      // every point outside the server's page: refuse (the page translates the code)
+      if (img.width !== o.pageW || img.height !== o.pageH)
+        throw Object.assign(new Error('image size ' + img.width + ' × ' + img.height + ' ≠ ' + o.pageW + ' × ' + o.pageH), { code: 'image_frame', width: img.width, height: img.height, pageW: o.pageW, pageH: o.pageH });
       dw = img.width; dh = img.height;
       toD = (x, y) => [x, y]; toP = (x, y) => [x, y];
     } else if (o.kind === 'pdf') {
@@ -108,17 +114,21 @@ function create(container, opts) {
     const t = pg.render({ canvasContext: c.getContext('2d'), viewport: vp });
     tasks[slot] = t; busy++;
     t.promise.then(() => {
-      if (dead || tasks[slot] !== t) return;
+      if (dead || tasks[slot] !== t) return free(c);
       const b = { c, x: r.x, y: r.y, w: c.width / s, h: c.height / s, s };
-      if (slot === 'base') base = b; else detail = b;
+      if (slot === 'base') { drop(base); base = b; } else { drop(detail); detail = b; }
       schedule();
     }, e => {
+      free(c);
       if (!(e && e.name === 'RenderingCancelledException')) failed(e);
     }).finally(() => {
       if (tasks[slot] === t) tasks[slot] = null;
       busy--; settle();
     });
   }
+  // a cancelled or replaced bitmap gives its memory back at once (not when the canvas is collected)
+  const free = c => { c.width = 0; c.height = 0; };
+  const drop = b => { if (b) free(b.c); };
   const capScale = (w, h, s) => Math.min(s, Math.sqrt(MAX_PIXELS / (w * h)));
   // the whole page at the fit resolution: shown at any zoom while a sharper one is on its way
   function renderBase() { render('base', { x: 0, y: 0, w: dw, h: dh }, capScale(dw, dh, fitScale * dpr)); }
@@ -127,7 +137,7 @@ function create(container, opts) {
     timer = 0;
     if (dead || !pg || !V) return settle();
     const want = V.scale * dpr;
-    if (base && want <= base.s * 1.01) { detail = null; if (tasks.detail) { tasks.detail.cancel(); tasks.detail = null; } return settle(); }
+    if (base && want <= base.s * 1.01) { drop(detail); detail = null; if (tasks.detail) { tasks.detail.cancel(); tasks.detail = null; } return settle(); }
     const a = display(0, 0), b = display(W, H);
     const x0 = Math.max(0, Math.min(a[0], b[0])), y0 = Math.max(0, Math.min(a[1], b[1])), x1 = Math.min(dw, Math.max(a[0], b[0])), y1 = Math.min(dh, Math.max(a[1], b[1]));
     if (!(x1 > x0 && y1 > y0)) return settle();   // the page is off screen
@@ -262,6 +272,7 @@ function create(container, opts) {
     for (const k of ['base', 'detail']) if (tasks[k]) { tasks[k].cancel(); tasks[k] = null; }
     if (doc) { doc.destroy(); doc = null; }   // the loading task: frees the document and its worker
     if (img) { img.close(); img = null; }
+    drop(base); drop(detail);
     base = detail = pg = null;
     canvas.removeEventListener('wheel', onWheel, { passive: false });
     canvas.removeEventListener('mousedown', onDown);

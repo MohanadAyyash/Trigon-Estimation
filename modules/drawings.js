@@ -24,7 +24,7 @@ const sniff = head => (MAGIC.find(([, m]) => head.length >= m.length && head.sub
 const NAME_EXT = { pdf: 'pdf', png: 'png', jpg: 'jpg', jpeg: 'jpg', dxf: 'dxf' };
 const EXT_LABEL = { pdf: 'a PDF', png: 'a PNG image', jpg: 'a JPEG image', dxf: 'a DXF drawing' };
 const MIME = { dxf: 'application/dxf', pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg' };
-const MAX_PAGES = 2000, MAX_PAGE_PT = 14400;   // pages in one PDF; a page side in points (200 in)
+const MAX_PAGES = 2000, MAX_PAGE_PT = 14400, MAX_PAGE_ORIGIN = 1e7;   // pages in one PDF; a page side in points (200 in)
 const MAX_NAME = 200;                          // a drawing name (also a generated page-row name)
 const BINARY = Buffer.from('AutoCAD Binary DXF', 'latin1');
 const BINARY_MSG = 'binary DXF is not supported — save as ASCII DXF';
@@ -54,7 +54,8 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   if (!db.prepare('PRAGMA table_info(drawings)').all().some(c => c.name === 'failed_version')) db.exec('ALTER TABLE drawings ADD COLUMN failed_version INTEGER');
   // PDF / image (batch 3): the page number (NULL: a PDF whose pages are not registered yet), its size in page units (PDF
   // points, image pixels), the PDF page /Rotate, and for pages 2..n the drawing row of page 1 (same file)
-  for (const [c, type] of [['page', 'INTEGER'], ['page_w', 'REAL'], ['page_h', 'REAL'], ['rotation', 'INTEGER'], ['parent_id', 'INTEGER']])
+  // page_x0/page_y0 (R16): a PDF page box's lower-left corner in user space (page.view[0], [1]); points stay absolute
+  for (const [c, type] of [['page', 'INTEGER'], ['page_w', 'REAL'], ['page_h', 'REAL'], ['rotation', 'INTEGER'], ['parent_id', 'INTEGER'], ['page_x0', 'REAL NOT NULL DEFAULT 0'], ['page_y0', 'REAL NOT NULL DEFAULT 0']])
     if (!db.prepare('PRAGMA table_info(drawings)').all().some(x => x.name === c)) db.exec(`ALTER TABLE drawings ADD COLUMN ${c} ${type}`);
   // 1 = saved with confirm_uom: the user accepted that qty_unit differs from the row's unit
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'uom_confirmed')) db.exec('ALTER TABLE measurements ADD COLUMN uom_confirmed INTEGER NOT NULL DEFAULT 0');
@@ -138,11 +139,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // row and calibration ids remapped
   const cloneForTender = (oldTid, newTid, rowIdMap) => {
     const dmap = new Map(), parsing = [];
-    const insD = db.prepare(`INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,page,page_w,page_h,rotation,parent_id,rev,replaced_by,created,created_by)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,NULL,?,?)`);
+    const insD = db.prepare(`INSERT INTO drawings(tender_id,kind,name,sha256,bytes,units,suggested_units,status,error,failed_version,page,page_w,page_h,rotation,page_x0,page_y0,parent_id,rev,replaced_by,created,created_by)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,NULL,?,?)`);
     const olds = db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(oldTid);
     for (const d of olds) {
-      const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.failed_version, d.page, d.page_w, d.page_h, d.rotation,
+      const nid = Number(insD.run(newTid, d.kind, d.name, d.sha256, d.bytes, d.units, d.suggested_units, d.status, d.error, d.failed_version, d.page, d.page_w, d.page_h, d.rotation, d.page_x0, d.page_y0,
         d.rev, d.created, d.created_by).lastInsertRowid);
       dmap.set(d.id, nid);
       if (d.status === 'parsing') parsing.push([nid, d.sha256]);
@@ -434,25 +435,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (!Array.isArray(b.pages) || b.pages.length < 1 || b.pages.length > MAX_PAGES) bad(`pages must be a list of 1 to ${MAX_PAGES} pages`);
     const n = b.pages.length, seen = new Set();
     const size = (p, k) => { if (!finNum(p[k]) || !(p[k] > 0) || p[k] > MAX_PAGE_PT) bad(`page ${k} must be a number > 0 and ≤ ${MAX_PAGE_PT} (points)`); return p[k]; };
+    // R16: the page box origin (optional, 0 when absent): a finite number within ±1e7 points
+    const origin = (p, k) => { if (p[k] === undefined) return 0; if (!finNum(p[k]) || Math.abs(p[k]) > MAX_PAGE_ORIGIN) bad(`page ${k} must be a number within ±${MAX_PAGE_ORIGIN} (points)`); return p[k]; };
     const pages = b.pages.map(p => {
       if (!p || typeof p !== 'object' || Array.isArray(p)) bad('each page must be { page, width, height, rotation }');
-      for (const k of Object.keys(p)) if (!['page', 'width', 'height', 'rotation'].includes(k)) bad('unknown field in a page: ' + k);
+      for (const k of Object.keys(p)) if (!['page', 'width', 'height', 'rotation', 'x0', 'y0'].includes(k)) bad('unknown field in a page: ' + k);
       if (!Number.isInteger(p.page)) bad('page must be a page number');
       if (p.page < 1 || p.page > n || seen.has(p.page)) bad(`pages 1 to ${n} must each be listed exactly once`);
       seen.add(p.page);
       if (![0, 90, 180, 270].includes(p.rotation)) bad('page rotation must be 0, 90, 180 or 270');
-      return { page: p.page, width: size(p, 'width'), height: size(p, 'height'), rotation: p.rotation };
+      return { page: p.page, width: size(p, 'width'), height: size(p, 'height'), rotation: p.rotation, x0: origin(p, 'x0'), y0: origin(p, 'y0') };
     }).sort((a, c) => a.page - c.page);
     const ids = tx(() => {
       mustDraft(tenderRow(t.id));
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'pages') bad('the pages of this drawing are already registered', 409);
       const [p1] = pages, now = new Date().toISOString();
-      db.prepare("UPDATE drawings SET status='ready', page=?, page_w=?, page_h=?, rotation=? WHERE id=? AND status='pages'").run(p1.page, p1.width, p1.height, p1.rotation, cur.id);
-      const ins = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,page_w,page_h,rotation,parent_id,rev,created,created_by) VALUES(?,'pdf',?,?,?,'ready',?,?,?,?,?,?,?,?)");
+      db.prepare("UPDATE drawings SET status='ready', page=?, page_w=?, page_h=?, rotation=?, page_x0=?, page_y0=? WHERE id=? AND status='pages'").run(p1.page, p1.width, p1.height, p1.rotation, p1.x0, p1.y0, cur.id);
+      const ins = db.prepare("INSERT INTO drawings(tender_id,kind,name,sha256,bytes,status,page,page_w,page_h,rotation,page_x0,page_y0,parent_id,rev,created,created_by) VALUES(?,'pdf',?,?,?,'ready',?,?,?,?,?,?,?,?,?,?)");
       const out = [cur.id];
       for (const p of pages.slice(1))
-        out.push(Number(ins.run(cur.tender_id, pageName(cur.name, p.page), cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, cur.id, cur.rev, now, me.username).lastInsertRowid));
+        out.push(Number(ins.run(cur.tender_id, pageName(cur.name, p.page), cur.sha256, cur.bytes, p.page, p.width, p.height, p.rotation, p.x0, p.y0, cur.id, cur.rev, now, me.username).lastInsertRowid));
       audit(me, 'pages', 'drawings', cur.id, { pages: n });
       return out;
     });
@@ -521,14 +524,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (!c) bad('calibration not found', 404);
     return c;
   };
-  // R12: a point of a PDF page (unrotated user space, points) or an image (pixels) lies within [−w, 2w] × [−h, 2h];
-  // anything further out was taken in another coordinate space. named: [[name, [x, y]], …] (already finite).
+  // R12/R16: a point of a PDF page (unrotated user space, points, absolute) or an image (pixels) lies within
+  // [x0 − w, x0 + 2w] × [y0 − h, y0 + 2h] (x0/y0: the PDF page box origin, 0 for an image); anything further out was taken
+  // in another coordinate space. named: [[name, [x, y]], …] (already finite).
   const onPage = (d, named) => {
     if (d.kind !== 'pdf' && d.kind !== 'image') return;
-    const w = d.page_w, h = d.page_h;
+    const w = d.page_w, h = d.page_h, x0 = d.page_x0 || 0, y0 = d.page_y0 || 0;
     if (!(w > 0) || !(h > 0)) bad('the page size of this drawing is not known yet', 409);
     for (const [name, p] of named)
-      if (!(p[0] >= -w && p[0] <= 2 * w && p[1] >= -h && p[1] <= 2 * h)) bad(`${name} is outside the page (${w} × ${h}): points must lie within −1 to 2 page widths and heights`);
+      if (!(p[0] >= x0 - w && p[0] <= x0 + 2 * w && p[1] >= y0 - h && p[1] <= y0 + 2 * h)) bad(`${name} is outside the page (${w} × ${h}): points must lie within −1 to 2 page widths and heights`);
   };
   // a pure-function refusal (lib/takeoff/calib.js, lib/takeoff/manual.js) is a 400 with its message
   const calc = fn => { try { return fn(); } catch (e) { if (e.status) throw e; bad(e.message); } };

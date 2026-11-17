@@ -494,7 +494,7 @@
   // ---- tab: drawings (DXF upload, units, layer table, links to rows, measurements) ----
   // The server measures; the UI never computes a quantity. No number is shown before the units are confirmed.
   const DW_UNITS = ['mm', 'cm', 'm', 'km', 'ft', 'in'];
-  const DW_MAX = 100 * 1024 * 1024;
+  const DW_MAX = 100 * 1024 * 1024, DW_MAX_IMAGE = 50 * 1024 * 1024;
   const metricLabel = m => ({ open_length: t('mt_open_length'), closed_perimeter: t('mt_closed_perimeter'), area: t('mt_area'), count: t('mt_count') })[m] || m;
   const dwStatusLabel = s => ({ parsing: t('dws_parsing'), pages: t('dws_pages'), ready: t('dws_ready'), failed: t('dws_failed') })[s] || s;
   const warnLabel = c => ({ unsupported_polyline: t('wc_unsupported_polyline'), self_intersecting: t('wc_self_intersecting'), hatch_open_loop: t('wc_hatch_open_loop'),
@@ -533,8 +533,11 @@
     const btn = h('button', { id: 'dw-upload', onclick: async () => {
       const f = file.files && file.files[0];
       if (!f) return say(t('dw_no_file'), 'err');
+      // the server's limits: 100 MB for DXF and PDF, 50 MB for PNG/JPEG (it decides by content; the name or type tells here)
+      const isImage = /\.(png|jpe?g)$/i.test(f.name) || /^image\//.test(f.type || '');
+      if (isImage && f.size > DW_MAX_IMAGE) return say(t('dw_too_large_image'), 'err');
       if (f.size > DW_MAX) return say(t('dw_too_large'), 'err');
-      const title = val(name) || f.name.replace(/\.dxf$/i, '');
+      const title = val(name) || f.name.replace(/\.(dxf|pdf|png|jpe?g)$/i, '');
       btn.disabled = true;
       say(t('dw_uploading', { mb: (f.size / 1048576).toFixed(1) }));
       let r, j = null;
@@ -569,13 +572,17 @@
         h('td', null, d.units || '—'), h('td', { class: 'num' }, !fin(d.bytes) ? '—' : d.bytes < 10486 ? '< 0.01' : (d.bytes / 1048576).toFixed(2)),
         h('td', null, (fmtTime(d.created) || '') + (d.created_by ? ' · ' + d.created_by : '')))), { class: 'grid' })) : h('p', { class: 'muted' }, t('dw_none'))));
     for (const d of list.filter(x => x.status === 'parsing')) watchParse(d.id, () => rerender());
-    // a PDF whose pages are not registered yet: this browser reads them (pdf.js) and tells the server, then the tab again
-    const pagesMsg = h('div', { id: 'dw-pages' });
-    if (editable) for (const d of list.filter(x => x.status === 'pages')) readPages(d, err => {
-      if (cur && d.id === cur.id) pagesMsg.replaceChildren(h('div', { id: 'dw-pages-error', class: 'banner banner-red' }, h('strong', null, t('dw_pages_failed')), ': ', err.message));
-    });
+    // a PDF whose pages are not registered yet: this browser reads them (pdf.js) and tells the server, then the tab again.
+    // A failure is shown (and not tried again until the page is reloaded).
+    const pagesBox = h('div', { id: 'dw-pages' });
+    const pagesFail = msg => pagesBox.replaceChildren(h('div', { id: 'dw-pages-error', class: 'banner banner-red' }, h('strong', null, t('dw_pages_failed')), ': ', msg));
+    if (editable) for (const d of list.filter(x => x.status === 'pages' && !pagesFailed.has(x.id))) readPages(d, msg => { if (cur && d.id === cur.id && pagesBox.isConnected) pagesFail(msg); });
+    if (cur && cur.status === 'pages') {
+      if (editable && pagesFailed.has(cur.id)) pagesFail(pagesFailed.get(cur.id));
+      else pagesBox.append(h('p', { id: 'dw-pages-wait', class: 'muted' }, editable ? t('dws_pages') : t('dw_pages_later')));
+    }
     if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) box.append(rasterCard(cur));
-    else if (cur && cur.status === 'pages') box.append(pagesMsg, h('p', { id: 'dw-pages-wait', class: 'muted' }, editable ? t('dws_pages') : t('dw_pages_later')));
+    else if (cur && cur.status === 'pages') box.append(pagesBox);
     else if (cur && cur.status === 'ready') {
       // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
       try { await drawingPanel(box, cur, ms, rows, editable, refreshList); }
@@ -805,6 +812,7 @@
   // Each page's size is its unrotated page box (pdf.js page.view, PDF user space) and its rotation the page's /Rotate:
   // stored points are unrotated (R12), so the server's bounds use the unrotated size.
   const pagesReading = new Set();   // drawing ids being read (one at a time per drawing)
+  const pagesFailed = new Map();    // drawing id -> why reading its pages failed (kept until the page is reloaded)
   async function readPages(d, onError) {
     if (pagesReading.has(d.id)) return;
     pagesReading.add(d.id);
@@ -820,13 +828,23 @@
         const doc = await loading.promise;
         for (let n = 1; n <= doc.numPages; n++) {
           const pg = await doc.getPage(n), v = pg.view;
-          pages.push({ page: n, width: v[2] - v[0], height: v[3] - v[1], rotation: pg.rotate });
+          pages.push({ page: n, width: v[2] - v[0], height: v[3] - v[1], rotation: pg.rotate, x0: v[0], y0: v[1] });   // R16: the box origin
         }
       } finally { loading.destroy(); }
       try { await api('POST', `drawings/${d.id}/pages`, { pages }); }
-      catch (e) { if (e.status !== 409) throw e; }   // already registered (another tab): the list shows its pages
+      catch (e) {
+        // a 409 is fine only when the pages are registered already (another tab); any other refusal is shown
+        if (e.status !== 409) throw e;
+        const now = await api('GET', 'drawings/' + d.id);
+        if (now.status === 'pages') throw e;
+      }
       if (tok === routeTok) whenFormsFree(tok, () => rerender());
-    } catch (e) { if (tok === routeTok) onError(e); }
+    } catch (e) {
+      if (e && e.status === 401) return;
+      const msg = String((e && e.message) || e);
+      pagesFailed.set(d.id, msg);
+      if (tok === routeTok) onError(msg);
+    }
     finally { pagesReading.delete(d.id); }
   }
 
@@ -843,11 +861,13 @@
     idle();
     viewerOpeners.set(d.id, openViewer);
     const errorBanner = msg => h('div', { id: 'tv-error', class: 'banner banner-red' }, h('strong', null, t('tv_unavailable')), ': ', msg);
+    // R17: an image the browser shows turned (EXIF orientation) has another size than the file: say how to fix it
+    const why = e => e && e.code === 'image_frame' ? t('tv_image_frame', { w: e.width, h: e.height, fw: e.pageW, fh: e.pageH }) : String((e && e.message) || e);
     let opening = null;
     function openViewer() {
       if (!opening) opening = loadViewer().catch(e => {
         if (e && e.status === 401) { me = null; return renderLogin(); }
-        if (sec.isConnected) idle(errorBanner(String((e && e.message) || e)));
+        if (sec.isConnected) idle(errorBanner(why(e)));
       }).finally(() => { opening = null; });
       return opening;
     }
@@ -865,7 +885,11 @@
         h('p', { class: 'muted', id: 'tv-loading' }, t('loading')),
         wrap, h('div', { id: 'tv-status', class: 'tv-status small' }, cursor));
       const eng = TVRaster.create(wrap, { kind: d.kind, url: `/api/drawings/${d.id}/file`, page: d.page, pageW: d.page_w, pageH: d.page_h, rotation: d.rotation,
-        alive: () => tok === routeTok, onCursor: showCursor, onError: e => { if (sec.isConnected) sec.append(errorBanner(String((e && e.message) || e))); } });
+        alive: () => tok === routeTok, onCursor: showCursor, onError: e => {   // a render failed: one banner, the latest reason
+          if (!sec.isConnected) return;
+          const b = errorBanner(why(e)), old = sec.querySelector('#tv-error');
+          if (old) old.replaceWith(b); else sec.append(b);
+        } });
       eng.canvas.id = 'tv-canvas';
       window.__tvViewer = eng;   // test hook
       const mine = activeViewer = { drawingId: d.id, highlight: () => {}, close: () => { eng.destroy(); if (window.__tvViewer === eng) window.__tvViewer = null; if (tok === routeTok && sec.isConnected) idle(); } };

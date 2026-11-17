@@ -670,7 +670,7 @@ server.listen(0, async () => {
 
     // ---- PDF and image viewer (batch 3 Task 5): pages read by the browser, rendered by the vendored pdf.js ----------
     {
-      const { makePdf, PDF_RECTS, makePng } = require('./test/fixtures/make-takeoff.js');
+      const { makePdf, PDF_RECTS, makePng, makeOffsetPdf, OFFSET_RECT } = require('./test/fixtures/make-takeoff.js');
       for (const f of ['/viewer/raster.js']) assert.ok(html.includes('src="' + f + '"'), 'index.html loads ' + f);
       const pt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI PDF' }, admin), 'pdf tender')).id;
       const DP = `#drawings[data-tender="${pt}"]`;
@@ -765,6 +765,7 @@ server.listen(0, async () => {
       await page.click('#dw-upload');
       await page.waitForSelector(DP + ' #tv-panel[data-kind="image"]');
       assert.ok((await page.textContent('#tv-page-info')).includes('64 × 48 px'), 'image size shown');
+      assert.ok(db.prepare("SELECT 1 FROM drawings WHERE tender_id=? AND kind='image' AND name='photo'").get(pt), 'the default title drops .png');
       await page.click(DP + ' #tv-open');
       await page.waitForSelector(DP + ' #tv-canvas[data-ready="1"]');
       await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
@@ -776,6 +777,95 @@ server.listen(0, async () => {
       assert.ok(Math.abs(back[0] - 12.5) < 1e-9 && Math.abs(back[1] - 33.25) < 1e-9, 'image round trip');
       await page.click('#tv-close');
       assert.strictEqual(await page.evaluate(() => window.__tvViewer), null, 'closed');
+
+      // ---- fix round 1 ----
+      // R16: a page box that does not start at 0 (MediaBox [1000 2000 1595 2842], /Rotate 270): its origin is registered,
+      // points stay absolute
+      await page.setInputFiles('#dw-file', { name: 'offset.pdf', mimeType: 'application/pdf', buffer: makeOffsetPdf() });
+      await page.click('#dw-upload');
+      await page.waitForFunction(() => /offset/.test((document.querySelector('#tv-panel[data-kind="pdf"] h2') || {}).textContent || ''));
+      const po = db.prepare("SELECT page_w, page_h, rotation, page_x0, page_y0, name FROM drawings WHERE tender_id=? AND name='offset'").get(pt);
+      assert.deepStrictEqual({ ...po }, { page_w: 595, page_h: 842, rotation: 270, page_x0: 1000, page_y0: 2000, name: 'offset' }, 'origin registered; .pdf dropped from the title');
+      await page.click(DP + ' #tv-open');
+      await page.waitForSelector(DP + ' #tv-canvas[data-ready="1"]');
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      await idle();
+      assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.size()), [842, 595], 'rotated 270: landscape');
+      const ob = await page.evaluate(() => { const e = window.__tvViewer; return e.toPage(...e.toScreen(1123.25, 2456.5)); });
+      assert.ok(Math.abs(ob[0] - 1123.25) < 1e-9 && Math.abs(ob[1] - 2456.5) < 1e-9, 'offset page round trip: ' + ob);
+      near(await pixel(OFFSET_RECT.x + OFFSET_RECT.w / 2, OFFSET_RECT.y + OFFSET_RECT.h / 2), [...rgb(OFFSET_RECT), 255], 'offset page: the fill under its absolute point');
+      near(await pixel(OFFSET_RECT.x - 30, OFFSET_RECT.y + OFFSET_RECT.h / 2), [255, 255, 255, 255], 'offset page: white beside it');
+      await page.click('#tv-close');
+
+      // R17: a JPEG the browser shows turned (EXIF orientation 6 on 40 × 20) is refused in words; orientation 3 (same size) opens
+      const exifJpeg = orientation => page.evaluate(o => {
+        const c = document.createElement('canvas'); c.width = 40; c.height = 20;
+        const g = c.getContext('2d'); g.fillStyle = '#c00'; g.fillRect(0, 0, 20, 20); g.fillStyle = '#00c'; g.fillRect(20, 0, 20, 20);
+        const b = Uint8Array.from(atob(c.toDataURL('image/jpeg', 0.95).split(',')[1]), ch => ch.charCodeAt(0));
+        // APP1 "Exif": big-endian TIFF, one IFD entry: Orientation (0x0112), SHORT, 1, o
+        const app1 = [0xff, 0xe1, 0x00, 0x22, 0x45, 0x78, 0x69, 0x66, 0, 0, 0x4d, 0x4d, 0, 0x2a, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, o, 0, 0, 0, 0, 0, 0];
+        const out = new Uint8Array(b.length + app1.length);
+        out.set(b.subarray(0, 2)); out.set(app1, 2); out.set(b.subarray(2), 2 + app1.length);
+        let s = ''; for (const x of out) s += String.fromCharCode(x);
+        return btoa(s);
+      }, orientation).then(x => Buffer.from(x, 'base64'));
+      await page.setInputFiles('#dw-file', { name: 'turned.jpg', mimeType: 'image/jpeg', buffer: await exifJpeg(6) });
+      await page.click('#dw-upload');
+      await page.waitForFunction(() => /turned/.test((document.querySelector('#tv-panel[data-kind="image"] h2') || {}).textContent || ''));
+      assert.ok((await page.textContent('#tv-page-info')).includes('40 × 20 px'), 'stored size from the file header');
+      await page.click(DP + ' #tv-open');
+      await page.waitForSelector(DP + ' #tv-error');
+      const frameMsg = await page.textContent(DP + ' #tv-error');
+      assert.ok(frameMsg.includes('20 × 40 px') && frameMsg.includes('Save the image upright') && !frameMsg.includes('≠'), 'translated refusal: ' + frameMsg);
+      assert.ok(await page.isEnabled(DP + ' #tv-open'), 'Open can be tried again');
+      await page.setInputFiles('#dw-file', { name: 'flipped.jpg', mimeType: 'image/jpeg', buffer: await exifJpeg(3) });
+      await page.click('#dw-upload');
+      await page.waitForFunction(() => /flipped/.test((document.querySelector('#tv-panel[data-kind="image"] h2') || {}).textContent || ''));
+      await page.click(DP + ' #tv-open');
+      await page.waitForSelector(DP + ' #tv-canvas[data-ready="1"]');
+      await page.click('#tv-close');
+
+      // an image over 50 MB is refused before the upload, naming the image limit
+      const bigPng = path.join(process.env.DATA_DIR, 'big.png');   // a sparse file in the temp DATA_DIR (removed at exit)
+      fs.writeFileSync(bigPng, ''); fs.truncateSync(bigPng, 50 * 1024 * 1024 + 1);
+      await page.setInputFiles('#dw-file', bigPng);
+      await page.click('#dw-upload');
+      assert.ok((await page.textContent('#dw-progress')).includes('50 MB'), 'image limit named: ' + await page.textContent('#dw-progress'));
+      await page.setInputFiles('#dw-file', []);
+
+      // reading pages: a refusal that is not "already registered" is shown; a PDF pdf.js cannot read is shown once and
+      // not downloaded again on every redraw (until a reload)
+      {
+        const upPdf = async (name, body) => {
+          const r = await fetch(`${base}tenders/${pt}/drawings?name=${name}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body });
+          assert.strictEqual(r.status, 202); return (await r.json()).id;
+        };
+        const refused = await upPdf('refused', makePdf());
+        await page.route('**/api/drawings/*/pages', r => r.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'test refusal' }) }));
+        await page.goto(`${origin}/#/tender/${pt}/drawings/${refused}`);
+        await page.waitForSelector(DP + ' #dw-pages-error');
+        assert.ok((await page.textContent(DP + ' #dw-pages-error')).includes('test refusal'), 'a 409 that is not "already registered" is shown');
+        assert.strictEqual(await page.$(DP + ' #dw-pages-wait'), null, 'no "reading pages…" once it failed');
+        await page.unroute('**/api/drawings/*/pages');
+        { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'refusal logged'); errors.splice(i, 1); }
+        await page.reload();
+        await page.waitForSelector(`${DP} #tv-panel[data-drawing="${refused}"]`);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE id=? OR parent_id=?').get(refused, refused).n, 2, 'after a reload the pages are read again');
+        const broken = await upPdf('broken', Buffer.from('%PDF-1.4\nnot really a pdf\n', 'latin1'));
+        let reads = 0;
+        const onReq = q => { if (q.url().endsWith(`/api/drawings/${broken}/file`)) reads++; };
+        page.on('request', onReq);
+        await page.goto(`${origin}/#/tender/${pt}/drawings/${broken}`);
+        await page.waitForSelector(DP + ' #dw-pages-error');
+        assert.match(await page.textContent(DP + ' #dw-pages-error'), /could not be read/, 'translated failure');
+        await page.click('#tab-info'); await page.waitForSelector('#tab-body-info');
+        await page.goto(`${origin}/#/tender/${pt}/drawings/${broken}`); await page.waitForSelector(DP + ' #dw-pages-error');
+        assert.match(await page.textContent(DP + ' #dw-pages-error'), /Invalid PDF structure/, 'the remembered reason');
+        assert.strictEqual(await page.$(DP + ' #dw-pages-wait'), null, 'still no "reading pages…"');
+        page.off('request', onReq);
+        assert.strictEqual(reads, 1, 'the PDF is not downloaded again on a redraw');
+        db.prepare('DELETE FROM drawings WHERE id=?').run(broken);
+      }
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
 
