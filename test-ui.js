@@ -1677,6 +1677,134 @@ server.listen(0, async () => {
       assert.ok(await page.evaluate(() => window.__tvViewer.view().scale > 0), 'zoomed');
     }
 
+    // ---- batch 4 Task 6: the drawing as a PNG with its numbered measurements (PDF page and DXF) -------------------------
+    {
+      const { makePdf } = require('./test/fixtures/make-takeoff.js');
+      assert.ok(html.includes('src="/lib/draft.js"'), 'index.html loads the shared draft label');
+      const DRAFT = require('./lib/draft.js');
+      const xt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Export' }, admin), 'export tender')).id;
+      const xL = (await ok(call('POST', `tenders/${xt}/rows`, { no: '1', description: 'Test edge export', unit: 'm' }, admin), 'x m row')).id;
+      const xA = (await ok(call('POST', `tenders/${xt}/rows`, { no: '2', description: 'Test slab export', unit: 'm2' }, admin), 'x m2 row')).id;
+      const xu = await fetch(`${base}tenders/${xt}/drawings?name=sheet`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: makePdf() });
+      assert.strictEqual(xu.status, 202);
+      const xp = (await xu.json()).id;
+      await ok(call('POST', `drawings/${xp}/pages`, { pages: [{ page: 1, width: 595, height: 842, rotation: 0 }, { page: 2, width: 842, height: 595, rotation: 90 }] }, admin), 'x pages');
+      await ok(call('POST', `drawings/${xp}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, admin), 'x calibrate');
+      // a line in its own colour (10 m) and a rect in the palette's second colour (100 × 150 pt = 37.5 m2)
+      const xm1 = await ok(call('POST', `drawings/${xp}/measurements`, { tool: 'manual', row_id: xL, label: 'Fake edge', color: '#00a000', geom: { tool: 'line', pts: [[100, 600], [300, 600]] } }, admin), 'x line');
+      const xm2 = await ok(call('POST', `drawings/${xp}/measurements`, { tool: 'manual', row_id: xA, label: 'Fake slab', geom: { tool: 'rect', p1: [350, 500], p2: [450, 650] } }, admin), 'x rect');
+      const DX = `#drawings[data-tender="${xt}"]`;
+      const today = (() => { const n = new Date(); return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0'); })();
+      // the list as shown: number, label, qty, unit and row of each measurement (in list order)
+      const listShown = D0 => page.$$eval(`${D0} #dw-measurements tr[data-measurement]`, trs => trs.map(tr => ({ id: Number(tr.getAttribute('data-measurement')),
+        no: Number(tr.querySelector('.m-no').textContent), label: tr.querySelector('.m-lbl').textContent, qty: tr.querySelector('.m-qty').textContent,
+        unit: tr.querySelector('.m-unit').textContent, row: tr.querySelector('.m-row').textContent })));
+      // click Export, wait for the download -> { file (Buffer), name, hook (window.__tvExport, with the export pixel of page point p) }
+      const exportPng = async (what, p) => {
+        if (what) await page.selectOption('#tv-export-what', what);
+        const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#tv-export')]);
+        const file = fs.readFileSync(await dl.path());
+        const hook = await page.evaluate(q => { const x = window.__tvExport; return { width: x.width, height: x.height, w: x.w, h: x.h, k: x.k, legend: x.legend, head: x.head, px: q ? q.map(r => x.toPx(r)) : null }; }, p || null);
+        return { file, name: dl.suggestedFilename(), hook };
+      };
+      // the PNG as the browser decodes it: its size and the pixels at the given export points
+      const decode = (file, pts) => page.evaluate(async ([b64, pts]) => {
+        const bm = await createImageBitmap(new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type: 'image/png' }));
+        const c = new OffscreenCanvas(bm.width, bm.height), g = c.getContext('2d');
+        g.drawImage(bm, 0, 0);
+        return { width: bm.width, height: bm.height, px: pts.map(p => Array.from(g.getImageData(Math.floor(p[0]), Math.floor(p[1]), 1, 1).data)) };
+      }, [file.toString('base64'), pts]);
+      const near = (a, b, msg) => assert.ok(a.length === 4 && b.every((v, i) => Math.abs(a[i] - v) <= 6), msg + ': ' + JSON.stringify(a) + ' ≈ ' + JSON.stringify(b));
+      const pngSize = f => { assert.strictEqual(f.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'a PNG'); return [f.readUInt32BE(16), f.readUInt32BE(20)]; };
+
+      await page.goto(`${origin}/#/tender/${xt}/drawings/${xp}`);
+      await page.waitForSelector(`${DX} #tv-panel[data-drawing="${xp}"] #tv-open`);
+      await page.click(DX + ' #tv-open');
+      await page.waitForSelector(DX + ' #tv-canvas[data-ready="1"]');
+      await page.evaluate(() => window.__tvViewer.whenIdle());
+      // the list numbers its measurements 1..n in list order; the screen's badges use the same numbers
+      const xs = await listShown(DX);
+      assert.deepStrictEqual(xs, [{ id: xm1.id, no: 1, label: 'Fake edge', qty: '10.00', unit: 'm', row: '1 — Test edge export (m)' },
+        { id: xm2.id, no: 2, label: 'Fake slab', qty: '37.50', unit: 'm2', row: '2 — Test slab export (m2)' }], 'the list with its numbers');
+      await page.evaluate(() => window.__tvViewer.requestDraw()); await page.evaluate(() => window.__tvViewer.whenIdle());
+      assert.deepStrictEqual((await page.evaluate(() => window.__tvTools.overlay())).map(x => [x.id, x.no]), [[xm1.id, 1], [xm2.id, 2]], 'screen badges = list numbers');
+      const vis0 = await page.evaluate(() => [window.__tvViewer.canvas.width, window.__tvViewer.canvas.height]);
+      // whole sheet (the default): page points on the line, on the rect's left edge and on the empty page
+      const P = [[200, 600], [350, 575], [500, 780]];
+      const ex = await exportPng(null, P);
+      assert.strictEqual(ex.name, 'Test UI Export-sheet-rev1.png', 'file name');
+      const [pw0, ph0] = pngSize(ex.file);
+      assert.deepStrictEqual([pw0, ph0], [ex.hook.width, ex.hook.height], 'PNG size = the export size');
+      assert.ok(pw0 * ph0 <= 16e6 && Math.max(pw0, ph0) <= 8000, 'within 16 MP and 8000 px: ' + pw0 + ' × ' + ph0);
+      assert.ok(ph0 > vis0[1] * 2, 'whole sheet at export resolution, larger than the screen: ' + ph0);
+      const dec = await decode(ex.file, ex.hook.px);
+      assert.deepStrictEqual([dec.width, dec.height], [pw0, ph0], 'the PNG decodes at its size');
+      near(dec.px[0], [0, 160, 0, 255], 'the line in its own colour');
+      near(dec.px[1], [0, 137, 123, 255], 'the rect in the palette colour');
+      near(dec.px[2], [255, 255, 255, 255], 'the page is white');
+      assert.deepStrictEqual(await page.evaluate(() => [window.__tvViewer.canvas.width, window.__tvViewer.canvas.height]), vis0, 'the visible canvas is not resized');
+      // the legend: the list's own numbers and texts; tender, date, scale line and the draft label (the Excel report's)
+      assert.deepStrictEqual(ex.hook.legend, xs.map(({ id, ...x }) => x), 'legend = list');
+      assert.ok(ex.hook.head.title.includes('Test UI Export') && ex.hook.head.title.includes('sheet'), 'tender and drawing: ' + ex.hook.head.title);
+      assert.strictEqual(ex.hook.head.date, today, 'date');
+      assert.ok(ex.hook.head.scale.includes('1 pt = 0.05 m'), 'scale line: ' + ex.hook.head.scale);
+      assert.deepStrictEqual(ex.hook.head.draft, [DRAFT.DRAFT_EN, DRAFT.DRAFT_AR], 'draft label on a draft');
+      assert.ok(ex.hook.height > ex.hook.h * ex.hook.k, 'the legend box under the drawing');
+      if (process.env.EXPORT_SCREENSHOT) fs.writeFileSync(process.env.EXPORT_SCREENSHOT, ex.file);
+      // the current view: the screen's size at the export resolution
+      const exv = await exportPng('view', [[200, 600]]);
+      const cw = await page.evaluate(() => window.__tvViewer.canvas.clientWidth);
+      assert.strictEqual(exv.hook.w, cw, 'current view: the screen width');
+      assert.deepStrictEqual(pngSize(exv.file), [exv.hook.width, exv.hook.height], 'current view PNG size');
+      near((await decode(exv.file, exv.hook.px)).px[0], [0, 160, 0, 255], 'current view: the line');
+      await page.selectOption('#tv-export-what', 'whole');
+
+      // DXF: the same through the DXF engine (dark background, light lines)
+      const XDXF = dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 6]]), ...dsec('ENTITIES', [...lwp('Q1', [[0, 0], [10, 0], [10, 10], [0, 10]], 'SITE')])]);
+      const xdu = await fetch(`${base}tenders/${xt}/drawings?name=site`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(XDXF) });
+      assert.strictEqual(xdu.status, 202);
+      const xd = (await xdu.json()).id;
+      for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(xd).status === 'parsing';) {
+        if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
+      }
+      await ok(call('PUT', `drawings/${xd}/units`, { units: 'm' }, admin), 'x dxf units');
+      const xm3 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'manual', row_id: xL, label: 'Fake dxf edge', color: '#00a000', geom: { tool: 'line', pts: [[0, 5], [10, 5]] } }, admin), 'x dxf line');
+      const xm4 = await ok(call('POST', `drawings/${xd}/measurements`, { tool: 'manual', row_id: xA, label: 'Fake dxf slab', geom: { tool: 'rect', p1: [6, 6], p2: [8, 9] } }, admin), 'x dxf rect');
+      await page.goto(`${origin}/#/tender/${xt}/drawings/${xd}`);
+      await page.waitForSelector(`${DX} #tv-panel[data-drawing="${xd}"] #tv-open`);
+      await page.click(DX + ' #tv-open');
+      await page.waitForSelector(DX + ' #tv-canvas[data-ready="1"]');
+      await frame();
+      const xs2 = (await listShown(DX)).filter(x => x.id === xm3.id || x.id === xm4.id);
+      assert.deepStrictEqual(xs2.map(x => [x.no, x.qty, x.unit]), [[3, '10.00', 'm'], [4, '6.00', 'm2']], 'DXF measurements numbered after the PDF ones');
+      const exd = await exportPng(null, [[5, 5], [6, 7.5], [3, 2]]);
+      assert.strictEqual(exd.name, 'Test UI Export-site-rev1.png', 'DXF file name');
+      const [dw0, dh0] = pngSize(exd.file);
+      assert.deepStrictEqual([dw0, dh0], [exd.hook.width, exd.hook.height], 'DXF PNG size');
+      assert.ok(dw0 * dh0 <= 16e6 && Math.max(dw0, dh0) <= 8000, 'DXF within limits: ' + dw0 + ' × ' + dh0);
+      const dd = await decode(exd.file, exd.hook.px);
+      near(dd.px[0], [0, 160, 0, 255], 'DXF: the line in its own colour');
+      near(dd.px[1], [0, 137, 123, 255], 'DXF: the rect in the palette colour');
+      near(dd.px[2], [30, 30, 30, 255], 'DXF: the background');
+      assert.deepStrictEqual(exd.hook.legend, xs2.map(({ id, ...x }) => x), 'DXF legend = list');
+      assert.ok(exd.hook.head.scale.includes('1 m = 1 m'), 'DXF scale line: ' + exd.hook.head.scale);
+      assert.deepStrictEqual(exd.hook.head.draft, [DRAFT.DRAFT_EN, DRAFT.DRAFT_AR], 'DXF draft label');
+
+      // approved: read only, the export is still there, no draft label
+      db.prepare("UPDATE tenders SET status='approved', frozen=(SELECT frozen FROM tenders WHERE id=?) WHERE id=?").run(full, xt);
+      await page.goto(`${origin}/#/tender/${xt}/drawings/${xp}`);
+      await page.waitForSelector(`${DX} #tv-panel[data-drawing="${xp}"] #tv-open`);
+      await page.click(DX + ' #tv-open');
+      await page.waitForSelector(DX + ' #tv-canvas[data-ready="1"]');
+      await page.evaluate(() => window.__tvViewer.whenIdle());
+      assert.ok(!(await page.$(DX + ' #tl-tools')), 'approved: no tools');
+      const exa = await exportPng(null, [[200, 600]]);
+      assert.deepStrictEqual(pngSize(exa.file), [exa.hook.width, exa.hook.height], 'approved: exported');
+      assert.deepStrictEqual(exa.hook.head.draft, null, 'approved: no draft label');
+      assert.deepStrictEqual(exa.hook.legend, xs.map(({ id, ...x }) => x), 'approved: legend = list');
+      await page.click('#tv-close');
+    }
+
     // other screens
     for (const [hash, sel] of [['#/costs', '#page-costs'], ['#/library', '#page-library'], ['#/settings', '#page-settings'], ['#/', '#page-home']]) {
       await page.goto(origin + '/' + hash); await page.waitForSelector(sel);
@@ -1705,6 +1833,18 @@ server.listen(0, async () => {
     assert.strictEqual((await arName.textContent()).trim(), 'أسفلت', 'Arabic layer name in the viewer panel unchanged');
     assert.strictEqual(await arName.getAttribute('dir'), 'auto', 'layer name isolated (dir=auto)');
     assert.ok((await page.textContent('#tv-preview')).includes('معاينة'), 'Arabic preview label');
+    // Task 6 in Arabic: the export (right-to-left legend); layer measurements have no shape but are in the legend, with the list's texts
+    {
+      assert.strictEqual((await page.textContent('#tv-export')).trim(), I18N.ar.tv_export, 'Arabic export button');
+      const [dl] = await Promise.all([page.waitForEvent('download'), page.click('#tv-export')]);
+      const f = fs.readFileSync(await dl.path()), x = await page.evaluate(() => ({ width: window.__tvExport.width, height: window.__tvExport.height, legend: window.__tvExport.legend }));
+      assert.deepStrictEqual([f.readUInt32BE(16), f.readUInt32BE(20)], [x.width, x.height], 'Arabic export PNG size');
+      const shown = await page.$$eval(`#drawings[data-tender="${dwg}"] #dw-measurements tr[data-measurement]`, trs => trs.map(tr => ({ no: Number(tr.querySelector('.m-no').textContent),
+        label: tr.querySelector('.m-lbl').textContent, qty: tr.querySelector('.m-qty').textContent, unit: tr.querySelector('.m-unit').textContent, row: tr.querySelector('.m-row').textContent })));
+      assert.ok(x.legend.length > 0, 'the layer measurements are in the legend');
+      for (const e of x.legend) assert.deepStrictEqual(e, shown.find(s => s.no === e.no), 'Arabic legend entry = list');
+      if (process.env.EXPORT_SCREENSHOT) fs.writeFileSync(process.env.EXPORT_SCREENSHOT.replace(/\.png$/, '-ar.png'), f);
+    }
     // final review M7: a server refusal of a drawn measurement in Arabic (the raw text is the fallback)
     {
       const { makePdf } = require('./test/fixtures/make-takeoff.js');

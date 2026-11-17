@@ -14,7 +14,8 @@ const DAY = 86400000, MAX = 1e12, MAX_MONTHS = 1200;
 const KINDS = ['rta', 'direct'];
 const HIDDEN_KINDS = ['fixed', 'monthly', 'pct', 'locked'];
 const HIDDEN_STATUS = ['applies', 'na', 'included'];
-const FROZEN_STATUSES = ['approved', 'sent', 'won', 'lost'];
+// the frozen statuses and the draft label: one source with the drawing PNG export (lib/draft.js)
+const { FROZEN_STATUSES, DRAFT_EN, DRAFT_AR } = require('../lib/draft.js');
 // names only, no amounts (global constraint: no fees hard-coded as facts)
 const SEED = [
   ['RTA permits & NOCs', 'تصاريح RTA وموافقات الجهات (NOCs)', 'fixed'],
@@ -50,7 +51,6 @@ const takeoffQty = lines => lines.reduce((s, x) => {
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const PARTIAL_EN = 'PARTIAL — not a tender price', PARTIAL_AR = 'سعر ناقص — ليس سعر المناقصة';
 const NO_PRICE_EN = 'NO PRICE — pricing is blocked', NO_PRICE_AR = 'لا يوجد سعر — التسعير متوقف';
-const DRAFT_EN = 'DRAFT — NOT APPROVED', DRAFT_AR = 'مسودة — غير معتمدة';
 // CSV: a text cell that a spreadsheet could read as a formula gets a leading quote (the client's BOQ text is untrusted)
 const csvCell = v => {
   if (v === null || v === undefined) return '';

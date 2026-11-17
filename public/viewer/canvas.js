@@ -16,11 +16,16 @@
 // Previous version (batch 4 Task 4, display only): opts.under = another decoded display file (the version this one
 // replaces) drawn under the drawing in grey, in the same world coordinates, its own off/frozen layers hidden; it is never
 // hit, selected or snapped. setUnder(on) shows or hides it (opts.underOn: the start), underOn() tells.
+// Export (batch 4 Task 6): exportFrame(whole) -> { w, h, toScreen(p), paint(g, k) } draws the drawing offscreen (the visible
+// canvas is not touched) with the same drawing code: whole = the whole drawing (its bounding box, long side EXPORT_LONG CSS
+// px), else the current view at the screen's size. paint(g, k) -> Promise draws it onto the 2-D context g at k device px per
+// CSS px (the layers as shown; no previous version, selection or hover); toScreen(p) is a world point's CSS px in that frame.
 'use strict';
 (function () {
 const BG = '#1e1e1e', UNDER = '#6b6b6b', LIGHT = '#e0e0e0', SEL = '#ffa726', HI = '#26c6da', HOVER = 'rgba(255,255,255,0.45)', SNAP = '#00e676';
 const KIND_CLOSED = 1, KIND_INSERT = 2, KIND_TEXT = 3, KIND_NESTED = 5;
 const CLICK_PX = 5, SNAP_PX = 10, DRAG_PX = 3;
+const EXPORT_LONG = 1400;   // an export of the whole drawing: the long side in CSS px (the device px follow from the page's k)
 
 // relative luminance (WCAG) of #rrggbb
 function lum(hex) {
@@ -59,9 +64,9 @@ function create(canvas, R, opts) {
   const tol = px => px / V.scale;
 
   // one entity's paths into the current path, in CSS pixels; a NaN pair starts a new subpath (X: the display file, R
-  // or the previous version's)
-  function trace(c, i, X = R) {
-    const s = V.scale, ex = (X.eo[2 * i] - V.ox) * s + V.tx, ey = -(X.eo[2 * i + 1] - V.oy) * s + V.ty;
+  // or the previous version's; view: the screen's or an export's)
+  function trace(c, i, X = R, view = V) {
+    const s = view.scale, ex = (X.eo[2 * i] - view.ox) * s + view.tx, ey = -(X.eo[2 * i + 1] - view.oy) * s + view.ty;
     const p = X.pts, st = X.start[i], e = st + X.count[i];
     if (isPoint(i, X)) {
       const x = ex + p[2 * st] * s, y = ey - p[2 * st + 1] * s, r = X.kind[i] === KIND_TEXT ? 2 : 4;
@@ -80,16 +85,21 @@ function create(canvas, R, opts) {
     if (closed && m > 2) c.closePath();
   }
 
-  function drawBase() {
-    bctx.setTransform(1, 0, 0, 1, 0, 0);
-    bctx.fillStyle = BG; bctx.fillRect(0, 0, base.width, base.height);
-    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const a = TV.toWorld(V, 0, H), b = TV.toWorld(V, W, 0);
-    if (U && underOn) {   // the previous version first, in grey: the drawing is drawn over it
+  const drawBase = () => paint(bctx, view0(), dpr, true);
+  const view0 = () => ({ view: V, w: W, h: H });
+  // the drawing of frame f ({ view, w, h }: CSS px) onto context g at k device px per CSS px; marks: the screen's extras
+  // (the previous version underneath, highlighted and selected entities)
+  function paint(g, f, k, marks) {
+    const view = f.view;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.fillStyle = BG; g.fillRect(0, 0, Math.ceil(f.w * k), Math.ceil(f.h * k));
+    g.setTransform(k, 0, 0, k, 0, 0);
+    const a = TV.toWorld(view, 0, f.h), b = TV.toWorld(view, f.w, 0);
+    if (marks && U && underOn) {   // the previous version first, in grey: the drawing is drawn over it
       const uv = TV.visible(GU, U, [a[0], a[1], b[0], b[1]], underLayers);
-      bctx.beginPath();
-      for (let k = 0; k < uv.length; k++) trace(bctx, uv[k], U);
-      bctx.lineWidth = 1; bctx.lineJoin = 'round'; bctx.strokeStyle = UNDER; bctx.stroke();
+      g.beginPath();
+      for (let k = 0; k < uv.length; k++) trace(g, uv[k], U, view);
+      g.lineWidth = 1; g.lineJoin = 'round'; g.strokeStyle = UNDER; g.stroke();
     }
     const vis = TV.visible(G, R, [a[0], a[1], b[0], b[1]], layerOn);
     // bucket by colour (a counting sort), one stroke per colour
@@ -98,19 +108,32 @@ function create(canvas, R, opts) {
     for (let c = 0; c < slots.length; c++) cnt[c + 1] += cnt[c];
     const order = new Uint32Array(vis.length), fill = cnt.slice(0, slots.length);
     for (let k = 0; k < vis.length; k++) order[fill[slotOf[R.layer[vis[k]]]]++] = vis[k];
-    bctx.lineWidth = 1; bctx.lineJoin = 'round';
+    g.lineWidth = 1; g.lineJoin = 'round';
     for (let c = 0; c < slots.length; c++) {
       if (cnt[c] === cnt[c + 1]) continue;
-      bctx.beginPath();
-      for (let k = cnt[c]; k < cnt[c + 1]; k++) trace(bctx, order[k]);
-      bctx.strokeStyle = slots[c]; bctx.stroke();
+      g.beginPath();
+      for (let k = cnt[c]; k < cnt[c + 1]; k++) trace(g, order[k], R, view);
+      g.strokeStyle = slots[c]; g.stroke();
     }
+    if (!marks) return;
     for (const [flags, any, colour] of [[hi, nHi, HI], [sel, nSel, SEL]]) {
       if (!any) continue;
-      bctx.beginPath();
-      for (let k = 0; k < vis.length; k++) if (flags[vis[k]]) trace(bctx, vis[k]);
-      bctx.lineWidth = 2; bctx.strokeStyle = colour; bctx.stroke();
+      g.beginPath();
+      for (let k = 0; k < vis.length; k++) if (flags[vis[k]]) trace(g, vis[k], R, view);
+      g.lineWidth = 2; g.strokeStyle = colour; g.stroke();
     }
+  }
+  // an export frame: the whole drawing (its bounding box with the view's 5 % margin) or the current view
+  function exportFrame(whole) {
+    if (!V) return null;
+    let f;
+    if (whole) {
+      const bb = R.bbox, a = Math.max(0, (bb[2] - bb[0]) * 1.1), b = Math.max(0, (bb[3] - bb[1]) * 1.1), m = Math.max(a, b);
+      // a drawing with no width or height (one line, one point): a square frame
+      const w = m > 0 && a > 0 ? Math.max(1, Math.round(EXPORT_LONG * a / m)) : EXPORT_LONG, h = m > 0 && b > 0 ? Math.max(1, Math.round(EXPORT_LONG * b / m)) : EXPORT_LONG;
+      f = { view: TV.makeView(bb, w, h, R.origin), w, h };
+    } else f = { view: { ...V }, w: W, h: H };
+    return { w: f.w, h: f.h, toScreen: p => TV.toScreen(f.view, p[0], p[1]), paint: (g, k) => { paint(g, f, k, false); return Promise.resolve(); } };
   }
 
   function frame() {
@@ -315,6 +338,7 @@ function create(canvas, R, opts) {
     },
     highlightedHandles: () => Array.from(indices(hi), i => R.handles[i]),
     setUnder(on) { underOn = !!(U && on); schedule(true); },
+    exportFrame,
     underOn: () => underOn,
     destroy,
   };

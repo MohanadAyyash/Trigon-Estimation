@@ -5,6 +5,8 @@
 //
 //   TVTools.create({ canvas, toScreen(p) -> [sx, sy] | null, toPage(sx, sy) -> p | null, requestDraw(), axisLock, alive(),
 //                    cursor() -> p | null, overlay() -> { saved, cals, region }, onChange(tools), onFinish(kind, data) })
+//   tools.drawSavedAt(ctx, toScreen) -> [{ id, no, colour }]: the saved measurements and calibrations alone (the screen's
+//     own drawing, no shape being drawn) through another projection, e.g. an offscreen export view (batch 4 Task 6)
 //   TVTools.calibrationFor(cals, p): the calibration a point uses, as the server's lib/takeoff/calib.js calibrationFor
 //   TVTools.pathWarnings(pts, closed): [{ code: 'back' | 'sharp', at }] (R15: a path that doubles back on itself; a very
 //     sharp angle), at = the 1-based point number
@@ -17,7 +19,8 @@
 // 'calibrate' / 'verify' / 'region' with { p1, p2 }; it returns true to keep the shape shown (frozen) while its form is
 // open. undo() removes the last point, cancel() (Esc) drops the shape and leaves the tool. axisLock (raster): Shift keeps
 // the new point horizontal or vertical to the previous one as displayed (exactly on a page axis: the page is shown turned
-// by 0/90/180/270 only).
+// by 0/90/180/270 only). A saved measurement with a number (overlay().saved[i].no: its number in the measurement list)
+// carries a badge with that number at its first point (batch 4 Task 6).
 'use strict';
 (function () {
 const SAME_PX = 2;          // a click within 2 screen px of the previous point is the same point (the 2nd click of a double-click)
@@ -56,7 +59,8 @@ const DRAW = '#ff1744', CAL = '#00acc1', REGION = '#ffb300';
 
 function create(o) {
   let tool = null, ring = [], outer = null, holes = [], done = null, shift = false, dead = false, drawn = [], drawnCals = [];
-  const S = p => o.toScreen(p);
+  let proj = null;   // drawSavedAt: another projection, for the duration of that call
+  const S = p => proj ? proj(p) : o.toScreen(p);
   const changed = () => { if (o.onChange) o.onChange(api); if (o.requestDraw) o.requestDraw(); };
   const samePt = (a, b) => {
     if (a[0] === b[0] && a[1] === b[1]) return true;
@@ -166,18 +170,31 @@ function create(o) {
     ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fillRect(s[0] + 6, s[1] - 18, w + 6, 16);
     ctx.fillStyle = colour; ctx.fillText(text, s[0] + 9, s[1] - 6);
   }
+  // the measurement list's number, white on the measurement's colour, up and before its first point
+  function badge(ctx, p, no, colour) {
+    const s = S(p);
+    if (!s) return;
+    const text = String(no);
+    ctx.font = 'bold 11px "Segoe UI", Tahoma, Arial, sans-serif';
+    const r = Math.max(8, ctx.measureText(text).width / 2 + 4), cx = s[0] - r - 3, cy = s[1] - r - 3;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+    ctx.fillStyle = colour; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = '#ffffff'; ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, cx, cy + 0.5);
+    ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+  }
   const first = g => g.tool === 'rect' ? g.p1 : g.tool === 'area' ? g.outer[0] : g.pts[0];
-  function draw(ctx) {
-    if (dead) return;
-    const ov = o.overlay ? o.overlay() : {};
-    drawn = []; drawnCals = [];
-    ctx.save();
+  // the saved measurements (with their number badges) and the calibrations: on the screen and in an export alike
+  function drawSaved(ctx, ov) {
+    const saved = [], cals = [];
     (ov.saved || []).forEach((m, k) => {
       if (!m.geom) return;
       const colour = m.color || PALETTE[k % PALETTE.length];
       shape(ctx, m.geom, colour, 0.15);
       label(ctx, first(m.geom), m.text, colour);
-      drawn.push({ id: m.id, text: m.text });
+      if (Number.isInteger(m.no)) badge(ctx, first(m.geom), m.no, colour);
+      saved.push({ id: m.id, no: Number.isInteger(m.no) ? m.no : null, text: m.text, colour });
     });
     for (const c of ov.cals || []) {
       ctx.setLineDash([6, 4]);
@@ -185,8 +202,15 @@ function create(o) {
       ctx.beginPath(); path(ctx, [c.p1, c.p2], false); ctx.strokeStyle = CAL; ctx.lineWidth = 1.5; ctx.stroke();
       ctx.setLineDash([]);
       label(ctx, c.region ? [c.region[0], c.region[3]] : c.p2, c.text, c.region ? '#8a6100' : '#00707f');
-      drawnCals.push(c.text);
+      cals.push(c.text);
     }
+    return { saved, cals };
+  }
+  function draw(ctx) {
+    if (dead) return;
+    const ov = o.overlay ? o.overlay() : {};
+    ctx.save();
+    ({ saved: drawn, cals: drawnCals } = drawSaved(ctx, ov));
     if (ov.region) {   // drawn, waiting for its calibration
       ctx.setLineDash([4, 3]); ctx.beginPath(); path(ctx, rectPts([ov.region[0], ov.region[1]], [ov.region[2], ov.region[3]]), true);
       ctx.strokeStyle = REGION; ctx.lineWidth = 2; ctx.stroke(); ctx.setLineDash([]);
@@ -212,6 +236,11 @@ function create(o) {
       ring.forEach(p => dot(ctx, p, colour, tool === 'count' ? 4 : 3));
     }
     ctx.restore();
+  }
+  function drawSavedAt(ctx, toScreen) {
+    proj = toScreen;
+    ctx.save();
+    try { return drawSaved(ctx, o.overlay ? o.overlay() : {}).saved; } finally { ctx.restore(); proj = null; }
   }
 
   // ---- keys: Enter finishes, Esc cancels; Shift held for the axis lock (and the rubber band) ----
@@ -241,14 +270,14 @@ function create(o) {
   }
 
   const api = {
-    tool: () => tool, setTool, pick, drag, hole, undo, finish, cancel, geom, draw, destroy,
+    tool: () => tool, setTool, pick, drag, hole, undo, finish, cancel, geom, draw, drawSavedAt, destroy,
     // the shape stays drawn (frozen) while its form is open; clear() drops it and keeps the tool
     clear() { clear(); changed(); },
     isDone: () => !!done,
     holeMode: () => !!outer,
     points: () => ring.map(p => p.slice()),
     pointCount: () => ring.length + (outer ? outer.length : 0) + holes.reduce((s, h) => s + h.length, 0),
-    overlay: () => drawn.slice(),   // what the last frame drew of the saved measurements (test hook)
+    overlay: () => drawn.slice(),   // what the last frame drew of the saved measurements: [{ id, no, text, colour }] (test hook)
     overlayCals: () => drawnCals.slice(),   // the scale labels it drew (test hook)
   };
   return api;

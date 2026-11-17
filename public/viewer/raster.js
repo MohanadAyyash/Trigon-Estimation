@@ -39,6 +39,12 @@
 // the start (default 0: this page only). engine.ready waits for it; a failure to load it calls onError and leaves this
 // page shown alone.
 //
+// Export (batch 4 Task 6): engine.exportFrame(whole) -> { w, h, toScreen(p), paint(g, k) } draws the page offscreen (the
+// visible canvas and its bitmaps are not touched): whole = the whole page (with the view's 5 % margin, long side EXPORT_LONG
+// CSS px), else the current view at the screen's size. paint(g, k) -> Promise draws it onto the 2-D context g at k device
+// px per CSS px: a PDF is rendered again by pdf.js at that resolution (the visible part of the page, ≤ 16 MP as below), an
+// image drawn from its bitmap; no previous version. toScreen(p) is a page point's CSS px in that frame.
+//
 // Rendering: a PDF is rendered by pdf.js (worker /vendor/pdfjs/pdf.worker.min.mjs). The whole page once at the fit
 // resolution, then the visible part at the current zoom 150 ms after the view stops changing (canvas ≤ 16 MP). A new
 // render cancels the one in flight; between renders the last bitmaps are drawn through the view transform, so zoom and
@@ -49,6 +55,7 @@
 (function () {
 const BG = '#1e1e1e', PAGE = '#ffffff', EDGE = 'rgba(255,255,255,0.25)';
 const MAX_PIXELS = 16e6, DEBOUNCE_MS = 150, DRAG_PX = 3;
+const EXPORT_LONG = 1400;   // an export of the whole page: the long side in CSS px (the device px follow from the page's k)
 // 2-D affines [a, b, c, d, e, f] (x' = a x + c y + e, y' = b x + d y + f), as canvas setTransform takes them
 const mul = (P, Q) => [P[0] * Q[0] + P[2] * Q[1], P[1] * Q[0] + P[3] * Q[1], P[0] * Q[2] + P[2] * Q[3], P[1] * Q[2] + P[3] * Q[3],
   P[0] * Q[4] + P[2] * Q[5] + P[4], P[1] * Q[4] + P[3] * Q[5] + P[5]];
@@ -274,6 +281,46 @@ function create(container, opts) {
     viewChanged();
   }
 
+  // ---- export ----
+  function exportFrame(whole) {
+    if (!V || !toD) return null;
+    let view, w, h;
+    if (whole) {
+      const a = dw * 1.1, b = dh * 1.1, m = Math.max(a, b);
+      w = Math.max(1, Math.round(EXPORT_LONG * a / m)); h = Math.max(1, Math.round(EXPORT_LONG * b / m));
+      view = TV.makeView([0, -dh, dw, 0], w, h, [0, 0]);
+    } else { view = { ...V }; w = W; h = H; }
+    const scr = (x, y) => TV.toScreen(view, x, -y);
+    return { w, h, toScreen: p => { const d = toD(p[0], p[1]); return scr(d[0], d[1]); }, paint: (g, k) => paintExport(g, k, view, w, h, scr) };
+  }
+  async function paintExport(g, k, view, w, h, scr) {
+    if (dead) throw new Error('viewer closed');
+    g.setTransform(k, 0, 0, k, 0, 0);
+    g.fillStyle = BG; g.fillRect(0, 0, w, h);
+    const [sx, sy] = scr(0, 0), s = view.scale;
+    g.fillStyle = PAGE; g.fillRect(sx, sy, dw * s, dh * s);
+    if (img) g.drawImage(img, sx, sy, dw * s, dh * s);
+    else if (pg) {
+      // the part of the page in the frame, in display units, rendered at the export's device px per unit (≤ 16 MP)
+      const a = TV.toWorld(view, 0, 0), b = TV.toWorld(view, w, h);
+      const x0 = Math.max(0, Math.min(a[0], b[0])), y0 = Math.max(0, Math.min(-a[1], -b[1])), x1 = Math.min(dw, Math.max(a[0], b[0])), y1 = Math.min(dh, Math.max(-a[1], -b[1]));
+      if (x1 > x0 && y1 > y0) {
+        const r = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, rs = capScale(r.w, r.h, s * k);
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.ceil(r.w * rs)); c.height = Math.max(1, Math.ceil(r.h * rs));
+        const p = pg;
+        try {
+          await p.render({ canvasContext: c.getContext('2d'), viewport: p.getViewport({ scale: rs, rotation: rot, offsetX: -r.x * rs, offsetY: -r.y * rs }) }).promise;
+          if (dead) throw new Error('viewer closed');
+          const [rx, ry] = scr(r.x, r.y);
+          g.setTransform(k, 0, 0, k, 0, 0);
+          g.drawImage(c, rx, ry, c.width / rs * s, c.height / rs * s);
+        } finally { free(c); }
+      }
+    }
+    g.lineWidth = 1; g.strokeStyle = EDGE; g.strokeRect(sx - 0.5, sy - 0.5, dw * s + 1, dh * s + 1);
+  }
+
   // the previous version lines up in page space only when both are PDFs or both images (R17)
   function underAligned() { return !!o.under && o.under.kind === o.kind; }
 
@@ -368,6 +415,7 @@ function create(container, opts) {
     underMix: () => mix,
     hasUnder: () => !!under,
     underAligned,
+    exportFrame,
     whenIdle: () => new Promise(f => { idleWaiters.push(f); settle(); }),
   };
   resize();

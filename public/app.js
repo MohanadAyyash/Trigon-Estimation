@@ -575,8 +575,11 @@
       if (activeViewer && activeViewer.redraw) activeViewer.redraw();
       return msCur;
     };
-    // the manual measurements of a drawing, drawn over it by the viewer
-    const savedOf = did => [...msCur.measurements, ...msCur.unlinked].filter(m => m.drawing_id === did && m.tool === 'manual' && m.geom);
+    // the measurements with their list numbers (no); the manual ones of a drawing are drawn over it by the viewer
+    const numbered = () => listOrder(msCur).map((m, k) => ({ ...m, no: k + 1 }));
+    const savedOf = did => numbered().filter(m => m.drawing_id === did && m.tool === 'manual' && m.geom);
+    // the PNG export (batch 4 Task 6): the tender, and every measurement of the drawings shown (its legend), in list order
+    const xp = { T, listedOf: dids => numbered().filter(m => dids.includes(m.drawing_id)) };
     if (!editable) box.append(h('p', { class: 'muted' }, canWrite() && T.status !== 'draft' ? t('dw_read_only_note') : t('read_only')));
     if (editable) box.append(uploadPanel(id));
     // batch 4: a replaced drawing (replaced_by) is a previous version, listed apart and read only; a new version waiting to be
@@ -620,14 +623,14 @@
     if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) {
       const np = pend ? cur.pending_replacement : null;   // the new version's page of the same number
       if (pend && !np) box.append(h('p', { id: 'rv-page-gone', class: 'warn' }, t('rv_page_gone')));
-      box.append(np && np.status === 'ready' ? rasterCard(np, rows, false, savedOf, refreshList, { under: cur, mix: 0.5, show: true })
-        : rasterCard(cur, rows, dEdit, savedOf, refreshList, prev ? { under: prev, mix: 0 } : null));
+      box.append(np && np.status === 'ready' ? rasterCard(np, rows, false, savedOf, refreshList, { under: cur, mix: 0.5, show: true }, xp)
+        : rasterCard(cur, rows, dEdit, savedOf, refreshList, prev ? { under: prev, mix: 0 } : null, xp));
     }
     else if (cur && cur.status === 'pages') box.append(pagesBox);
     else if (cur && cur.status === 'ready') {
       // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
       const cmp = pend && pend.status === 'ready' ? { show: pend, under: cur, on: true } : prev ? { under: prev, on: false } : null;
-      try { await drawingPanel(box, cur, ms, rows, dEdit, refreshList, savedOf, cmp); }
+      try { await drawingPanel(box, cur, ms, rows, dEdit, refreshList, savedOf, cmp, xp); }
       catch (e) { box.append(h('div', { id: 'dw-panel-error', class: 'banner banner-red' }, h('strong', null, t('dw_panel_failed')), ': ', e.message)); }
     }
     else if (cur && cur.status === 'failed') box.append(h('div', { class: 'banner banner-red' }, h('strong', null, t('dw_parse_failed')), ': ', cur.error || ''));
@@ -853,13 +856,13 @@
 
   // cmp (batch 4): { show: a new version waiting, under: cur, on: true } shows the new version in the viewer over this one;
   // { under: the version this one replaced, on: false } offers it under this one
-  async function drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf, cmp) {
+  async function drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf, cmp, xp) {
     const [d, lt] = await Promise.all([api('GET', 'drawings/' + cur.id), api('GET', `drawings/${cur.id}/layers`)]);
     const confirmed = lt.units_confirmed, measured = [...ms.measurements, ...ms.unlinked].some(m => m.drawing_id === d.id);
     if (cmp && cmp.show) {
       const [nd, nlt] = await Promise.all([api('GET', 'drawings/' + cmp.show.id), api('GET', `drawings/${cmp.show.id}/layers`)]);
-      box.append(viewerCard(nd, nlt, rows, false, refreshList, false, savedOf, cmp));
-    } else box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList, editable, savedOf, cmp));
+      box.append(viewerCard(nd, nlt, rows, false, refreshList, false, savedOf, cmp, xp));
+    } else box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList, editable, savedOf, cmp, xp));
     // units: the suggestion is pre-selected, nothing is computed until Confirm
     const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable });
     const ignored = Object.entries(d.ignored || {});
@@ -971,7 +974,8 @@
   }
   // canLink: a selection can be linked (editable, units confirmed); editable: the measuring tools are shown
   // cmp: { under: a drawing row, on } draws that version in grey under this one, with a toggle (display only)
-  function viewerCard(d, lt, rows, canLink, refreshList, editable, savedOf, cmp) {
+  // xp: { T, listedOf(drawing ids) } for the PNG export
+  function viewerCard(d, lt, rows, canLink, refreshList, editable, savedOf, cmp, xp) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id) });
     const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''), cmp && cmp.show ? h('span', { class: 'tag warn-tag', id: 'tv-rev' }, t('dw_rev_n', { rev: d.rev })) : null);
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
@@ -1049,7 +1053,7 @@
         h('div', { class: 'row wrap tv-toolbar' }, modeBtn('select', t('tv_select')), modeBtn('window', t('tv_window')), modeBtn('crossing', t('tv_crossing')),
           h('button', { id: 'tv-clear', class: 'small secondary', onclick: () => { eng.clear(); highlightTxt.textContent = ''; } }, t('tv_clear')),
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
-          h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn,
+          h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn, exportControls(() => mp),
           underCb ? h('label', { class: 'tv-check' }, underCb, ' ' + t('tv_under')) : null,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
         h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_dxf')) : null,
@@ -1100,7 +1104,8 @@
       const savedBoth = () => [...savedOf(d.id), ...(cmp && cmp.under ? savedOf(cmp.under.id) : [])];
       mp = measurePanel({ d, kind: 'dxf', unit: lt.units || '', editable, rows, savedOf: savedBoth, refreshList, alive: () => tok === routeTok,
         dxfScale: () => f, cursor: () => { const sp = eng.snapPoint(); return sp ? [sp.x, sp.y] : cur; },
-        eng: { canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
+        tender: xp.T, listed: () => xp.listedOf([d.id, ...(cmp && cmp.under ? [cmp.under.id] : [])]),
+        eng: { canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(), exportFrame: whole => eng.exportFrame(whole),
           setToolMode: on => { eng.setTool(on); if (on && !snapCb.checked) { snapCb.checked = true; eng.setSnap(true); } } } });
       barBox.replaceWith(mp.bar || '');
       infoBox.replaceWith(mp.info);
@@ -1175,7 +1180,8 @@
   // ---- PDF page / image viewer (public/viewer/raster.js): the page on a canvas, zoom and pan; display only ----
   // cmp: { under: the row of the other version's page, mix: 0..1, show: d is a new version waiting } shows that page
   // blended with this one, with a slider (display only)
-  function rasterCard(d, rows, editable, savedOf, refreshList, cmp) {
+  // xp: { T, listedOf(drawing ids) } for the PNG export
+  function rasterCard(d, rows, editable, savedOf, refreshList, cmp, xp) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id), 'data-kind': d.kind });
     const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''), cmp && cmp.show ? h('span', { class: 'tag warn-tag', id: 'tv-rev' }, t('dw_rev_n', { rev: d.rev })) : null);
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
@@ -1215,7 +1221,7 @@
       sec.replaceChildren(title(), info,
         h('div', { class: 'row wrap tv-toolbar' },
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
-          u ? h('label', { class: 'tv-check tv-mix' }, t('tv_under') + ' ', mixIn, ' ', mixOut) : null,
+          u ? h('label', { class: 'tv-check tv-mix' }, t('tv_under') + ' ', mixIn, ' ', mixOut) : null, exportControls(() => mp),
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
         h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_raster')) : null,
           u && u.kind !== d.kind ? h('p', { id: 'tv-under-note', class: 'warn small' }, t('tv_under_mixed')) : null),
@@ -1239,7 +1245,8 @@
       // no snap on a page; Shift keeps a segment horizontal or vertical; a tool takes the left button (pan: middle/right)
       mp = measurePanel({ d: full, kind: d.kind, unit, editable, rows, savedOf: () => [...savedOf(d.id), ...(u ? savedOf(u.id) : [])], refreshList, alive: () => tok === routeTok,
         cals: calsOf.calibrations || [], calsPrevious: !!(cmp && cmp.show), units: Object.keys(full.unit_to_m || {}), cursor: () => cur, axisLock: true,
-        eng: { canvas: eng.canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
+        tender: xp.T, listed: () => xp.listedOf([d.id, ...(u ? [u.id] : [])]),
+        eng: { canvas: eng.canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(), exportFrame: whole => eng.exportFrame(whole),
           setToolMode: on => eng.setPanOnLeft(!on) } });
       barBox.replaceWith(mp.bar || '');
       infoBox.replaceWith(mp.info);
@@ -1305,10 +1312,84 @@
     }), { class: 'grid', id }));
   }
 
+  // ---- PNG export (batch 4 Task 6): the drawing with its numbered measurements and a legend, saved by this browser ----
+  // Size: the frame's CSS px at k device px each, k as large as fits 8000 px on the long side and 16 MP in all (the viewer's
+  // bitmap cap, well inside the browser's canvas limits). Read only: any role, any tender status.
+  const EXPORT_MAX_SIDE = 8000, EXPORT_MAX_PIXELS = 16e6;
+  const LG_FONT = '"Segoe UI", Tahoma, Arial, sans-serif', LG_PAD = 14, LG_LH = 18, LG_TITLE = 24;
+  // a file name part: no path or reserved characters, no direction marks, at most 80 characters
+  const fileSafe = s => Array.from(String(s || '').replace(/[\\/:*?"<>|\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g, '_').replace(/\s+/g, ' ').trim().replace(/^\.+/, '')).slice(0, 80).join('').trim();
+  const pngName = (T, d) => (fileSafe(T.title) || 'tender') + '-' + (fileSafe(d.name) || 'drawing') + '-rev' + (d.rev || 1) + '.png';
+  function saveBlob(blob, name) {
+    const url = URL.createObjectURL(blob), a = h('a', { href: url, download: name, style: 'display:none' });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+  // the toolbar's Export image: the whole sheet (default) or the current view; getMp() -> the viewer's measurePanel
+  function exportControls(getMp) {
+    const what = sel('tv-export-what', 'whole', [['whole', t('tv_export_whole')], ['view', t('tv_export_view')]], { class: 'small', title: t('tv_export_title') });
+    const btn = h('button', { id: 'tv-export', class: 'small secondary', title: t('tv_export_title'), onclick: async () => {
+      const mp = getMp();
+      if (!mp) return;
+      btn.disabled = true;
+      try { await mp.exportPng(what.value !== 'view'); }
+      catch (e) { flash(t('tv_export_failed') + ': ' + String((e && e.message) || e)); }
+      finally { btn.disabled = false; }
+    } }, t('tv_export'));
+    return h('span', { class: 'row tv-export' }, what, btn);
+  }
+  // the legend box: title (tender — drawing · Rev), date and scale line, the draft label, then one line per measurement
+  const legendHeight = (head, list) => LG_PAD + LG_TITLE + LG_LH * ((head.draft ? 2 : 1) + 1 + Math.max(1, list.length)) + 8 + LG_PAD;
+  // text cut to width w with an ellipsis
+  function fitText(g, text, w) {
+    if (g.measureText(text).width <= w) return text;
+    const ch = Array.from(text);
+    let lo = 0, hi = ch.length;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (g.measureText(ch.slice(0, m).join('') + '…').width <= w) lo = m; else hi = m - 1; }
+    return ch.slice(0, lo).join('') + '…';
+  }
+  // at CSS px under the context's transform; y0: its top; W: its width; rtl: columns from the right (Arabic)
+  function drawLegend(g, y0, W, head, list, colourOf, rtl) {
+    const P = LG_PAD, CW = W - 2 * P;
+    g.fillStyle = '#ffffff'; g.fillRect(0, y0, W, legendHeight(head, list));
+    g.fillStyle = '#9e9e9e'; g.fillRect(0, y0, W, 1);
+    g.textBaseline = 'alphabetic';
+    // a text's own direction from its first strong letter, as dir="auto" does in the list (else the page's)
+    const dirOf = s => { const m = /[A-Za-zÀ-ɏ]|[֐-ࣿיִ-﷿ﹰ-﻿]/.exec(s); return m ? (/[֐-ࣿיִ-﷿ﹰ-﻿]/.test(m[0]) ? 'rtl' : 'ltr') : rtl ? 'rtl' : 'ltr'; };
+    // text in the column [x, x + w) counted from the start side, cut to fit; align 'start' or 'end' within it
+    const put = (text, x, w, y, align = 'start') => {
+      const x0 = rtl ? W - x - w : x, left = (align === 'start') !== rtl;
+      g.direction = dirOf(String(text)); g.textAlign = left ? 'left' : 'right';
+      g.fillText(fitText(g, String(text), w), left ? x0 : x0 + w, y);
+    };
+    let y = y0 + P + 16;
+    g.fillStyle = '#212121'; g.font = 'bold 15px ' + LG_FONT; put(head.title, P, CW, y);
+    y += LG_TITLE - 16 + LG_LH - 4;
+    g.font = '13px ' + LG_FONT; put(t('xp_date', { d: iso(head.date) }) + '   ·   ' + head.scale, P, CW, y);
+    if (head.draft) { y += LG_LH; g.fillStyle = '#c62828'; g.font = 'bold 13px ' + LG_FONT; put(head.draft.join('   ·   '), P, CW, y); }
+    // columns: number (with the overlay colour), label, qty, unit, row
+    const gap = 8, wNo = 44, wQty = 90, wUnit = 50, rest = Math.max(120, CW - wNo - wQty - wUnit - 4 * gap), wLabel = Math.round(rest * 0.4), wRow = rest - wLabel;
+    const xs = { no: P, label: P + wNo + gap, qty: P + wNo + wLabel + 2 * gap, unit: P + wNo + wLabel + wQty + 3 * gap, row: P + wNo + wLabel + wQty + wUnit + 4 * gap };
+    y += LG_LH + 8;
+    g.fillStyle = '#212121'; g.font = 'bold 13px ' + LG_FONT;
+    put('#', xs.no + 14, wNo - 14, y); put(t('m_label'), xs.label, wLabel, y); put(t('qty'), xs.qty, wQty, y, 'end'); put(t('unit'), xs.unit, wUnit, y); put(t('row'), xs.row, wRow, y);
+    g.font = '13px ' + LG_FONT;
+    if (!list.length) { y += LG_LH; put(t('m_none'), P, CW, y); }
+    for (const e of list) {
+      y += LG_LH;
+      const c = colourOf.get(e.no);
+      if (c) { g.fillStyle = c; g.fillRect(rtl ? W - xs.no - 10 : xs.no, y - 10, 10, 10); }
+      g.fillStyle = '#212121';
+      put(String(e.no), xs.no + 14, wNo - 14, y); put(e.label, xs.label, wLabel, y); put(e.qty, xs.qty, wQty, y, 'end'); put(e.unit, xs.unit, wUnit, y); put(e.row, xs.row, wRow, y);
+    }
+    g.textAlign = 'start'; g.direction = 'inherit';
+  }
+
   // c: { d (with id), kind: 'dxf'|'pdf'|'image', unit (label of a drawing/page unit), editable, rows, savedOf(), refreshList(),
-  //      alive(), cursor(), axisLock, dxfScale() (DXF), cals, units (PDF/image),
-  //      eng: { canvas, toScreen(p), toPage(sx, sy), requestDraw(), setToolMode(on) } }
-  // -> { bar (null when read only), info, tools, draw(ctx), destroy() }
+  //      alive(), cursor(), axisLock, dxfScale() (DXF), cals, units (PDF/image), tender (T), listed() (every measurement of the
+  //      drawings shown, with its list number no: the PNG legend),
+  //      eng: { canvas, toScreen(p), toPage(sx, sy), requestDraw(), setToolMode(on), exportFrame(whole) } }
+  // -> { bar (null when read only), info, tools, draw(ctx), exportPng(whole), destroy() }
   function measurePanel(c) {
     const raster = c.kind !== 'dxf';
     let cals = c.cals || [], region = null;   // region: drawn, waiting for its calibration
@@ -1483,7 +1564,7 @@
       alive: c.alive, cursor: c.cursor, onFinish,
       onNote: (k, n) => say(k === 'same_point' ? t('tl_same_point') : k === 'drag' ? t('tl_drag_ignored') : t('tl_need_points', { n }), 'warn small'),
       overlay: () => ({
-        saved: c.savedOf().map(m => ({ id: m.id, geom: m.geom, color: m.color, text: (m.label ? m.label + ' · ' : '') + (m.metric === 'count' ? fmtQ(m.qty) : fmt2(m.qty)) + ' ' + (m.qty_unit || '') })),
+        saved: c.savedOf().map(m => ({ id: m.id, no: m.no, geom: m.geom, color: m.color, text: (m.label ? m.label + ' · ' : '') + (m.metric === 'count' ? fmtQ(m.qty) : fmt2(m.qty)) + ' ' + (m.qty_unit || '') })),
         cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: t('tl_scale_dxf', { u: c.unit, s: fmtScale(x.scale) }) })) : [],
         region,
       }),
@@ -1512,8 +1593,38 @@
       btns.finish.disabled = !tl || tools.isDone();
       btns.cancel.disabled = !tl;
     }
+    // PNG export: the drawing drawn offscreen by the viewer (exportFrame), the saved measurements with their numbers by the
+    // screen's own overlay code (tools.drawSavedAt), the legend box under it; then saved as <tender>-<drawing>-rev<n>.png
+    async function exportPng(whole) {
+      const f = c.eng.exportFrame(whole);
+      if (!f) throw new Error(t('tv_export_not_ready'));
+      const T = c.tender, n = new Date();
+      const legend = c.listed().map(m => ({ no: m.no, label: m.label || '', qty: mQtyText(m), unit: m.qty_unit || '', row: m.row_id === null ? t('xp_unlinked') : mRowText(m) }));
+      const head = { title: (T.title || '') + ' — ' + (c.d.name || '') + ' · ' + t('dw_rev_n', { rev: c.d.rev || 1 }),
+        date: n.getFullYear() + '-' + pad(n.getMonth() + 1) + '-' + pad(n.getDate()), scale: scaleEl.textContent,
+        draft: TenderDraft.isDraft(T.status) ? [TenderDraft.DRAFT_EN, TenderDraft.DRAFT_AR] : null };   // the Excel report's rule and words
+      const W = f.w, H = f.h + legendHeight(head, legend);
+      const k = Math.min(EXPORT_MAX_SIDE / Math.max(W, H), Math.sqrt(EXPORT_MAX_PIXELS / (W * H)));
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.floor(W * k)); cv.height = Math.max(1, Math.floor(H * k));
+      try {
+        const g = cv.getContext('2d');
+        if (!g) throw new Error(t('tv_export_too_big'));
+        await f.paint(g, k);
+        g.setTransform(k, 0, 0, k, 0, 0);
+        g.save(); g.beginPath(); g.rect(0, 0, f.w, f.h); g.clip();
+        const drawn = tools.drawSavedAt(g, f.toScreen);
+        g.restore();
+        drawLegend(g, f.h, W, head, legend, new Map(drawn.map(x => [x.no, x.colour])), document.dir === 'rtl');
+        const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
+        if (!blob) throw new Error(t('tv_export_too_big'));   // the browser could not encode a canvas this size
+        const name = pngName(T, c.d);
+        window.__tvExport = { width: cv.width, height: cv.height, w: f.w, h: f.h, k, legend, head, name, toPx: p => { const s = f.toScreen(p); return [s[0] * k, s[1] * k]; } };   // test hook
+        saveBlob(blob, name);
+      } finally { cv.width = 0; cv.height = 0; }
+    }
     showScale(); showBar(); showPreview();
-    return { bar, info: h('div', { class: 'tl-info' }, scaleEl, previewEl, warnEl, msgEl, vfBox, calBox, linkHost), tools, draw: ctx => tools.draw(ctx), destroy: () => tools.destroy() };
+    return { bar, info: h('div', { class: 'tl-info' }, scaleEl, previewEl, warnEl, msgEl, vfBox, calBox, linkHost), tools, draw: ctx => tools.draw(ctx), exportPng, destroy: () => tools.destroy() };
   }
 
   // drawing-level warnings, one line per code with how many and the first few entity handles
@@ -1650,9 +1761,15 @@
       dimsNote, msg, cb.el, h('div', { class: 'row' }, save, h('button', { id: 'lk-cancel', class: 'secondary', onclick: close }, t('cancel'))));
   }
 
+  // the measurement list's order (unlinked first, then the linked ones): its numbers 1..n, also on the viewer's badges and in
+  // the PNG legend; a measurement's qty and row as the list shows them (the legend uses the same text)
+  const listOrder = ms => [...ms.unlinked, ...ms.measurements];
+  const mQtyText = m => fin(m.qty) ? fmt2(m.qty) : '—';
+  const mRowText = m => [m.row_no, m.row_description].filter(Boolean).join(' — ') + ' (' + (m.row_unit || '—') + ')';
   // every measurement of the tender; unlinked first (after a re-import) with a row picker to relink. onChanged: refresh after
   // an edit (the tab's list and the viewer's overlays, in place); else the tab is drawn again
   function measurementList(ms, rows, editable, onChanged) {
+    const noOf = new Map(listOrder(ms).map((m, k) => [m.id, k + 1]));
     // a selection count: its stored per-block breakdown (summaries saved before it have { block, count } only)
     const selBlocks = m => {
       const bl = m.metric === 'count' && m.selection_summary && Array.isArray(m.selection_summary.blocks) ? m.selection_summary.blocks : [];
@@ -1689,7 +1806,7 @@
     const edit = m => editable && m.tool === 'manual' ? h('button', { class: 'small secondary m-edit', onclick: ev => {
       const old = document.getElementById('ed-row');
       if (old) old.remove();
-      const er = h('tr', { id: 'ed-row' }, h('td', { colspan: 9 }, editForm(m, () => er.remove())));
+      const er = h('tr', { id: 'ed-row' }, h('td', { colspan: 10 }, editForm(m, () => er.remove())));
       ev.target.closest('tr').after(er);
     } }, t('edit')) : null;
     function editForm(m, close) {
@@ -1755,13 +1872,14 @@
       return h('div', null, h('div', { class: 'row' }, rs, go), msg, cb.el);
     };
     const line = (m, last) => h('tr', { 'data-measurement': String(m.id), 'data-row': m.row_id === null ? null : String(m.row_id) },
-      h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m), calLine(m)),
-      h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, reviewed(m), ' ', edit(m), ' ', del(m)));
-    const heads = [t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
+      h('td', { class: 'num m-no' }, String(noOf.get(m.id))),
+      h('td', { class: 'm-lbl' }, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m), calLine(m)),
+      h('td', { class: 'num m-qty' }, mQtyText(m)), h('td', { class: 'm-unit' }, m.qty_unit || ''), h('td', null, flags(m)), h('td', { class: 'm-row' }, last(m)), h('td', null, reviewed(m), ' ', edit(m), ' ', del(m)));
+    const heads = ['#', t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
     return h('section', { class: 'card', id: 'dw-measurements' }, h('h2', null, t('measurements')),
       ms.unlinked.length ? [h('h3', { class: 'err' }, t('m_unlinked') + ' (' + ms.unlinked.length + ')'),
         h('div', { class: 'scroll' }, table(heads, ms.unlinked.map(m => line(m, relink)), { class: 'grid', id: 'dw-unlinked' }))] : null,
-      ms.measurements.length ? h('div', { class: 'scroll' }, table(heads, ms.measurements.map(m => line(m, x => h('span', { dir: 'auto' }, [x.row_no, x.row_description].filter(Boolean).join(' — ') + ' (' + (x.row_unit || '—') + ')'))), { class: 'grid' }))
+      ms.measurements.length ? h('div', { class: 'scroll' }, table(heads, ms.measurements.map(m => line(m, x => h('span', { dir: 'auto' }, mRowText(x)))), { class: 'grid' }))
         : !ms.unlinked.length ? h('p', { class: 'muted' }, t('m_none')) : null);
   }
 

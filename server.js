@@ -186,8 +186,10 @@ async function api(req, res, url) {
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8' };
 const PUB = path.join(__dirname, 'public');
 // server code the browser also runs, served from its one source file (never copied under public/): the manual take-off
-// formulas (UMD) behind the measuring tools' preview, and a measurement's formula text (the list and the Excel report)
-const SHARED = { '/lib/takeoff/manual.js': path.join(__dirname, 'lib', 'takeoff', 'manual.js'), '/lib/takeoff/formula.js': path.join(__dirname, 'lib', 'takeoff', 'formula.js') };
+// formulas (UMD) behind the measuring tools' preview, a measurement's formula text (the list and the Excel report) and a
+// tender's draft label (the reports and the drawing PNG export)
+const SHARED = { '/lib/takeoff/manual.js': path.join(__dirname, 'lib', 'takeoff', 'manual.js'), '/lib/takeoff/formula.js': path.join(__dirname, 'lib', 'takeoff', 'formula.js'),
+  '/lib/draft.js': path.join(__dirname, 'lib', 'draft.js') };
 function serveStatic(req, res, url) {
   let rel; try { rel = decodeURIComponent(url.pathname); } catch (e) { return send(res, 400, 'bad request'); }
   if (rel === '/') rel = '/index.html';
