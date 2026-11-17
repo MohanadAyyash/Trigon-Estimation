@@ -1018,6 +1018,9 @@ server.listen(0, async () => {
       { const [ax, ay] = await scr(400, 300), [bx, by] = await scr(560, 500); await page.mouse.move(ax, ay); await page.mouse.down(); await page.mouse.move(bx, by, { steps: 5 }); await page.mouse.up(); }
       await page.waitForFunction(() => window.__tvTools.tool() === 'calibrate');
       assert.ok((await page.textContent('#tl-msg')).includes('inside it'), 'region: calibrate inside it');
+      // its calibration points must lie inside it (the server refuses too)
+      await pick(300, 400); await pick(520, 400);
+      assert.ok((await page.textContent('#tl-msg')).includes('inside the region') && !(await page.$(DM + ' #cal-form')), 'points outside the region refused');
       await pick(420, 400); await pick(520, 400);
       await page.waitForSelector(DM + ' #cal-form');
       await page.fill('#cal-real', '2'); await page.click('#cal-save');
@@ -1048,10 +1051,52 @@ server.listen(0, async () => {
       assert.ok(tbl.includes(f2(beforeM)) && tbl.includes(f2(beforeM * 2)) && tbl.includes(f2(24)) && tbl.includes(f2(96)), 'before/after: ' + tbl);
       assert.strictEqual(await rowQty(rowM), beforeM, 'nothing changed before Apply');
       { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 're-calibration 409 logged'); errors.splice(i, 1); }
+      // R18: someone measures on the page between the review and Apply: Apply refuses, the fresh list is shown, nothing changed
+      const late = await ok(call('POST', `drawings/${pdfId}/measurements`, { tool: 'manual', row_id: rowM, geom: { tool: 'line', pts: [[100, 550], [200, 550]] } }, admin), 'measured meanwhile');
+      const withLate = await rowQty(rowM);
+      await page.click('#cal-apply');
+      await page.waitForSelector(DM + ' #cal-again');
+      assert.ok((await page.textContent('#cal-again')).includes('Review the changes again'), 'review again');
+      assert.strictEqual(await page.$$eval('#cal-changes tbody tr', x => x.length), 3, 'the fresh list has the new measurement');
+      assert.ok((await page.textContent('#cal-changes')).includes(f2(late.qty * 2)), 'with its before/after');
+      assert.strictEqual(await rowQty(rowM), withLate, 'nothing changed');
+      { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, 'stale apply 409 logged'); errors.splice(i, 1); }
       await page.click('#cal-apply');
       await page.waitForFunction(() => /Page: 1 pt = 0\.1 m/.test(document.querySelector('#tl-scale').textContent));
-      assert.ok(Math.abs(await rowQty(rowM) - beforeM * 2) < 1e-9 && Math.abs(await rowQty(rowA) - 96) < 1e-9, 'Apply changed the rows');
+      assert.ok(Math.abs(await rowQty(rowM) - withLate * 2) < 1e-9 && Math.abs(await rowQty(rowA) - 96) < 1e-9, 'Apply changed the rows');
+      await ok(call('DELETE', 'measurements/' + late.id, null, admin), 'tidy');
+      assert.ok(Math.abs(await rowQty(rowM) - beforeM * 2) < 1e-9, 'the reviewed measurements doubled');
+      await page.evaluate(() => window.__tvViewer.requestDraw()); await idleM();
+      // the scale label drawn on the page is in the user's language (the same words as the scale line)
+      assert.ok((await page.evaluate(() => window.__tvTools.overlayCals())).some(x => x === '1 pt = 0.1 m'), 'overlay scale label');
       assert.ok((await page.textContent(`${DM} #dw-measurements tr[data-row="${rowA}"] td.m-formula`)).includes('(0.1 m/pt)²'), 'list follows the new scale');
+      // rotated page 2 (/Rotate 90): a polyline clicked with the mouse; Shift locks it horizontal as displayed, which is
+      // exactly vertical on the page; the saved length is the page length × the scale
+      {
+        const p2id = db.prepare('SELECT id FROM drawings WHERE parent_id=?').get(pdfId).id;
+        await page.goto(`${origin}/#/tender/${mt}/drawings/${p2id}`);
+        await page.waitForSelector(`${DM} #tv-panel[data-drawing="${p2id}"] #tv-open`);
+        await openM();
+        await page.click('#tl-calibrate'); await pick(100, 100); await pick(200, 100);
+        await page.waitForSelector(DM + ' #cal-form'); await page.fill('#cal-real', '5'); await page.click('#cal-save');
+        await page.waitForFunction(() => /Page: 1 pt = 0\.05 m/.test(document.querySelector('#tl-scale').textContent));
+        await page.click('#tl-polyline');
+        await clickPage(300, 200);
+        { const [sx, sy] = await scr(300, 350); await page.keyboard.down('Shift'); await page.mouse.click(sx, sy + 3); await page.keyboard.up('Shift'); }
+        const rp = await page.evaluate(() => window.__tvTools.points());
+        assert.strictEqual(rp[1][0], rp[0][0], 'rotated page: Shift (horizontal on screen) keeps page x exactly: ' + JSON.stringify(rp));
+        assert.ok(Math.abs(rp[0][1] - 200) < 2 && Math.abs(rp[1][1] - 350) < 2, 'clicked where intended: ' + JSON.stringify(rp));
+        const rq = await expectQty();
+        await page.keyboard.press('Enter');
+        await page.waitForSelector(DM + ' #lk-form');
+        await page.selectOption('#lk-row', String(rowM)); await page.click('#lk-save');
+        await page.waitForFunction(() => /Saved:/.test((document.querySelector('#tl-msg') || {}).textContent || ''));
+        const saved = (await listed()).find(m => m.drawing_id === p2id);
+        assert.deepStrictEqual(saved.geom, { tool: 'polyline', pts: rp }, 'saved as drawn (unrotated page space)');
+        assert.strictEqual(saved.qty, rq, 'saved qty = preview'); assert.strictEqual(saved.qty, Math.abs(rp[1][1] - rp[0][1]) * 0.05, 'the page length × scale, whatever the rotation');
+        await ok(call('DELETE', 'measurements/' + saved.id, null, admin), 'tidy');
+        await page.click('#tv-close');
+      }
       // 10. screenshot (deviceScaleFactor 2): a shape being drawn over the saved ones
       if (process.env.MEASURE_SCREENSHOT) {
         const ctx2 = await browser.newContext({ viewport: { width: 1360, height: 1000 }, deviceScaleFactor: 2 });
@@ -1069,7 +1114,6 @@ server.listen(0, async () => {
         await ctx2.close();
       }
       // 8. approved: no tools; the scale, the overlays and the list still work
-      await page.click('#tv-close');
       // approved (a test shortcut: this tender has no priced rows to approve through the API; it takes the frozen price of
       // the tender approved above, so the tender page reads like any approved one)
       db.prepare("UPDATE tenders SET status='approved', frozen=(SELECT frozen FROM tenders WHERE id=?) WHERE id=?").run(full, mt);
@@ -1108,6 +1152,41 @@ server.listen(0, async () => {
       assert.ok((await page.textContent(`${D} #dw-measurements tr[data-measurement="${dm.id}"] td.m-formula`)).includes('length 5,000.00 mm × 0.001 m/mm = 5.00 m'), 'DXF formula');
       await page.click(`${D} #dw-measurements tr[data-measurement="${dm.id}"] .m-delete`);
       await page.waitForFunction(id => !document.querySelector(`#dw-measurements tr[data-measurement="${id}"]`), dm.id);
+      // R7 at georeferenced coordinates: vertices that Float32 cannot hold. The snap gives the exact vertex and the saved
+      // quantity is manualQty of the exact points
+      {
+        const A = [500000.123, 2700000.456], B = [500003.3561234, 2700004.7894321];
+        assert.notStrictEqual(A[0] + Math.fround(B[0] - A[0]), B[0], 'fixture: B is not exact in Float32 offsets');
+        assert.notStrictEqual(A[1] + Math.fround(B[1] - A[1]), B[1], 'fixture: B is not exact in Float32 offsets (y)');
+        const GEO = dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 6]]), ...dsec('ENTITIES', [[0, 'LWPOLYLINE'], [5, 'G1'], [8, 'GEO'], [90, 3], [70, 0],
+          [10, A[0]], [20, A[1]], [10, B[0]], [20, B[1]], [10, B[0] + 2.5], [20, B[1] - 1.25]])]);
+        const gu = await fetch(`${base}tenders/${dwg}/drawings?name=geo`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(GEO) });
+        assert.strictEqual(gu.status, 202);
+        const gid = (await gu.json()).id;
+        for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(gid).status === 'parsing';) {
+          if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
+        }
+        await ok(call('PUT', `drawings/${gid}/units`, { units: 'm' }, admin), 'geo units');
+        await page.goto(`${origin}/#/tender/${dwg}/drawings/${gid}`);
+        await page.waitForSelector(`${D} #tv-panel[data-drawing="${gid}"] #tv-open`);
+        await openViewer();
+        await page.click('#tl-polyline');
+        { const [sx, sy] = await at(...A); await page.mouse.move(sx + 3, sy - 2); await frame(); await page.mouse.click(sx + 3, sy - 2); }
+        { const [sx, sy] = await at(...B); await page.mouse.move(sx - 2, sy + 3); await frame();
+          assert.deepStrictEqual(await page.evaluate(() => window.__tvViewer.snapPoint()), { x: B[0], y: B[1], kind: 'end' }, 'snap marker on the exact vertex');
+          await page.mouse.dblclick(sx - 2, sy + 3); }
+        await page.waitForSelector(D + ' #lk-form');
+        assert.deepStrictEqual(await page.evaluate(() => window.__tvTools.geom()), { tool: 'polyline', pts: [A, B] }, 'exact georeferenced vertices');
+        await page.selectOption('#lk-row', String(kerbRowB)); await page.click('#lk-save');
+        await page.waitForFunction(() => /Saved:/.test((document.querySelector('#tl-msg') || {}).textContent || ''));
+        const gm = (await call('GET', `tenders/${dwg}/measurements`, null, admin)).j.measurements.find(m => m.drawing_id === gid);
+        assert.deepStrictEqual(gm.geom.pts, [A, B], 'saved exactly');
+        const TMn = require('./lib/takeoff/manual.js');
+        assert.strictEqual(gm.qty, TMn.manualQty({ tool: 'polyline', pts: [A, B] }, { scale: 1 }).qty, 'qty of the exact points');
+        await ok(call('DELETE', 'measurements/' + gm.id, null, admin), 'tidy');
+        await page.click('#tv-close');
+        db.prepare('DELETE FROM drawings WHERE id=?').run(gid);
+      }
       await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
     }
 

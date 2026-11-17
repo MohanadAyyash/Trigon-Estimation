@@ -1480,14 +1480,19 @@ server.listen(0, async () => {
       assert.strictEqual(calRows(P1).find(c => c.id === regA.id).region, '[100,100,300,300]');
       const n0 = calRows(P1).length;
       for (const rg of [[250, 250, 400, 400], [150, 150, 200, 200], [0, 0, 500, 500], [299, 0, 400, 101]]) {
-        const o = await call('POST', cpath(P1), { region: rg, p1: [0, 0], p2: [50, 0], real: 1, unit: 'm' }, qs);
+        const o = await call('POST', cpath(P1), { region: rg, p1: [rg[0], rg[1]], p2: [rg[0] + 40, rg[1]], real: 1, unit: 'm' }, qs);
         assert.strictEqual(o.s, 409, JSON.stringify(rg)); assert.match(o.j.error, /overlap/);
       }
       assert.strictEqual(calRows(P1).length, n0, 'nothing stored');
       r = await call('POST', cpath(P1), { region: [300, 100, 400, 300], p1: [300, 100], p2: [400, 100], real: 1, unit: 'm' }, qs);
       assert.strictEqual(r.s, 200, 'sharing an edge is fine');
       const regB = r.j.calibration;
-      assert.strictEqual((await call('POST', cpath(P1), { region: [400, 300, 500, 400], p1: [0, 0], p2: [50, 0], real: 1, unit: 'm' }, qs)).s, 200, 'sharing a corner is fine');
+      assert.strictEqual((await call('POST', cpath(P1), { region: [400, 300, 500, 400], p1: [400, 300], p2: [450, 300], real: 1, unit: 'm' }, qs)).s, 200, 'sharing a corner is fine');
+      // Task 6 fix: a region is calibrated by points inside it
+      for (const pts of [{ p1: [0, 0], p2: [450, 300] }, { p1: [400, 300], p2: [501, 300] }]) {
+        const x = await call('POST', cpath(P1), { region: [500, 500, 600, 600], ...pts, real: 1, unit: 'm' }, qs);
+        assert.strictEqual(x.s, 400, JSON.stringify(pts)); assert.match(x.j.error, /inside the region/);
+      }
       // the same rectangle again (corners in another order) replaces that region's calibration
       r = await call('POST', cpath(P1), { region: [100, 300, 300, 100], p1: [100, 100], p2: [300, 100], real: 4, unit: 'm' }, qs);
       assert.strictEqual(r.s, 200); assert.strictEqual(r.j.calibration.id, regA.id); assert.strictEqual(r.j.replaced, true); assert.strictEqual(r.j.calibration.scale, 0.02);
@@ -1535,7 +1540,7 @@ server.listen(0, async () => {
       {
         const mBefore = db.prepare('SELECT * FROM measurements WHERE id=?').get(fakeM), cBefore = calRows(P1);
         for (const apply of [undefined, true]) {
-          const y = await call('POST', cpath(P1), { region: [300, 100, 400, 300], p1: [300, 100], p2: [400, 100], real: 2, unit: 'm', ...(apply ? { apply } : {}) }, qs);
+          const y = await call('POST', cpath(P1), { region: [300, 100, 400, 300], p1: [300, 100], p2: [400, 100], real: 2, unit: 'm', ...(apply ? { apply, expect: [] } : {}) }, qs);
           assert.strictEqual(y.s, 409, 'apply ' + apply + ': ' + JSON.stringify(y.j)); assert.match(y.j.error, /recomputed/);
         }
         assert.deepStrictEqual(db.prepare('SELECT * FROM measurements WHERE id=?').get(fakeM), mBefore, 'measurement unchanged');
@@ -1674,7 +1679,7 @@ server.listen(0, async () => {
           const x = await call('POST', `drawings/${PO.id}/calibrations`, b, qs);
           assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, /outside the page/);
         }
-        const e = await call('POST', `drawings/${PO.id}/calibrations`, { p1: [405, 1158], p2: [2190, 3684], real: 5, unit: 'm', apply: true }, qs);
+        const e = await call('POST', `drawings/${PO.id}/calibrations`, { p1: [405, 1158], p2: [2190, 3684], real: 5, unit: 'm', apply: true, expect: [] }, qs);
         assert.strictEqual(e.s, 200, 'the bound edges are inside: ' + JSON.stringify(e.j));
         // leave the tender as the checks below expect it
         db.prepare('DELETE FROM calibrations WHERE drawing_id=?').run(PO.id); db.prepare('DELETE FROM drawings WHERE id=?').run(PO.id);
@@ -1770,7 +1775,28 @@ server.listen(0, async () => {
         { measurement_id: mArea.id, row_id: rM2, old_qty: mRow(mArea.id).qty, new_qty: at(area) },
         { measurement_id: mDed.id, row_id: rM, old_qty: -1, new_qty: at(dline, { deduct: true }) }]);
       assert.strictEqual(snap(), before, 'nothing changed without apply');
-      r = await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 10, unit: 'm', apply: true }, qs), 'apply');
+      // R18: apply carries the reviewed list; without it → 400
+      const expectOf = changes => changes.map(c => ({ measurement_id: c.measurement_id, new_qty: c.new_qty }));
+      const reviewedList = expectOf(r.j.changes), recal = { p1: [0, 0], p2: [100, 0], real: 10, unit: 'm' };
+      for (const [b, re] of [[{ ...recal, apply: true }, /needs expect/], [{ ...recal, expect: reviewedList }, /goes with apply/], [{ ...recal, apply: true, expect: [{ measurement_id: mPoly.id }] }, /new_qty/],
+        [{ ...recal, apply: true, expect: [...reviewedList, reviewedList[0]] }, /duplicate/], [{ ...recal, apply: true, expect: [{ ...reviewedList[0], x: 1 }] }, /unknown field/]]) {
+        const x = await call('POST', `drawings/${P1}/calibrations`, b, qs);
+        assert.strictEqual(x.s, 400, JSON.stringify(b)); assert.match(x.j.error, re);
+      }
+      assert.strictEqual(snap(), before, 'nothing changed by a refused apply');
+      // another measurement saved between the review and Apply: the reviewed list no longer matches → 409 with the fresh list
+      const mLate = await ok(measure(P1, { row_id: rM, geom: { tool: 'line', pts: [[0, 300], [0, 340]] } }), 'saved meanwhile');
+      const beforeLate = snap();
+      r = await call('POST', `drawings/${P1}/calibrations`, { ...recal, apply: true, expect: reviewedList }, qs);
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'the measured quantities changed: review the changes again');
+      assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), [mPoly.id, mArea.id, mDed.id, mLate.id], 'the fresh list');
+      assert.strictEqual(snap(), beforeLate, 'nothing changed');
+      // a changed qty (not only a changed set) is refused too
+      r = await call('POST', `drawings/${P1}/calibrations`, { ...recal, apply: true, expect: [...reviewedList, { measurement_id: mLate.id, new_qty: 5 }] }, qs);
+      assert.strictEqual(r.s, 409); assert.strictEqual(snap(), beforeLate, 'nothing changed');
+      await ok(call('DELETE', 'measurements/' + mLate.id, null, qs), 'tidy');
+      assert.strictEqual(snap(), before);
+      r = await ok(call('POST', `drawings/${P1}/calibrations`, { ...recal, apply: true, expect: reviewedList }, qs), 'apply');
       assert.strictEqual(r.changes.length, 3);
       near(mRow(mPoly.id).qty, 22, 'polyline doubled'); near(mRow(mPoly.id).base, 11, 'base doubled'); near(mRow(mArea.id).qty, 96, 'area × 4'); near(mRow(mDed.id).qty, -2, 'deduction doubled');
       near(qtyOf(rM), 20, 'row m updated'); near(qtyOf(rM2), 96, 'row m2 updated');
@@ -1784,7 +1810,7 @@ server.listen(0, async () => {
       assert.strictEqual(r.s, 409, JSON.stringify(r.j));
       assert.deepStrictEqual(r.j.changes, [{ measurement_id: mArea.id, row_id: rM2, old_qty: 96, new_qty: TM.manualQty(area, { scale: 0.025 }).qty }], 'only the area starts inside the region');
       assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM calibrations WHERE drawing_id=?').get(P1).n, 1, 'no region stored');
-      const reg = (await ok(call('POST', `drawings/${P1}/calibrations`, { ...regBody, apply: true }, qs), 'region apply')).calibration;
+      const reg = (await ok(call('POST', `drawings/${P1}/calibrations`, { ...regBody, apply: true, expect: expectOf(r.j.changes) }, qs), 'region apply')).calibration;
       assert.strictEqual(mRow(mArea.id).calibration_id, reg.id); near(mRow(mArea.id).qty, 6, 'area at 0.025'); near(qtyOf(rM2), 6, 'm2 row');
       assert.strictEqual(mRow(mPoly.id).calibration_id, pageCal.id, 'the polyline stays on the page calibration');
       // a new measurement starting in the region uses it

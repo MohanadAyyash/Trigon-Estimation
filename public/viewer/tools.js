@@ -55,7 +55,7 @@ const PALETTE = ['#d81b60', '#00897b', '#f57c00', '#3949ab', '#7cb342', '#8e24aa
 const DRAW = '#ff1744', CAL = '#00acc1', REGION = '#ffb300';
 
 function create(o) {
-  let tool = null, ring = [], outer = null, holes = [], done = null, shift = false, dead = false, drawn = [];
+  let tool = null, ring = [], outer = null, holes = [], done = null, shift = false, dead = false, drawn = [], drawnCals = [];
   const S = p => o.toScreen(p);
   const changed = () => { if (o.onChange) o.onChange(api); if (o.requestDraw) o.requestDraw(); };
   const samePt = (a, b) => {
@@ -168,7 +168,7 @@ function create(o) {
   function draw(ctx) {
     if (dead) return;
     const ov = o.overlay ? o.overlay() : {};
-    drawn = [];
+    drawn = []; drawnCals = [];
     ctx.save();
     (ov.saved || []).forEach((m, k) => {
       if (!m.geom) return;
@@ -183,6 +183,7 @@ function create(o) {
       ctx.beginPath(); path(ctx, [c.p1, c.p2], false); ctx.strokeStyle = CAL; ctx.lineWidth = 1.5; ctx.stroke();
       ctx.setLineDash([]);
       label(ctx, c.region ? [c.region[0], c.region[3]] : c.p2, c.text, c.region ? '#8a6100' : '#00707f');
+      drawnCals.push(c.text);
     }
     if (ov.region) {   // drawn, waiting for its calibration
       ctx.setLineDash([4, 3]); ctx.beginPath(); path(ctx, rectPts([ov.region[0], ov.region[1]], [ov.region[2], ov.region[3]]), true);
@@ -246,6 +247,7 @@ function create(o) {
     points: () => ring.map(p => p.slice()),
     pointCount: () => ring.length + (outer ? outer.length : 0) + holes.reduce((s, h) => s + h.length, 0),
     overlay: () => drawn.slice(),   // what the last frame drew of the saved measurements (test hook)
+    overlayCals: () => drawnCals.slice(),   // the scale labels it drew (test hook)
   };
   return api;
 }

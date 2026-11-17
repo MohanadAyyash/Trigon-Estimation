@@ -516,7 +516,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (q.qty_unit !== m.qty_unit || !(Math.abs(q.qty) <= MAX_QTY)) cannotRescale(m);
     return { qty: q.qty, base: q.base };
   }
-  const CAL_FIELDS = ['region', 'p1', 'p2', 'real', 'unit', 'apply'];
+  const CAL_FIELDS = ['region', 'p1', 'p2', 'real', 'unit', 'apply', 'expect'];
+  // R18: apply carries the change set the user reviewed, [{ measurement_id, new_qty }]; it is applied only when the server
+  // finds exactly that set (the same ids, each new_qty equal within 1e-9 relative), so a measurement saved or changed by
+  // someone else meanwhile is never rescaled unseen
+  function cleanExpect(b, apply) {
+    if (!apply) { if (b.expect !== undefined) bad('expect goes with apply: true'); return null; }
+    if (!Array.isArray(b.expect)) bad('apply needs expect: the reviewed changes [{ measurement_id, new_qty }]');
+    if (b.expect.length > 100000) bad('expect is too long');
+    const out = new Map();
+    for (const x of b.expect) {
+      if (!x || typeof x !== 'object' || Array.isArray(x)) bad('each expect entry must be { measurement_id, new_qty }');
+      for (const k of Object.keys(x)) if (k !== 'measurement_id' && k !== 'new_qty') bad('unknown field in expect: ' + k);
+      if (!Number.isInteger(x.measurement_id) || x.measurement_id <= 0) bad('expect measurement_id must be a measurement id');
+      if (!finNum(x.new_qty)) bad('expect new_qty must be a number');
+      if (out.has(x.measurement_id)) bad('duplicate measurement_id in expect');
+      out.set(x.measurement_id, x.new_qty);
+    }
+    return out;
+  }
+  const sameQty = (a, b) => a === b || Math.abs(a - b) <= 1e-9 * Math.max(Math.abs(a), Math.abs(b));
+  const reviewed = (expect, changes) => changes.length === expect.size && changes.every(c => expect.has(c.measurement_id) && sameQty(expect.get(c.measurement_id), c.new_qty));
   // the calibration routes apply to a PDF page or an image (a DXF has confirmed units instead)
   const rasterOnly = d => { if (d.kind !== 'pdf' && d.kind !== 'image') bad('calibration applies to PDF and image drawings only'); };
   const calibOf = (d, cidStr) => {
@@ -582,10 +602,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (d.status !== 'ready') bad('register the pages of this PDF first', 409);
     const b = await ctx.readBody(req);
     for (const k of Object.keys(b)) if (!CAL_FIELDS.includes(k)) bad('unknown field: ' + k);
-    const apply = optBool(b, 'apply');
+    const apply = optBool(b, 'apply'), expect = cleanExpect(b, apply);
     const region = b.region === undefined || b.region === null ? null : calc(() => calib.normRect(b.region));
     const scale = calc(() => calib.scaleOf(b.p1, b.p2, b.real, b.unit));
     if (!(scale > 0) || !Number.isFinite(scale)) bad('the calibration gives no usable scale');
+    // a region is calibrated by a known length inside it (edges included)
+    if (region !== null && ![b.p1, b.p2].every(p => p[0] >= region[0] && p[0] <= region[2] && p[1] >= region[1] && p[1] <= region[3])) bad('the calibration points must lie inside the region');
     onPage(d, [['p1', b.p1], ['p2', b.p2], ...(region === null ? [] : [['region', [region[0], region[1]]], ['region', [region[2], region[3]]]])]);
     const regionText = region === null ? null : JSON.stringify(region);
     const out = tx(() => {
@@ -603,7 +625,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         }
       }
       const changes = calibrationChanges(d, replaced, { region, scale });
-      if (changes.length && !apply) conflictBody({ error: 'calibration changes measured quantities', changes: changes.map(({ measurement_id, row_id, old_qty, new_qty }) => ({ measurement_id, row_id, old_qty, new_qty })) });
+      const listed = () => changes.map(({ measurement_id, row_id, old_qty, new_qty }) => ({ measurement_id, row_id, old_qty, new_qty }));
+      if (changes.length && !apply) conflictBody({ error: 'calibration changes measured quantities', changes: listed() });
+      if (apply && !reviewed(expect, changes)) conflictBody({ error: 'the measured quantities changed: review the changes again', changes: listed() });
       const now = new Date().toISOString(), [p1x, p1y] = b.p1, [p2x, p2y] = b.p2;
       let id;
       if (replaced) {

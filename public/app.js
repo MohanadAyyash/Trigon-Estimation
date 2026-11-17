@@ -1048,6 +1048,10 @@
         calForm(data, a);
         return true;
       }
+      if (region && ![data.p1, data.p2].every(q => q[0] >= region[0] && q[0] <= region[2] && q[1] >= region[1] && q[1] <= region[3])) {
+        say(t('cal_inside_region'), 'err small');   // the server refuses it too
+        return false;
+      }
       calForm(data, null);
       return true;
     }
@@ -1077,20 +1081,29 @@
       const changed = () => { gen++; msg.replaceChildren(); };
       real.addEventListener('input', changed); unit.addEventListener('change', changed);
       const close = () => { calBox.replaceChildren(); tools.clear(); };
-      const done = async res => {
+      // changed: the form was edited while the request was on its way; what the server stored is said, and that it was the earlier value
+      const done = async (res, changed) => {
         region = null; calBox.replaceChildren(); tools.cancel();
-        say(t('cal_done', { u: c.unit, s: fmtScale(res.calibration.scale), n: res.changes.length }));
+        say(t('cal_done', { u: c.unit, s: fmtScale(res.calibration.scale), n: res.changes.length }) + (changed ? ' ' + t('cal_changed_saved') : ''), changed ? 'warn small' : 'small');
         await reloadCals();
         if (res.changes.length) await c.refreshList();
       };
-      const changesTable = (changes, body) => {
+      // R18: Apply sends the list shown here; if the server finds another one (someone measured meanwhile), the fresh list
+      // is shown to be reviewed again and nothing changes
+      const changesTable = (changes, body, again) => {
         const ms = new Map(c.savedOf().map(m => [m.id, m])), rowName = id => { const r = c.rows.find(x => x.id === id); return r ? rowText(r) : '—'; };
         const apply = h('button', { id: 'cal-apply', onclick: async () => {
           apply.disabled = true;
-          try { await done(await api('POST', `drawings/${c.d.id}/calibrations`, { ...body, apply: true })); }
-          catch (e) { apply.disabled = false; msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message)); }
+          const g = gen, expect = changes.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty }));
+          try { await done(await api('POST', `drawings/${c.d.id}/calibrations`, { ...body, apply: true, expect }), g !== gen); }
+          catch (e) {
+            apply.disabled = false;
+            if (g !== gen) msg.replaceChildren(h('p', { class: 'warn' }, t('lk_changed_save_again')));
+            else if (e.status === 409 && e.body && Array.isArray(e.body.changes)) changesTable(e.body.changes, body, true);
+            else msg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + e.message));
+          }
         } }, t('cal_apply'));
-        msg.replaceChildren(h('p', { class: 'warn' }, t('cal_changes')),
+        msg.replaceChildren(...(again ? [h('p', { id: 'cal-again', class: 'err' }, t('cal_review_again'))] : []), h('p', { class: 'warn' }, t('cal_changes')),
           h('div', { class: 'scroll' }, table([t('m_label'), t('row'), t('cal_before'), t('cal_after'), t('unit')], changes.map(x => {
             const m = ms.get(x.measurement_id) || {};
             return h('tr', null, h('td', null, h('span', { dir: 'auto' }, m.label || '#' + x.measurement_id)), h('td', null, h('span', { dir: 'auto' }, x.row_id === null ? '—' : rowName(x.row_id))),
@@ -1107,12 +1120,12 @@
           if (isV) {
             const res = await api('POST', `drawings/${c.d.id}/calibrations/${cal.id}/verify`, body);
             vfBox.replaceChildren(h('p', { id: 'vf-result', class: 'small' }, t('vf_result') + ': ', h('span', { class: res.warning ? 'pct-warn' : 'pct-ok' }, fmtPct(res.pct)),
-              res.warning ? ' — ' + t('vf_warn') : ''));
+              res.warning ? ' — ' + t('vf_warn') : '', g !== gen ? ' ' + t('cal_changed_saved') : ''));
             calBox.replaceChildren(); tools.cancel();
             await reloadCals();
             return;
           }
-          await done(await api('POST', `drawings/${c.d.id}/calibrations`, body));
+          await done(await api('POST', `drawings/${c.d.id}/calibrations`, body), g !== gen);
         } catch (e) {
           save.disabled = false;
           if (g !== gen) msg.replaceChildren(h('p', { class: 'warn' }, t('lk_changed_save_again')));
@@ -1133,7 +1146,7 @@
       onNote: (k, n) => say(k === 'same_point' ? t('tl_same_point') : t('tl_need_points', { n }), 'warn small'),
       overlay: () => ({
         saved: c.savedOf().map(m => ({ id: m.id, geom: m.geom, color: m.color, text: (m.label ? m.label + ' · ' : '') + (m.metric === 'count' ? fmtQ(m.qty) : fmt2(m.qty)) + ' ' + (m.qty_unit || '') })),
-        cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: '1 ' + c.unit + ' = ' + fmtScale(x.scale) + ' m' })) : [],
+        cals: raster ? cals.map(x => ({ region: x.region, p1: x.p1, p2: x.p2, text: t('tl_scale_dxf', { u: c.unit, s: fmtScale(x.scale) }) })) : [],
         region,
       }),
       onChange: () => {
@@ -1367,7 +1380,9 @@
       const w = len ? numIn('ed-width', m.width) : null, dp = count ? null : numIn('ed-depth', m.depth), fac = numIn('ed-factor', m.factor === 1 ? null : m.factor);
       const deduct = h('input', { type: 'checkbox', id: 'ed-deduct', checked: !!m.deduct });
       const msg = h('div', { id: 'ed-msg' }), cb = confirmBoxes('ed-');
-      const clear = () => { cb.reset(); msg.replaceChildren(); };   // a confirmation belongs to the values it was given for
+      // gen: bumped by any change; a refusal of values sent before a change gets no confirm box (as the link form)
+      let gen = 0;
+      const clear = () => { gen++; cb.reset(); msg.replaceChildren(); };   // a confirmation belongs to the values it was given for
       for (const x of [rowSel, deduct]) x.addEventListener('change', clear);
       for (const x of [w, dp, fac, label]) if (x) x.addEventListener('input', clear);
       const save = h('button', { id: 'ed-save', onclick: async () => {
@@ -1385,8 +1400,14 @@
         if (deduct.checked !== !!m.deduct) b.deduct = deduct.checked;
         if (!Object.keys(b).length) { msg.replaceChildren(h('p', { class: 'muted' }, t('ed_nothing'))); return; }
         save.disabled = true;
+        const g = gen;
         try { await api('PUT', 'measurements/' + m.id, { ...b, ...cb.flags() }); }
-        catch (e) { save.disabled = false; linkRefusal(e, msg, cb.add); return; }
+        catch (e) {
+          save.disabled = false;
+          if (g !== gen) msg.replaceChildren(h('p', { class: 'warn', id: 'ed-changed' }, t('lk_changed_save_again')));
+          else linkRefusal(e, msg, cb.add);
+          return;
+        }
         flash(t('saved'), 'ok');
         close();
         if (onChanged) { try { await onChanged(); } catch (e) { fail(e); } } else rerender();
