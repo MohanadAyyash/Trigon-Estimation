@@ -13,9 +13,12 @@
 // onClick(world point, event, snap) with snap = the snap point at the click (TV.snap, exact true vertex) when Snap is on,
 // a left drag calls onDrag(world start, world end, event); nothing is selected. onDraw(ctx, viewer) is called each frame
 // after the drawing (ctx in CSS pixels) for overlays; requestDraw() schedules a frame; toScreen/toPage convert.
+// Previous version (batch 4 Task 4, display only): opts.under = another decoded display file (the version this one
+// replaces) drawn under the drawing in grey, in the same world coordinates, its own off/frozen layers hidden; it is never
+// hit, selected or snapped. setUnder(on) shows or hides it (opts.underOn: the start), underOn() tells.
 'use strict';
 (function () {
-const BG = '#1e1e1e', LIGHT = '#e0e0e0', SEL = '#ffa726', HI = '#26c6da', HOVER = 'rgba(255,255,255,0.45)', SNAP = '#00e676';
+const BG = '#1e1e1e', UNDER = '#6b6b6b', LIGHT = '#e0e0e0', SEL = '#ffa726', HI = '#26c6da', HOVER = 'rgba(255,255,255,0.45)', SNAP = '#00e676';
 const KIND_CLOSED = 1, KIND_INSERT = 2, KIND_TEXT = 3, KIND_NESTED = 5;
 const CLICK_PX = 5, SNAP_PX = 10, DRAG_PX = 3;
 
@@ -46,23 +49,26 @@ function create(canvas, R, opts) {
   let mode = 'select', toolOn = false, snapOn = false, mouse = null, moved = false, hover = -1, snapPt = null, band = null, drag = null;
   let baseDirty = true, raf = 0, dead = false;
   const base = document.createElement('canvas'), ctx = canvas.getContext('2d'), bctx = base.getContext('2d');
+  const U = o.under || null, GU = U ? TV.buildGrid(U) : null, underLayers = U ? Uint8Array.from(U.layers, l => l.off || l.frozen ? 0 : 1) : null;
+  let underOn = !!(U && o.underOn);
 
-  const isPoint = i => R.kind[i] === KIND_INSERT || R.kind[i] === KIND_NESTED || R.kind[i] === KIND_TEXT || R.count[i] === 1;
+  const isPoint = (i, X = R) => X.kind[i] === KIND_INSERT || X.kind[i] === KIND_NESTED || X.kind[i] === KIND_TEXT || X.count[i] === 1;
   const pos = e => { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
   // a drag released outside the canvas: the band stops at its edge (nothing off screen is selected)
   const clampPos = e => { const [x, y] = pos(e); return [Math.min(W, Math.max(0, x)), Math.min(H, Math.max(0, y))]; };
   const tol = px => px / V.scale;
 
-  // one entity's paths into the current path, in CSS pixels; a NaN pair starts a new subpath
-  function trace(c, i) {
-    const s = V.scale, ex = (R.eo[2 * i] - V.ox) * s + V.tx, ey = -(R.eo[2 * i + 1] - V.oy) * s + V.ty;
-    const p = R.pts, st = R.start[i], e = st + R.count[i];
-    if (isPoint(i)) {
-      const x = ex + p[2 * st] * s, y = ey - p[2 * st + 1] * s, r = R.kind[i] === KIND_TEXT ? 2 : 4;
+  // one entity's paths into the current path, in CSS pixels; a NaN pair starts a new subpath (X: the display file, R
+  // or the previous version's)
+  function trace(c, i, X = R) {
+    const s = V.scale, ex = (X.eo[2 * i] - V.ox) * s + V.tx, ey = -(X.eo[2 * i + 1] - V.oy) * s + V.ty;
+    const p = X.pts, st = X.start[i], e = st + X.count[i];
+    if (isPoint(i, X)) {
+      const x = ex + p[2 * st] * s, y = ey - p[2 * st + 1] * s, r = X.kind[i] === KIND_TEXT ? 2 : 4;
       c.moveTo(x - r, y); c.lineTo(x + r, y); c.moveTo(x, y - r); c.lineTo(x, y + r);
       return;
     }
-    const closed = R.kind[i] === KIND_CLOSED;
+    const closed = X.kind[i] === KIND_CLOSED;
     let m = 0;
     for (let k = st; k < e; k++) {
       const px = p[2 * k], py = p[2 * k + 1];
@@ -79,6 +85,12 @@ function create(canvas, R, opts) {
     bctx.fillStyle = BG; bctx.fillRect(0, 0, base.width, base.height);
     bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const a = TV.toWorld(V, 0, H), b = TV.toWorld(V, W, 0);
+    if (U && underOn) {   // the previous version first, in grey: the drawing is drawn over it
+      const uv = TV.visible(GU, U, [a[0], a[1], b[0], b[1]], underLayers);
+      bctx.beginPath();
+      for (let k = 0; k < uv.length; k++) trace(bctx, uv[k], U);
+      bctx.lineWidth = 1; bctx.lineJoin = 'round'; bctx.strokeStyle = UNDER; bctx.stroke();
+    }
     const vis = TV.visible(G, R, [a[0], a[1], b[0], b[1]], layerOn);
     // bucket by colour (a counting sort), one stroke per colour
     const cnt = new Uint32Array(slots.length + 1);
@@ -302,6 +314,8 @@ function create(canvas, R, opts) {
       return { n: nHi, layersOn };
     },
     highlightedHandles: () => Array.from(indices(hi), i => R.handles[i]),
+    setUnder(on) { underOn = !!(U && on); schedule(true); },
+    underOn: () => underOn,
     destroy,
   };
   return api;

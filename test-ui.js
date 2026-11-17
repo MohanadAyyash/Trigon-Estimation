@@ -733,6 +733,232 @@ server.listen(0, async () => {
       assert.strictEqual(db.prepare('SELECT units FROM drawings WHERE id=?').get(uid).units, 'm', 'nothing changed');
     }
 
+    // ---- batch 4 Task 4: a revised drawing: upload, units, before/after table, resolve, accept (R14 probe, stale table),
+    // previous versions, the comparison views, the review badge, the copied calibration (R15), read only ----------------
+    {
+      const took = (code, msg) => { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes(code)); assert.ok(i >= 0, msg); errors.splice(i, 1); };
+      const lineR = (hd, layer, x0, y0, x1, y1) => [[0, 'LINE'], [5, hd], [8, layer], [10, x0], [20, y0], [11, x1], [21, y1]];
+      const sqR = n => [[0, 0], [n, 0], [n, n], [0, n]];
+      // v1 (mm): KERB a 5 m line, ASPHALT a 10 m square (100 m2), EDGE E1 1 m + E2 2 m. v2: ASPHALT is PAVING, a 12 m square (144 m2)
+      const planR = v2 => dxf([...dsec('HEADER', [[9, '$INSUNITS'], [70, 4]]),
+        ...dsec('TABLES', [[0, 'TABLE'], [2, 'LAYER'], [70, 3], ...layerRec('KERB'), ...layerRec(v2 ? 'PAVING' : 'ASPHALT'), ...layerRec('EDGE'), [0, 'ENDTAB']]),
+        ...dsec('ENTITIES', [...lineR('RK', 'KERB', 0, 0, 3000, 4000), ...lwp('RA', sqR(v2 ? 12000 : 10000), v2 ? 'PAVING' : 'ASPHALT'),
+          ...lineR('E1', 'EDGE', 0, 0, 1000, 0), ...lineR('E2', 'EDGE', 0, 100, 2000, 100)])]);
+      const parsed = async did => { for (const t0 = Date.now(); db.prepare('SELECT status FROM drawings WHERE id=?').get(did).status === 'parsing';) {
+        if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20)); } };
+      const upDxf = async (tid, name, text) => {
+        const r = await fetch(`${base}tenders/${tid}/drawings?name=${name}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(text) });
+        assert.strictEqual(r.status, 202); const did = (await r.json()).id; await parsed(did); return did;
+      };
+      const rt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision' }, admin), 'revision tender')).id;
+      const rowE = (await ok(call('POST', `tenders/${rt}/rows`, { no: '1', description: 'Fake edging', unit: 'm' }, admin), 'row')).id;
+      const rowP = (await ok(call('POST', `tenders/${rt}/rows`, { no: '2', description: 'Fake paving', unit: 'm2' }, admin), 'row')).id;
+      const v1 = await upDxf(rt, 'plan', planR(false));
+      await ok(call('PUT', `drawings/${v1}/units`, { units: 'mm' }, admin), 'units');
+      const mA = await ok(call('POST', `drawings/${v1}/measurements`, { row_id: rowP, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'area', label: 'Fake asphalt area' }, admin), 'layer');
+      const mS = await ok(call('POST', `drawings/${v1}/measurements`, { row_id: rowE, tool: 'dxf_selection', metric: 'open_length', handles: ['E1', 'E2'], label: 'Fake edge selection' }, admin), 'selection');
+      const mD = await ok(call('POST', `drawings/${v1}/measurements`, { row_id: rowE, tool: 'manual', label: 'Fake drawn edge', confirm_overlap: true, geom: { tool: 'line', pts: [[0, 500], [0, 1500]] } }, admin), 'manual');
+      const DR = `#drawings[data-tender="${rt}"]`, rq = async r => (await call('GET', `tenders/${rt}/rows`, null, admin)).j.find(x => x.id === r).qty;
+      const rvRow = id => `${DR} #rv-table tr[data-measurement="${id}"]`;
+      const cellsOf = id => page.$$eval(rvRow(id) + ' td', cs => cs.slice(0, 8).map(c => c.textContent.trim()));
+      // 1. upload v2 through "Upload revised version": parsed, then its units pre-filled from v1; nothing compared before
+      await page.goto(`${origin}/#/tender/${rt}/drawings/${v1}`);
+      await page.waitForSelector(DR + ' #rv-upload');
+      await page.setInputFiles('#rv-file', { name: 'plan-b.dxf', mimeType: 'application/octet-stream', buffer: Buffer.from(planR(true)) });
+      await page.click('#rv-upload');
+      await page.waitForSelector(DR + ' #rv-units-confirm');
+      const v2 = db.prepare('SELECT id FROM drawings WHERE replaces_id=? AND pending=1').get(v1).id;
+      assert.strictEqual(await page.inputValue('#rv-unit-select'), 'mm', 'units pre-filled from the previous version');
+      assert.ok(await page.$(DR + ' .dw-pending-tag'), 'the list says a new version waits');
+      assert.strictEqual(await page.$(DR + ' #rv-table'), null, 'no table before the units are confirmed');
+      assert.ok(!(await page.$(DR + ' #tl-tools')), 'nothing is measured while a new version waits');
+      await page.click('#rv-units-confirm');
+      await page.waitForSelector(DR + ' #rv-table');
+      // the table: old, new, difference, status with its reason in words
+      assert.deepStrictEqual(await cellsOf(mA.id), ['Fake asphalt area', '2 — Fake paving', 'ASPHALT — area', 'blockedthe layer is not in the new version', f2(100), '—', '—', 'm2']);
+      assert.deepStrictEqual(await cellsOf(mS.id), ['Fake edge selection', '1 — Fake edging', 'selection (entities: 2)', 'unchanged', f2(3), f2(3), f2(0), 'm']);
+      assert.deepStrictEqual((await cellsOf(mD.id)).slice(3), ['checkdrawn by hand: check it on the new version', f2(1), f2(1), f2(0), 'm']);
+      assert.ok(await page.textContent('#rv-totals').then(x => x.includes('Fake paving')), 'row totals');
+      assert.ok(await page.isDisabled('#rv-accept'), 'Accept revision waits for every blocked item');
+      // relink: the dropdown of the server's choices (R12)
+      await page.selectOption(`#rv-res-${mA.id}`, 'relink');
+      assert.deepStrictEqual(await page.$$eval(`#rv-to-${mA.id} option`, o => o.map(x => x.textContent)), ['Choose the layer or block…', 'PAVING']);
+      assert.ok(await page.isDisabled('#rv-accept'), 'a relink needs its layer');
+      await page.selectOption(`#rv-to-${mA.id}`, '0');
+      assert.ok(await page.isEnabled('#rv-accept'));
+      // R14: the first Accept asks what the relink gives; nothing changes; its qty and checks are shown; a second click accepts
+      await page.click('#rv-accept');
+      await page.waitForSelector(DR + ' #rv-preview');
+      took('409 (Conflict)', 'probe 409 logged');
+      assert.strictEqual((await page.textContent(rvRow(mA.id) + ' td.rv-after')).trim(), f2(144), 'the resolved qty');
+      assert.strictEqual((await page.textContent(rvRow(mA.id) + ' td.rv-diff')).trim(), '+' + f2(44));
+      assert.ok(await page.$(rvRow(mA.id) + ' .rv-no-checks'), 'no checks fire');
+      assert.strictEqual(await rq(rowP), 100, 'nothing changed by the probe');
+      // the comparison views (deviceScaleFactor 2): the new version over the old one in grey
+      if (process.env.REVISION_SCREENSHOT) {
+        const ctx2 = await browser.newContext({ viewport: { width: 1360, height: 1000 }, deviceScaleFactor: 2 });
+        const [ck, cv] = admin.split('=');
+        await ctx2.addCookies([{ name: ck, value: cv, url: origin }]);
+        const p2 = await ctx2.newPage();
+        p2.on('console', m => { if (m.type() === 'error') errors.push(m.text()); }); p2.on('pageerror', e => errors.push(String(e)));
+        await p2.goto(`${origin}/#/tender/${rt}/drawings/${v1}`);
+        await p2.waitForSelector(DR + ' #rv-table');
+        await p2.selectOption(`#rv-res-${mA.id}`, 'relink'); await p2.selectOption(`#rv-to-${mA.id}`, '0');
+        await p2.click(DR + ' #tv-open'); await p2.waitForSelector(DR + ' #tv-canvas[data-ready="1"]');
+        await p2.evaluate(() => new Promise(f => requestAnimationFrame(() => requestAnimationFrame(f))));
+        await p2.evaluate(() => window.scrollTo(0, 0));   // boundingBox is in viewport coordinates: at the top they are the page's
+        const a = await p2.locator('#rv-panel').boundingBox(), b = await p2.locator('#tv-panel').boundingBox();
+        await p2.screenshot({ path: process.env.REVISION_SCREENSHOT, clip: { x: 0, y: a.y - 8, width: 1360, height: b.y + b.height - a.y + 16 }, fullPage: true });
+        await ctx2.close();
+      }
+      // DXF comparison while pending: the viewer shows v2, v1 in grey under it (toggle on)
+      await page.click(DR + ' #tv-open');
+      await page.waitForSelector(DR + ' #tv-canvas[data-ready="1"]');
+      assert.strictEqual(await page.getAttribute(DR + ' #tv-panel', 'data-drawing'), String(v2), 'the viewer shows the new version');
+      assert.ok(await page.isChecked('#tv-under'), 'the previous version is shown under it');
+      // the square's old edge (x = 10 m) is only in v1: grey with the toggle on, the background with it off
+      const greyAt = (x, y) => page.evaluate(([x, y]) => {
+        const v = window.__tvViewer, [sx, sy] = TV.toScreen(v.view(), x, y), d = window.devicePixelRatio || 1, g = v.canvas.getContext('2d');
+        const px = g.getImageData(Math.round(sx * d) - 2, Math.round(sy * d) - 2, 5, 5).data;
+        for (let k = 0; k < px.length; k += 4) if (Math.abs(px[k] - px[k + 1]) < 8 && Math.abs(px[k + 1] - px[k + 2]) < 8 && px[k] > 70 && px[k] < 140) return true;
+        return false;
+      }, [x, y]);
+      const frame2 = () => page.evaluate(() => new Promise(f => requestAnimationFrame(() => requestAnimationFrame(f))));
+      await frame2();
+      assert.strictEqual(await greyAt(10000, 6000), true, 'v1 drawn in grey');
+      await page.uncheck('#tv-under'); await frame2();
+      assert.strictEqual(await greyAt(10000, 6000), false, 'toggle off: v1 hidden');
+      await page.click('#tv-close');
+      // a stale accept: the table changed meanwhile (a label, and v2's units: other quantities) → 409, the fresh table
+      // with the new label, the resolutions to choose again, nothing changed
+      db.prepare('UPDATE measurements SET label=? WHERE id=?').run('Fake asphalt area renamed', mA.id);
+      await ok(call('PUT', `drawings/${v2}/units`, { units: 'cm' }, admin), 'units changed meanwhile');
+      await page.click('#rv-accept');
+      await page.waitForSelector(DR + ' #rv-again');
+      took('409 (Conflict)', 'stale accept 409 logged');
+      assert.strictEqual(await page.$(DR + ' #rv-preview'), null);
+      assert.deepStrictEqual((await cellsOf(mA.id)).slice(0, 1), ['Fake asphalt area renamed'], 'label refreshed');
+      assert.deepStrictEqual((await cellsOf(mS.id)).slice(3, 6), ['changed', f2(3), f2(30)], 'the fresh quantities');
+      assert.strictEqual(await page.inputValue(`#rv-res-${mA.id}`), '', 'resolutions chosen again on the fresh table');
+      assert.ok(await page.isDisabled('#rv-accept'));
+      assert.deepStrictEqual([await rq(rowP), await rq(rowE), db.prepare('SELECT replaced_by FROM drawings WHERE id=?').get(v1).replaced_by], [100, 4, null], 'nothing changed');
+      await ok(call('PUT', `drawings/${v2}/units`, { units: 'mm' }, admin), 'units back');
+      await page.reload();
+      await page.waitForSelector(DR + ' #rv-table');
+      await page.selectOption(`#rv-res-${mA.id}`, 'relink'); await page.selectOption(`#rv-to-${mA.id}`, '0');
+      await page.click('#rv-accept');
+      await page.waitForSelector(DR + ' #rv-preview');
+      took('409 (Conflict)', 'probe 409 logged');
+      const shown = (await page.textContent(rvRow(mA.id) + ' td.rv-after')).trim();
+      await page.click('#rv-accept');
+      // accepted: the page shows v2 (v1 under Previous versions); the rows hold the new quantities
+      await page.waitForSelector(DR + ' #dw-history');
+      assert.strictEqual(await page.getAttribute(DR + ' #tv-panel', 'data-drawing'), String(v2));
+      assert.strictEqual(f2(await rq(rowP)), shown, 'the take-off row qty is the accepted value');
+      assert.deepStrictEqual([await rq(rowP), await rq(rowE)], [144, 4]);
+      assert.strictEqual(db.prepare('SELECT replaced_by FROM drawings WHERE id=?').get(v1).replaced_by, v2);
+      // previous versions: v1 listed apart (read only), replaced by v2; the current list has v2 only
+      assert.deepStrictEqual(await page.$$eval(DR + ' #dw-history tbody tr', rs => rs.map(r => [r.dataset.drawing, ...[...r.cells].slice(0, 3).map(c => c.textContent.trim())])),
+        [[String(v1), 'plan', '1', 'plan']], 'Previous versions lists v1, replaced by v2');
+      assert.ok(await page.$(DR + ' #rv-upload'), 'v2 takes a revised version in turn');
+      // after accept: the version it replaced is offered under it, off at first
+      await page.click(DR + ' #tv-open');
+      await page.waitForSelector(DR + ' #tv-canvas[data-ready="1"]');
+      assert.strictEqual(await page.isChecked('#tv-under'), false, 'previous version off by default after accept');
+      await page.click('#tv-close');
+      // the drawn measurement carried over: a "check" badge, cleared by Mark reviewed
+      const mdRow = `${DR} #dw-measurements tr[data-measurement="${mD.id}"]`;
+      assert.strictEqual((await page.textContent(mdRow + ' .m-review')).trim(), 'check');
+      assert.strictEqual(await page.$(`${DR} #dw-measurements tr[data-measurement="${mS.id}"] .m-review`), null, 'DXF quantities need no check');
+      await page.click(mdRow + ' .m-reviewed');
+      await page.waitForFunction(s => !document.querySelector(s + ' .m-review'), mdRow);
+      assert.strictEqual(await page.$(mdRow + ' .m-reviewed'), null);
+      assert.strictEqual(db.prepare('SELECT review_needed FROM measurements WHERE id=?').get(mD.id).review_needed, 0);
+      // v1 opened from the list: read only, said so
+      await page.click(`${DR} #dw-history a[href$="/drawings/${v1}"]`);
+      await page.waitForSelector(DR + ' #dw-history-note');
+      for (const s of ['#rv-upload', '.lk-btn', '#dw-change-units', '#dw-confirm-units', '#rv-panel']) assert.strictEqual(await page.$(DR + ' ' + s), null, 'history: no ' + s);
+      assert.ok((await page.textContent(DR + ' #dw-history-note')).includes('Previous version (Rev 1)'));
+
+      // ---- PDF: v2 shown over v1 with an opacity slider (the pixel blend follows it); accept copies the calibration (R15) ----
+      const { buildPdf, makePdf, PDF_PAGES } = require('./test/fixtures/make-takeoff.js');
+      const RED = { x: 300, y: 500, w: 200, h: 150, rgb: [0.8, 0.2, 0.2] };
+      const pt2 = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision PDF' }, admin), 'pdf revision tender')).id;
+      const rowK = (await ok(call('POST', `tenders/${pt2}/rows`, { no: '1', description: 'Fake kerb', unit: 'm' }, admin), 'row')).id;
+      const pu = await fetch(`${base}tenders/${pt2}/drawings?name=sheet`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: makePdf() });
+      const [P1] = (await ok(call('POST', `drawings/${(await pu.json()).id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, admin), 'pages')).drawings.map(x => x.id);
+      await ok(call('POST', `drawings/${P1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, admin), 'calibrate');
+      const mK = await ok(call('POST', `drawings/${P1}/measurements`, { row_id: rowK, tool: 'manual', label: 'Fake drawn kerb', geom: { tool: 'line', pts: [[500, 600], [500, 700]] } }, admin), 'drawn');
+      const DQ = `#drawings[data-tender="${pt2}"]`;
+      await page.goto(`${origin}/#/tender/${pt2}/drawings/${P1}`);
+      await page.waitForSelector(DQ + ' #rv-upload');
+      await page.setInputFiles('#rv-file', { name: 'sheet-b.pdf', mimeType: 'application/pdf', buffer: buildPdf([{ box: [0, 0, 595, 842], rotate: 0, rect: RED }]) });
+      await page.click('#rv-upload');
+      // the browser reads the new pages, then the table: the drawn line is to be checked on the new page
+      await page.waitForSelector(DQ + ' #rv-table');
+      const np = db.prepare('SELECT id FROM drawings WHERE replaces_id=? AND pending=1').get(P1).id;
+      assert.deepStrictEqual((await page.$$eval(DQ + ' #rv-table tbody tr', rs => rs.map(r => r.dataset.status))), ['review']);
+      await page.waitForSelector(`${DQ} #tv-panel[data-drawing="${np}"] #tv-open`);
+      await page.click(DQ + ' #tv-open');
+      await page.waitForSelector(DQ + ' #tv-canvas[data-ready="1"]');
+      await page.locator('#tv-canvas').scrollIntoViewIfNeeded();
+      assert.strictEqual(await page.inputValue('#tv-under-mix'), '50', 'the slider starts half way');
+      const pixelQ = (x, y) => page.evaluate(([x, y]) => {
+        const e = window.__tvViewer, s = e.toScreen(x, y), d = window.devicePixelRatio || 1;
+        return Array.from(e.canvas.getContext('2d').getImageData(Math.floor(s[0] * d), Math.floor(s[1] * d), 1, 1).data);
+      }, [x, y]);
+      const mixTo = async v => { await page.$eval('#tv-under-mix', (e, v) => { e.value = v; e.dispatchEvent(new Event('input')); }, String(v)); await page.evaluate(() => window.__tvViewer.whenIdle()); };
+      const nearQ = (got, want, msg) => assert.ok(want.every((v, k) => Math.abs(got[k] - v) <= 4), msg + ': ' + JSON.stringify(got) + ' ≈ ' + JSON.stringify(want));
+      const red = [...RED.rgb.map(v => Math.round(v * 255)), 255], blue = [51, 102, 204, 255], white = [255, 255, 255, 255];
+      const mid = (a, b) => a.map((v, k) => Math.round((v + b[k]) / 2));
+      await mixTo(0);
+      nearQ(await pixelQ(400, 575), red, 'slider 0: the new page only (its red rectangle)'); nearQ(await pixelQ(200, 175), white, 'slider 0: no old rectangle');
+      await mixTo(100);
+      nearQ(await pixelQ(400, 575), white, 'slider 100: the previous page only'); nearQ(await pixelQ(200, 175), blue, 'slider 100: the old blue rectangle');
+      await mixTo(50);
+      nearQ(await pixelQ(400, 575), mid(red, white), 'slider 50: half and half'); nearQ(await pixelQ(200, 175), mid(white, blue), 'slider 50: half and half (old)');
+      assert.strictEqual((await page.textContent('#tv-under-pct')).trim(), '50 %');
+      await page.click('#tv-close');
+      // nothing blocked: Accept revision at once; the line moves to the new page with a copy of its calibration
+      assert.ok(await page.isEnabled('#rv-accept'));
+      await page.click('#rv-accept');
+      await page.waitForSelector(DQ + ' #dw-history');
+      await page.waitForSelector(`${DQ} #tv-panel[data-drawing="${np}"] #tv-open`);
+      assert.strictEqual(await page.$(DQ + ' #rv-table'), null, 'accepted');
+      assert.strictEqual(db.prepare('SELECT drawing_id FROM measurements WHERE id=?').get(mK.id).drawing_id, np);
+      await page.click(DQ + ' #tv-open');
+      await page.waitForSelector(DQ + ' #tv-canvas[data-ready="1"]');
+      assert.strictEqual(await page.inputValue('#tv-under-mix'), '0', 'after accept the previous page starts hidden');
+      assert.strictEqual((await page.textContent(DQ + ' #tl-scale .tl-copied')).trim(), 'copied from the previous version — verify', 'R15 in the scale line');
+      const mkRow = `${DQ} #dw-measurements tr[data-measurement="${mK.id}"]`;
+      assert.ok(await page.$(mkRow + ' .m-review'), 'check badge'); assert.ok(await page.$(mkRow + ' .tl-copied'), 'R15 in the list');
+      await page.click('#tv-close');
+
+      // ---- read only (an approved tender holding a pending version: older data): the table, no action ----
+      const ro = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision Read-only' }, admin), 'ro tender')).id;
+      const rowR = (await ok(call('POST', `tenders/${ro}/rows`, { no: '1', description: 'Fake paving', unit: 'm2' }, admin), 'row')).id;
+      const r1 = await upDxf(ro, 'plan', planR(false));
+      await ok(call('PUT', `drawings/${r1}/units`, { units: 'mm' }, admin), 'units');
+      const mR = await ok(call('POST', `drawings/${r1}/measurements`, { row_id: rowR, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'area' }, admin), 'layer');
+      const rr = await fetch(`${base}drawings/${r1}/replace?name=plan`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(planR(true)) });
+      const r2 = (await rr.json()).id; await parsed(r2);
+      await ok(call('PUT', `drawings/${r2}/units`, { units: 'mm' }, admin), 'units v2');
+      db.prepare("UPDATE tenders SET status='approved', frozen=(SELECT frozen FROM tenders WHERE id=?) WHERE id=?").run(full, ro);
+      const DO = `#drawings[data-tender="${ro}"]`;
+      await page.goto(`${origin}/#/tender/${ro}/drawings/${r1}`);
+      await page.waitForSelector(DO + ' #rv-table');
+      assert.strictEqual(await page.getAttribute(`${DO} #rv-table tr[data-measurement="${mR.id}"]`, 'data-status'), 'blocked', 'the table is shown');
+      for (const s of ['#rv-accept', '#rv-cancel', 'select.rv-res', '#rv-upload', '#rv-units-confirm', '.m-reviewed']) assert.strictEqual(await page.$(DO + ' ' + s), null, 'read only: no ' + s);
+
+      // Arabic: the table's words (status, reason, resolutions) in Arabic
+      await page.click('#lang-toggle'); await page.waitForFunction(() => document.dir === 'rtl');
+      await page.waitForSelector(DO + ' #rv-table');
+      const arRow = await page.textContent(`${DO} #rv-table tr[data-measurement="${mR.id}"]`);
+      assert.ok(arRow.includes(I18N.ar.rv_st_blocked) && arRow.includes(I18N.ar.rv_r_layer_missing), 'Arabic status and reason: ' + arRow);
+      await page.click('#lang-toggle'); await page.waitForFunction(() => document.dir === 'ltr');
+      await page.goto(`${origin}/#/tender/${dwg}/drawings`); await page.waitForSelector(D + ' #dw-layers[data-units="mm"]');
+    }
+
     // ---- PDF and image viewer (batch 3 Task 5): pages read by the browser, rendered by the vendored pdf.js ----------
     {
       const { makePdf, PDF_RECTS, makePng, makeOffsetPdf, OFFSET_RECT } = require('./test/fixtures/make-takeoff.js');

@@ -84,6 +84,9 @@ CREATE INDEX IF NOT EXISTS measurements_row ON measurements(row_id);
   p2x REAL NOT NULL, p2y REAL NOT NULL, real REAL NOT NULL, unit TEXT NOT NULL, scale REAL NOT NULL, verify_pct REAL, created TEXT, created_by TEXT);
 CREATE INDEX IF NOT EXISTS calibrations_drawing ON calibrations(drawing_id);
 CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) WHERE region IS NULL;`);
+  // R15: copied_from = the calibration of the previous version this one was copied from at accept (NULL: made on this
+  // page); verifying it or calibrating again on the new page clears it
+  if (!db.prepare('PRAGMA table_info(calibrations)').all().some(c => c.name === 'copied_from')) db.exec('ALTER TABLE calibrations ADD COLUMN copied_from INTEGER');
   // the calibration a manual measurement on a PDF page or an image was computed with (NULL on a DXF: its units)
   if (!db.prepare('PRAGMA table_info(measurements)').all().some(c => c.name === 'calibration_id')) db.exec('ALTER TABLE measurements ADD COLUMN calibration_id INTEGER');
   // tool 'manual' (lib/takeoff/manual.js): geom = the shape drawn, JSON { tool: line|polyline|area|rect|count, … } in
@@ -171,9 +174,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     }
     // calibrations in id order, so the lower-id rule between regions sharing an edge picks the same one in the copy
     const cmap = new Map();
-    const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
+    // copied_from (R15) points at the Rev's copy of the source (copied before it: a lower id); the flag is kept either way
+    const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,copied_from,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)');
     for (const c of db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? AND d.pending=0 ORDER BY c.id').all(oldTid))
-      cmap.set(c.id, Number(insC.run(dmap.get(c.drawing_id), c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.verify_pct, c.created, c.created_by).lastInsertRowid));
+      cmap.set(c.id, Number(insC.run(dmap.get(c.drawing_id), c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.verify_pct,
+        c.copied_from === null ? null : cmap.get(c.copied_from) ?? c.copied_from, c.created, c.created_by).lastInsertRowid));
     const insM = db.prepare(`INSERT INTO measurements(drawing_id,tender_id,row_id,tool,layer,block,metric,nested,width,depth,factor,label,color,qty,qty_unit,handles_count,review_needed,uom_confirmed,incomplete,duplicate,mixed,base,selection_summary,geom,deduct,calibration_id,created,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     const insH = db.prepare('INSERT INTO measurement_handles(measurement_id, handle, geom_key) SELECT ?, handle, geom_key FROM measurement_handles WHERE measurement_id=? ORDER BY rowid');
@@ -520,7 +525,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
 
   // ---- calibration (PDF pages and images): page and regions, verify -------------------------------------------
   const calView = c => ({ id: c.id, drawing_id: c.drawing_id, region: c.region === null ? null : JSON.parse(c.region), p1: [c.p1x, c.p1y], p2: [c.p2x, c.p2y],
-    real: c.real, unit: c.unit, scale: c.scale, verify_pct: c.verify_pct, created: c.created, created_by: c.created_by });
+    real: c.real, unit: c.unit, scale: c.scale, verify_pct: c.verify_pct, copied_from: c.copied_from, created: c.created, created_by: c.created_by });
   // the page calibration first, then the regions by id
   const calibrationsOf = drawingId => db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY region IS NOT NULL, id').all(drawingId).map(calView);
   // how many measurements were computed with this calibration (they stop its deletion)
@@ -629,7 +634,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         // region, a region inside it), as a measurement's first point would
         const cals = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(d.id), at = p => calib.calibrationFor(cals, p);
         if (![at(b.p1), at(b.p2)].every(x => x && x.id === c.id)) bad('both verify points must lie where this calibration applies (inside its region, or for the page outside every region)');
-        if (!db.prepare('UPDATE calibrations SET verify_pct=? WHERE id=? AND scale=?').run(pct, c.id, c.scale).changes) bad('the calibration changed: verify again', 409);
+        if (!db.prepare('UPDATE calibrations SET verify_pct=?, copied_from=NULL WHERE id=? AND scale=?').run(pct, c.id, c.scale).changes) bad('the calibration changed: verify again', 409);
         audit(me, 'calibration_verify', 'calibrations', c.id, { drawing_id: d.id, calibration_id: c.id, pct, warning });
       });
       return reply(res, 200, { pct, warning });
@@ -690,7 +695,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       const now = new Date().toISOString(), [p1x, p1y] = b.p1, [p2x, p2y] = b.p2;
       let id;
       if (replaced) {
-        db.prepare('UPDATE calibrations SET p1x=?, p1y=?, p2x=?, p2y=?, real=?, unit=?, scale=?, verify_pct=NULL, created=?, created_by=? WHERE id=?')
+        db.prepare('UPDATE calibrations SET p1x=?, p1y=?, p2x=?, p2y=?, real=?, unit=?, scale=?, verify_pct=NULL, copied_from=NULL, created=?, created_by=? WHERE id=?')
           .run(p1x, p1y, p2x, p2y, b.real, b.unit, scale, now, me.username, replaced.id);
         id = replaced.id;
       } else {
@@ -926,6 +931,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // table: another id set or qty (R18), unconfirmed checks, or the drawings changed while the comparison ran.
   const RESOLUTIONS = ['delete', 'relink', 'keep_matched', 'confirm'], CHECKS = ['incomplete', 'duplicate', 'mixed_blocks', 'overlap'];
   const REVIEW_AGAIN = 'the measured quantities changed: review the changes again';
+  // R14: a relink / keep_matched sent with new_qty null (its qty not known yet) is a probe, answered by a 409 of its own:
+  // `resolved` gives each resolution's qty and checks, which the user sees and then accepts with a second click
+  const PREVIEW = 'check what the chosen resolutions give, then accept again';
+  const isProbe = e => e.new_qty === null && (e.resolution === 'relink' || e.resolution === 'keep_matched');
   function cleanAccept(b) {
     for (const k of Object.keys(b)) if (k !== 'expect') bad('unknown field: ' + k);
     if (!Array.isArray(b.expect)) bad('accept needs expect: the reviewed table [{ measurement_id, new_qty, resolution?, to?, confirm? }]');
@@ -988,13 +997,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       const why = compare.resolutionError(it, expect.get(it.measurement_id));
       if (why) failBody(400, { error: `measurement ${it.measurement_id}: ${why}`, ...body });
     }
-    // PDF/image: the old pages' calibrations are copied to the page of the same number (to be verified there again)
+    // PDF/image: the old pages' calibrations are copied to the page of the same number (to be verified there again;
+    // copied_from: the source, R15)
     const cmap = new Map();
     if (nd.kind !== 'dxf') {
-      const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)');
+      const insC = db.prepare('INSERT INTO calibrations(drawing_id,region,p1x,p1y,p2x,p2y,real,unit,scale,verify_pct,copied_from,created,created_by) VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?)');
       for (const c of db.prepare('SELECT c.*, d.page AS on_page FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.id=? OR d.parent_id=? ORDER BY c.id').all(old.id, old.id)) {
         const np = newPages.get(c.on_page);
-        if (np) cmap.set(c.id, Number(insC.run(np.id, c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.created, c.created_by).lastInsertRowid));
+        if (np) cmap.set(c.id, Number(insC.run(np.id, c.region, c.p1x, c.p1y, c.p2x, c.p2y, c.real, c.unit, c.scale, c.id, c.created, c.created_by).lastInsertRowid));
       }
     }
     const set = (id, f) => { const ks = Object.keys(f); db.prepare(`UPDATE measurements SET ${ks.map(k => k + '=?').join(', ')} WHERE id=?`).run(...ks.map(k => f[k]), id); };
@@ -1057,9 +1067,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     const order = new Map(items.map((it, i) => [it.measurement_id, i]));
     resolved.sort((a, b) => order.get(a.measurement_id) - order.get(b.measurement_id));
     // 3. R18: every qty as reviewed, every check of a resolution confirmed (else 409: the tx rolls back)
-    if (items.some(it => { const e = expect.get(it.measurement_id); return e.resolution !== 'delete' && (e.new_qty === null || !sameQty(e.new_qty, qtyOf.get(it.measurement_id))); }))
-      conflictBody({ error: REVIEW_AGAIN, ...body, resolved });
-    if (checked.some(gt => gt.gates.some(g => !(gt.e.confirm || []).includes(g)))) conflictBody({ error: 'confirm the checks of the chosen resolutions', ...body, resolved });
+    // a table where only probes differ is a preview (R14); any other difference is a stale table
+    const differ = items.map(it => expect.get(it.measurement_id)).filter(e => e.resolution !== 'delete' && (e.new_qty === null || !sameQty(e.new_qty, qtyOf.get(e.measurement_id))));
+    if (differ.length) conflictBody(differ.every(isProbe) ? { error: PREVIEW, code: 'resolution_preview', ...body, resolved } : { error: REVIEW_AGAIN, ...body, resolved });
+    if (checked.some(gt => gt.gates.some(g => !(gt.e.confirm || []).includes(g)))) conflictBody({ error: 'confirm the checks of the chosen resolutions', code: 'confirm_checks', ...body, resolved });
     // 4. the rows (an imported row keeps its client qty; its measured total must not go below 0), then the drawings
     const rowQty = rows.map(r => ({ row_id: r, qty: recompute(r) }));
     db.prepare('UPDATE drawings SET pending=0 WHERE id=? OR parent_id=?').run(nd.id, nd.id);
@@ -1708,7 +1719,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
 
   function tenderMeasurements(t) {
     const all = db.prepare(`SELECT m.*, d.name AS drawing_name, d.kind AS drawing_kind, d.units AS drawing_units, r.no AS row_no, r.description AS row_description, r.unit AS row_unit,
-      c.region AS cal_region, c.scale AS cal_scale, c.verify_pct AS cal_verify_pct,
+      c.region AS cal_region, c.scale AS cal_scale, c.verify_pct AS cal_verify_pct, c.copied_from AS cal_copied_from,
       (SELECT COUNT(*) FROM calibrations c2 WHERE c2.drawing_id=c.drawing_id AND c2.region IS NOT NULL AND c2.id<=c.id) AS cal_region_no
       FROM measurements m JOIN drawings d ON d.id=m.drawing_id LEFT JOIN tender_rows r ON r.id=m.row_id LEFT JOIN calibrations c ON c.id=m.calibration_id WHERE m.tender_id=? ORDER BY m.id`).all(t.id);
     for (const x of all) {
@@ -1717,8 +1728,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       // which calibration a PDF/image quantity used (page or region n: the drawing's regions by id from 1, as the
       // browser's scale line numbers them) and its verify %
       x.calibration = x.calibration_id === null || x.cal_scale === null ? null
-        : { id: x.calibration_id, region: x.cal_region !== null, region_no: x.cal_region !== null ? x.cal_region_no : null, scale: x.cal_scale, verify_pct: x.cal_verify_pct };
-      delete x.cal_region; delete x.cal_scale; delete x.cal_verify_pct; delete x.cal_region_no;
+        : { id: x.calibration_id, region: x.cal_region !== null, region_no: x.cal_region !== null ? x.cal_region_no : null, scale: x.cal_scale, verify_pct: x.cal_verify_pct, copied_from: x.cal_copied_from };
+      delete x.cal_region; delete x.cal_scale; delete x.cal_verify_pct; delete x.cal_region_no; delete x.cal_copied_from;
       // a manual quantity's scale (metres per drawing/page unit), as the server used it: its calibration, or the DXF units
       x.scale = x.tool !== 'manual' || x.metric === 'count' ? null : x.calibration ? x.calibration.scale
         : x.drawing_kind === 'dxf' && hasUnit(x.drawing_units) ? UNIT_TO_M[x.drawing_units] : null;

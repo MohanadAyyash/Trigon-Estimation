@@ -523,12 +523,17 @@
     setTimeout(tick, delay);
   }
   // a finished parse never wipes what the user is typing: wait while a link form is open or a relink row is chosen
-  const formsBusy = () => !!document.querySelector('#lk-form, #cal-form, #ed-form') || [...document.querySelectorAll('select.rl-row')].some(x => x.value);
+  const formsBusy = () => !!document.querySelector('#lk-form, #cal-form, #ed-form') || [...document.querySelectorAll('select.rl-row, select.rv-res')].some(x => x.value);
   function whenFormsFree(tok, fn) {
     if (tok !== routeTok) return;
     if (formsBusy()) setTimeout(() => whenFormsFree(tok, fn), 1000); else fn();
   }
 
+  // the server's limits: 100 MB for DXF and PDF, 50 MB for PNG/JPEG (it decides by content; the name or type tells here)
+  const tooLarge = f => {
+    const isImage = /\.(png|jpe?g)$/i.test(f.name) || /^image\//.test(f.type || '');
+    return isImage && f.size > DW_MAX_IMAGE ? t('dw_too_large_image') : f.size > DW_MAX ? t('dw_too_large') : null;
+  };
   function uploadPanel(id) {
     const name = inp('dw-name', '', { maxlength: 200 }), file = h('input', { type: 'file', id: 'dw-file', accept: '.dxf,.pdf,.png,.jpg,.jpeg' });
     const msg = h('p', { id: 'dw-progress', class: 'muted' });
@@ -536,10 +541,8 @@
     const btn = h('button', { id: 'dw-upload', onclick: async () => {
       const f = file.files && file.files[0];
       if (!f) return say(t('dw_no_file'), 'err');
-      // the server's limits: 100 MB for DXF and PDF, 50 MB for PNG/JPEG (it decides by content; the name or type tells here)
-      const isImage = /\.(png|jpe?g)$/i.test(f.name) || /^image\//.test(f.type || '');
-      if (isImage && f.size > DW_MAX_IMAGE) return say(t('dw_too_large_image'), 'err');
-      if (f.size > DW_MAX) return say(t('dw_too_large'), 'err');
+      const big = tooLarge(f);
+      if (big) return say(big, 'err');
       const title = val(name) || f.name.replace(/\.(dxf|pdf|png|jpe?g)$/i, '');
       btn.disabled = true;
       say(t('dw_uploading', { mb: (f.size / 1048576).toFixed(1) }));
@@ -574,12 +577,22 @@
     const savedOf = did => [...msCur.measurements, ...msCur.unlinked].filter(m => m.drawing_id === did && m.tool === 'manual' && m.geom);
     if (!editable) box.append(h('p', { class: 'muted' }, canWrite() && T.status !== 'draft' ? t('dw_read_only_note') : t('read_only')));
     if (editable) box.append(uploadPanel(id));
-    const cur = list.find(d => d.id === focusId) || [...list].reverse().find(d => d.status === 'ready') || list[list.length - 1] || null;
-    box.append(card(t('dw_list'), list.length ? h('div', { class: 'scroll' }, table([t('dw_name'), t('dw_status'), t('dw_units'), t('dw_size_mb'), t('created')], list.map(d =>
-      h('tr', { class: cur && d.id === cur.id ? 'selected' : null }, h('td', null, h('a', { href: `#/tender/${id}/drawings/${d.id}`, dir: 'auto' }, d.name || '#' + d.id)),
+    // batch 4: a replaced drawing (replaced_by) is a previous version, listed apart and read only; a new version waiting to be
+    // accepted (pending) is not in the list, it is shown under the drawing it replaces (pending_replacement)
+    const byId = new Map(list.map(d => [d.id, d])), current = list.filter(d => d.replaced_by === null), history = list.filter(d => d.replaced_by !== null);
+    const link = d => h('a', { href: `#/tender/${id}/drawings/${d.id}`, dir: 'auto' }, d.name || '#' + d.id);
+    const cur = list.find(d => d.id === focusId) || [...current].reverse().find(d => d.status === 'ready') || current[current.length - 1] || null;
+    box.append(card(t('dw_list'), current.length ? h('div', { class: 'scroll' }, table([t('dw_name'), t('dw_status'), t('dw_units'), t('dw_size_mb'), t('created')], current.map(d =>
+      h('tr', { class: cur && d.id === cur.id ? 'selected' : null }, h('td', null, link(d), d.rev > 1 ? h('span', { class: 'tag' }, t('dw_rev_n', { rev: d.rev })) : null,
+        d.pending_replacement ? h('span', { class: 'tag warn-tag dw-pending-tag' }, t('dw_pending_tag')) : null),
         h('td', null, h('span', { class: 'tag' + (d.status === 'failed' ? ' bad' : d.status === 'ready' ? ' good' : '') }, dwStatusLabel(d.status))),
         h('td', null, d.units || '—'), h('td', { class: 'num' }, !fin(d.bytes) ? '—' : d.bytes < 10486 ? '< 0.01' : (d.bytes / 1048576).toFixed(2)),
         h('td', null, (fmtTime(d.created) || '') + (d.created_by ? ' · ' + d.created_by : '')))), { class: 'grid' })) : h('p', { class: 'muted' }, t('dw_none'))));
+    if (history.length) box.append(card(t('dw_history'), h('div', { class: 'scroll' }, table([t('dw_name'), t('dw_rev'), t('dw_replaced_by'), t('created')], history.map(d => {
+      const by = byId.get(d.replaced_by);
+      return h('tr', { class: cur && d.id === cur.id ? 'selected' : null, 'data-drawing': String(d.id) }, h('td', null, link(d)), h('td', { class: 'num' }, String(d.rev || 1)),
+        h('td', null, by ? link(by) : '—'), h('td', null, (fmtTime(d.created) || '') + (d.created_by ? ' · ' + d.created_by : '')));
+    }), { class: 'grid', id: 'dw-history' }))));
     for (const d of list.filter(x => x.status === 'parsing')) watchParse(d.id, () => rerender());
     // a PDF whose pages are not registered yet: this browser reads them (pdf.js) and tells the server, then the tab again.
     // A failure is shown (and not tried again until the page is reloaded).
@@ -590,11 +603,29 @@
       if (editable && pagesFailed.has(cur.id)) pagesFail(pagesFailed.get(cur.id));
       else pagesBox.append(h('p', { id: 'dw-pages-wait', class: 'muted' }, editable ? t('dws_pages') : t('dw_pages_later')));
     }
-    if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) box.append(rasterCard(cur, rows, editable, savedOf, refreshList));
+    // the drawing shown: a previous version is read only; while a new version of its file waits, nothing is measured on it
+    // and the viewer shows the new version over it; an accepted version can show the one it replaced
+    const top = cur && cur.parent_id !== null ? byId.get(cur.parent_id) || cur : cur;
+    const old = !!cur && cur.replaced_by !== null;
+    const pend = top && !old ? top.pending_replacement : null;
+    const dEdit = editable && !old && !pend;
+    const prev = cur && !pend && cur.replaces_id !== null ? byId.get(cur.replaces_id) || null : null;
+    if (old) { const by = byId.get(cur.replaced_by); box.append(h('div', { id: 'dw-history-note', class: 'banner banner-info' }, t('dw_history_note', { rev: cur.rev || 1 }), ' ', by ? link(by) : '—')); }
+    if (cur && cur.status === 'ready' && !old && top.status === 'ready') {
+      if (pend) box.append(await revisionPanel(top, pend, rows, msCur, editable));
+      else if (editable) box.append(revisionUpload(top));
+    }
+    if (cur && cur.status === 'ready' && (cur.kind === 'pdf' || cur.kind === 'image')) {
+      const np = pend ? cur.pending_replacement : null;   // the new version's page of the same number
+      if (pend && !np) box.append(h('p', { id: 'rv-page-gone', class: 'warn' }, t('rv_page_gone')));
+      box.append(np && np.status === 'ready' ? rasterCard(np, rows, false, savedOf, refreshList, { under: cur, mix: 0.5, show: true })
+        : rasterCard(cur, rows, dEdit, savedOf, refreshList, prev ? { under: prev, mix: 0 } : null));
+    }
     else if (cur && cur.status === 'pages') box.append(pagesBox);
     else if (cur && cur.status === 'ready') {
       // a drawing that cannot be shown (e.g. its parsed file is missing) stops only its own panel, never the tab
-      try { await drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf); }
+      const cmp = pend && pend.status === 'ready' ? { show: pend, under: cur, on: true } : prev ? { under: prev, on: false } : null;
+      try { await drawingPanel(box, cur, ms, rows, dEdit, refreshList, savedOf, cmp); }
       catch (e) { box.append(h('div', { id: 'dw-panel-error', class: 'banner banner-red' }, h('strong', null, t('dw_panel_failed')), ': ', e.message)); }
     }
     else if (cur && cur.status === 'failed') box.append(h('div', { class: 'banner banner-red' }, h('strong', null, t('dw_parse_failed')), ': ', cur.error || ''));
@@ -603,10 +634,221 @@
     body.append(box);
   }
 
-  async function drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf) {
+  // ---- a new version of a drawing (batch 4): upload it, compare before/after, resolve, accept or cancel ----------------
+  // top: the drawing's first row (a PDF's page 1: the whole file is replaced)
+  function revisionUpload(top) {
+    const file = h('input', { type: 'file', id: 'rv-file', accept: top.kind === 'dxf' ? '.dxf' : '.pdf,.png,.jpg,.jpeg' });
+    const msg = h('p', { id: 'rv-progress', class: 'muted small' });
+    const say = (text, cls) => { msg.className = cls || 'muted small'; msg.textContent = text; };
+    const btn = h('button', { id: 'rv-upload', class: 'secondary', onclick: async () => {
+      const f = file.files && file.files[0];
+      if (!f) return say(t('dw_no_file'), 'err');
+      const big = tooLarge(f);
+      if (big) return say(big, 'err');
+      btn.disabled = true;
+      say(t('dw_uploading', { mb: (f.size / 1048576).toFixed(1) }));
+      let r, j = null;
+      try {
+        r = await fetch(`/api/drawings/${top.id}/replace?name=${encodeURIComponent(top.name || f.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: f });
+        try { j = await r.json(); } catch (e) { j = null; }
+      } catch (e) { btn.disabled = false; return say(t('error') + ': ' + e.message, 'err'); }
+      if (r.status === 401) { me = null; return renderLogin(); }
+      if (!r.ok) { btn.disabled = false; return say(t('error') + ': ' + srvMsg((j && j.error) || r.statusText || String(r.status)), 'err'); }
+      rerender();
+    } }, t('rv_upload'));
+    return h('section', { class: 'card', id: 'rv-panel' }, h('h2', null, t('rv_upload'), ' — ', h('span', { dir: 'auto' }, top.name || '')),
+      h('p', { class: 'muted small' }, t('rv_upload_note')), h('div', { class: 'row wrap' }, file, btn), msg);
+  }
+
+  const rvStatus = s => ({ same: t('rv_st_same'), changed: t('rv_st_changed'), review: t('rv_st_review'), blocked: t('rv_st_blocked') })[s] || s;
+  const rvReason = r => ({ layer_missing: t('rv_r_layer_missing'), block_missing: t('rv_r_block_missing'), layer_empty: t('rv_r_layer_empty'), handles_missing: t('rv_r_handles_missing'),
+    geometry_changed: t('rv_r_geometry_changed'), confirm_needed: t('rv_r_confirm_needed'), off_page: t('rv_r_off_page'), cannot_recompute: t('rv_r_cannot_recompute'),
+    page_missing: t('rv_r_page_missing'), manual_check: t('rv_r_manual_check') })[r] || r;
+  const rvGate = g => ({ incomplete: t('rv_g_incomplete'), duplicate: t('rv_g_duplicate'), mixed_blocks: t('rv_g_mixed_blocks'), overlap: t('rv_g_overlap') })[g] || g;
+  // a relink target (R12): a layer name, or { layer, block }
+  const rvTarget = x => typeof x === 'string' ? h('span', { dir: 'auto' }, x) : [h('span', { dir: 'auto' }, x.layer), ' / ', h('span', { dir: 'auto' }, x.block)];
+  const rvTargetText = x => typeof x === 'string' ? x : x.layer + ' / ' + x.block;
+
+  // top: the drawing's first row; pend: its new version (GET compare). The table changes nothing: Accept revision sends
+  // it as reviewed (R18: expect, every item once). A relink or keep_matched is first sent without its qty (R14: the server
+  // answers with what it gives and the checks that fire, shown here); a second Accept revision sends those numbers and the
+  // ticked checks. Any other 409 is a stale table: the fresh one is shown and reviewed again.
+  async function revisionPanel(top, pend, rows, ms, editable) {
+    const tok = routeTok;
+    const sec = h('section', { class: 'card', id: 'rv-panel', 'data-drawing': String(pend.id) },
+      h('h2', null, t('rv_pending_title', { rev: pend.rev || 2 }), ' — ', h('span', { dir: 'auto' }, pend.name || '')));
+    const cancelBtn = editable ? h('button', { id: 'rv-cancel', class: 'danger', onclick: async () => {
+      if (!confirm(t('rv_cancel_confirm'))) return;
+      cancelBtn.disabled = true;
+      try { await api('DELETE', 'drawings/' + pend.id); flash(t('rv_cancelled'), 'ok'); rerender(); }
+      catch (e) { cancelBtn.disabled = false; fail(srvMsg(e.message)); }
+    } }, t('rv_cancel')) : null;
+    const tail = (...btns) => h('div', { class: 'row wrap rv-actions' }, ...btns, cancelBtn);
+    if (pend.status === 'parsing') {
+      watchParse(pend.id, () => rerender());
+      sec.append(h('p', { id: 'rv-wait', class: 'muted' }, t('rv_parsing')), tail());
+      return sec;
+    }
+    if (pend.status === 'pages') {
+      const pb = h('div', { id: 'rv-pages' });
+      const failed = msg => pb.replaceChildren(h('div', { id: 'rv-pages-error', class: 'banner banner-red' }, h('strong', null, t('dw_pages_failed')), ': ', msg, ' ', h('span', { class: 'small' }, t('dw_pages_retry'))));
+      if (editable && pagesFailed.has(pend.id)) failed(pagesFailed.get(pend.id));
+      else {
+        pb.append(h('p', { id: 'rv-wait', class: 'muted' }, editable ? t('rv_pages') : t('dw_pages_later')));
+        if (editable) readPages(pend, msg => { if (pb.isConnected) failed(msg); });
+      }
+      sec.append(pb, tail());
+      return sec;
+    }
+    let c;
+    try { c = await api('GET', `drawings/${pend.id}/compare`); }
+    catch (e) {
+      sec.append(h('div', { id: 'rv-error', class: 'banner banner-red' }, h('strong', null, t('rv_failed')), ': ', srvMsg(e.message)), tail());
+      return sec;
+    }
+    if (!c.ready) {
+      watchParse(pend.id, () => rerender());
+      sec.append(h('p', { id: 'rv-wait', class: 'muted' }, t('rv_parsing')), tail());
+      return sec;
+    }
+    // DXF: the new version's units, pre-filled from the previous version's; nothing is compared before they are confirmed
+    if (c.needs_units) {
+      const us = sel('rv-unit-select', c.old_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable });
+      const go = editable ? h('button', { id: 'rv-units-confirm', onclick: async ev => {
+        if (!us.value) return flash(t('dw_choose_units'));
+        ev.target.disabled = true;
+        try { await api('PUT', `drawings/${pend.id}/units`, { units: us.value }); rerender(); }
+        catch (e) { ev.target.disabled = false; fail(srvMsg(e.message)); }
+      } }, t('rv_units_confirm')) : null;
+      sec.append(h('p', { id: 'rv-units-note', class: 'warn' }, editable ? t('rv_units_note', { u: c.old_units || '—' }) : t('rv_units_wait')), h('div', { class: 'row wrap' }, us, go), tail());
+      return sec;
+    }
+
+    let items = c.items, totals = c.totals, newPages = c.new_pages || [], note = null, rowsNow = rows, msNow = ms;
+    const choice = new Map();     // measurement id -> { res, to: index in relink_choices ('' none yet) }
+    const previews = new Map();   // measurement id -> { key, new_qty, gates, ticks: Set } (R14: what the server said)
+    const keyOf = id => { const ch = choice.get(id); return ch ? ch.res + ':' + (ch.res === 'relink' ? ch.to : '') : ''; };
+    const previewOf = id => { const p = previews.get(id); return p && p.key === keyOf(id) ? p : null; };
+    const probes = res => res === 'relink' || res === 'keep_matched';
+    const tableBox = h('div', { id: 'rv-table-box' }), msgBox = h('div', { id: 'rv-msg' });
+    const acceptBtn = editable ? h('button', { id: 'rv-accept', onclick: () => accept() }, t('rv_accept')) : null;
+    const chosen = it => { const ch = choice.get(it.measurement_id); return !!ch && !!ch.res && (ch.res !== 'relink' || ch.to !== ''); };
+    const canAccept = () => items.every(it => it.status !== 'blocked' || chosen(it))
+      && items.every(it => { const p = previewOf(it.measurement_id); return !p || p.gates.every(g => p.ticks.has(g)); });
+    const refresh = () => { if (acceptBtn) acceptBtn.disabled = !canAccept(); };
+
+    function draw() {
+      const byM = new Map([...msNow.measurements, ...msNow.unlinked].map(m => [m.id, m]));
+      const rowName = rid => { const r = rowsNow.find(x => x.id === rid); return r ? rowText(r) : '—'; };
+      const q = (it, v) => fin(v) ? (it.qty_unit === 'nr' ? fmtQ(v) : fmt2(v)) : '—';
+      const src = it => {
+        const m = byM.get(it.measurement_id);
+        if (!m) return it.tool;
+        if (m.tool === 'dxf_layer') return [h('span', { dir: 'auto' }, m.layer), ' — ' + metricLabel(m.metric)];
+        if (m.tool === 'dxf_blocks') return [h('span', { dir: 'auto' }, m.layer), ' / ', h('span', { dir: 'auto' }, m.block)];
+        if (m.tool === 'dxf_selection') return t('m_selection', { n: m.handles_count || 0 });
+        return t('m_manual') + ': ' + toolName(m.geom && m.geom.tool);
+      };
+      const tr = it => {
+        const id = it.measurement_id, ch = choice.get(id), p = previewOf(id);
+        // after: the compared qty; a blocked item's once its resolution says it (delete 0; confirm its qty; relink and
+        // keep_matched what the server answered, R14)
+        const after = it.status !== 'blocked' ? it.new_qty : !ch ? null : ch.res === 'delete' ? 0 : ch.res === 'confirm' ? it.new_qty : p ? p.new_qty : null;
+        const diff = fin(after) && fin(it.old_qty) ? after - it.old_qty : null;
+        const counts = it.gate_counts ? Object.entries(it.gate_counts).map(([g, n]) => h('div', { class: 'small muted' }, t('rv_gate_count', { gate: rvGate(g), old: fmtQ(n.old), new: fmtQ(n.new) }))) : null;
+        const status = h('td', { class: 'rv-status' }, h('span', { class: 'tag ' + (it.status === 'blocked' ? 'bad' : it.status === 'review' ? 'warn-tag' : it.status === 'changed' ? '' : 'good') }, rvStatus(it.status)),
+          it.reason ? h('div', { class: 'small rv-reason' }, rvReason(it.reason)) : null,
+          Array.isArray(it.gates) && it.gates.length ? h('div', { class: 'small' }, it.gates.map(rvGate).join(' · ')) : null, counts);
+        let res = null;
+        if (it.status === 'blocked' && editable) {
+          const opts = [['', t('rv_o_choose')], ...it.options.map(o => [o, o === 'delete' ? t('rv_o_delete') : o === 'relink' ? t('rv_o_relink')
+            : o === 'keep_matched' ? t('rv_o_keep_matched', { qty: q(it, it.keep_matched_qty), unit: it.qty_unit || '' }) : o === 'confirm' ? t('rv_o_confirm') : o])];
+          const rs = sel('rv-res-' + id, ch ? ch.res : '', opts, { class: 'rv-res' });
+          rs.addEventListener('change', () => { if (rs.value) choice.set(id, { res: rs.value, to: '' }); else choice.delete(id); note = null; draw(); });
+          const to = ch && ch.res === 'relink' ? sel('rv-to-' + id, ch.to, [['', t('rv_to_choose')], ...(it.relink_choices || []).map((x, k) => [String(k), rvTargetText(x)])], { class: 'rv-to' }) : null;
+          if (to) to.addEventListener('change', () => { ch.to = to.value; note = null; draw(); });
+          // R14: the checks the server says the resolution brings, each to be ticked before Accept revision
+          const checks = p ? h('div', { class: 'rv-checks small' }, p.gates.length ? p.gates.map(g => h('label', { class: 'field check' }, h('span', null, t('rv_confirm_check', { check: rvGate(g) })),
+            h('input', { type: 'checkbox', id: `rv-chk-${id}-${g}`, checked: p.ticks.has(g), onchange: ev => { if (ev.target.checked) p.ticks.add(g); else p.ticks.delete(g); refresh(); } })))
+            : h('span', { class: 'muted rv-no-checks' }, t('rv_no_checks'))) : null;
+          res = [rs, to, checks];
+        } else if (it.status === 'blocked') res = h('span', { class: 'muted small' }, it.options.map(o => ({ delete: t('rv_o_delete'), relink: t('rv_o_relink'), keep_matched: t('rv_o_keep_matched', { qty: q(it, it.keep_matched_qty), unit: it.qty_unit || '' }), confirm: t('rv_o_confirm') })[o] || o).join(' / '));
+        else if (it.status === 'review') res = h('span', { class: 'muted small' }, t('rv_mark_after'));
+        return h('tr', { 'data-measurement': String(id), 'data-status': it.status, class: 'rv-' + it.status },
+          h('td', null, h('span', { dir: 'auto' }, it.label || (byM.get(id) || {}).label || '#' + id)), h('td', null, h('span', { dir: 'auto' }, it.row_id === null ? '—' : rowName(it.row_id))),
+          h('td', null, src(it)), status, h('td', { class: 'num rv-before' }, q(it, it.old_qty)),
+          h('td', { class: 'num rv-after' + (p ? ' rv-resolved' : '') }, ch && ch.res === 'delete' ? t('rv_deleted') : q(it, after)),
+          h('td', { class: 'num rv-diff' }, fin(diff) ? (diff > 0 ? '+' : '') + q(it, diff) : '—'), h('td', null, it.qty_unit || ''), h('td', { class: 'rv-res-cell' }, res));
+      };
+      const tots = (totals && totals.rows) || [];
+      tableBox.replaceChildren(...[
+        note === 'again' ? h('p', { id: 'rv-again', class: 'err' }, t('rv_again')) : note === 'preview' ? h('p', { id: 'rv-preview', class: 'warn' }, t('rv_preview')) : null,
+        h('p', { class: 'muted small' }, t('rv_intro')),
+        items.length ? h('div', { class: 'scroll' }, table([t('m_label'), t('row'), t('m_source'), t('rv_col_status'), t('cal_before'), t('cal_after'), t('rv_col_diff'), t('unit'), t('rv_col_resolution')],
+          items.map(tr), { class: 'grid rv-table', id: 'rv-table' })) : h('p', { id: 'rv-table', class: 'muted' }, t('rv_nothing_measured')),
+        tots.length ? [h('h3', null, t('rv_totals')), h('div', { class: 'scroll' }, table([t('row'), t('unit'), t('cal_before'), t('cal_after')], tots.map(x =>
+          h('tr', { 'data-row': String(x.row_id) }, h('td', null, h('span', { dir: 'auto' }, rowName(x.row_id))), h('td', null, x.qty_unit || ''),
+            h('td', { class: 'num' }, fmt2(x.old)), h('td', { class: 'num' }, fin(x.new) ? fmt2(x.new) : h('span', { class: 'muted', title: t('rv_total_blocked') }, '—')))), { class: 'grid', id: 'rv-totals' }))] : null,
+        newPages.length ? h('p', { id: 'rv-new-pages', class: 'small muted' }, t('rv_new_pages', { pages: newPages.join(', ') })) : null].flat().filter(Boolean));
+      refresh();
+    }
+
+    async function accept() {
+      const expect = items.map(it => {
+        const e = { measurement_id: it.measurement_id, new_qty: it.new_qty };
+        if (it.status !== 'blocked') return e;
+        const ch = choice.get(it.measurement_id), p = previewOf(it.measurement_id);
+        e.resolution = ch.res;
+        if (ch.res === 'delete') e.new_qty = null;
+        if (ch.res === 'relink') e.to = it.relink_choices[Number(ch.to)];
+        if (probes(ch.res)) { e.new_qty = p ? p.new_qty : null; if (p && p.gates.length) e.confirm = p.gates.filter(g => p.ticks.has(g)); }
+        return e;
+      });
+      acceptBtn.disabled = true;
+      msgBox.replaceChildren();
+      try {
+        await api('POST', `drawings/${pend.id}/accept`, { expect });
+        if (tok !== routeTok) return;
+        flash(t('rv_accepted'), 'ok');
+        const target = `#/tender/${pend.tender_id}/drawings/${pend.id}`;
+        if (location.hash === target) rerender(); else location.hash = target;
+      } catch (e) {
+        if (tok !== routeTok) return;
+        const b = e.body || {};
+        if (e.status === 409 && (b.code === 'resolution_preview' || b.code === 'confirm_checks') && Array.isArray(b.resolved) && Array.isArray(b.items)) {
+          // R14: what each relink / keep_matched gives and the checks it brings; nothing changed. The ticks given for a check
+          // still asked for stay.
+          for (const r of b.resolved) if (probes(r.resolution)) {
+            const was = previewOf(r.measurement_id);
+            previews.set(r.measurement_id, { key: keyOf(r.measurement_id), new_qty: r.new_qty, gates: r.gates, ticks: new Set(was ? [...was.ticks].filter(g => r.gates.includes(g)) : []) });
+          }
+          items = b.items; totals = b.totals; note = 'preview';
+          draw();
+        } else if (e.status === 409 && Array.isArray(b.items) && b.ready && !b.needs_units) {
+          // a stale table: the fresh one (labels and rows read again), every resolution chosen again
+          try { [rowsNow, msNow] = await Promise.all([api('GET', `tenders/${pend.tender_id}/rows`), api('GET', `tenders/${pend.tender_id}/measurements`)]); } catch (e2) { /* the last ones */ }
+          if (tok !== routeTok) return;
+          items = b.items; totals = b.totals; newPages = b.new_pages || []; choice.clear(); previews.clear(); note = 'again';
+          draw();
+        } else if (e.status === 409 && (b.needs_units || b.ready === false)) rerender();
+        else { refresh(); msgBox.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message))); }
+      }
+    }
+
+    draw();
+    sec.append(tableBox, msgBox, ...(editable ? [tail(acceptBtn)] : []));
+    return sec;
+  }
+
+  // cmp (batch 4): { show: a new version waiting, under: cur, on: true } shows the new version in the viewer over this one;
+  // { under: the version this one replaced, on: false } offers it under this one
+  async function drawingPanel(box, cur, ms, rows, editable, refreshList, savedOf, cmp) {
     const [d, lt] = await Promise.all([api('GET', 'drawings/' + cur.id), api('GET', `drawings/${cur.id}/layers`)]);
     const confirmed = lt.units_confirmed, measured = [...ms.measurements, ...ms.unlinked].some(m => m.drawing_id === d.id);
-    box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList, editable, savedOf));
+    if (cmp && cmp.show) {
+      const [nd, nlt] = await Promise.all([api('GET', 'drawings/' + cmp.show.id), api('GET', `drawings/${cmp.show.id}/layers`)]);
+      box.append(viewerCard(nd, nlt, rows, false, refreshList, false, savedOf, cmp));
+    } else box.append(viewerCard(d, lt, rows, editable && confirmed, refreshList, editable, savedOf, cmp));
     // units: the suggestion is pre-selected, nothing is computed until Confirm
     const unitSel = sel('dw-unit-select', d.units || d.suggested_units || '', [['', t('dw_choose_units')], ...DW_UNITS.map(u => [u, u])], { disabled: !editable });
     const ignored = Object.entries(d.ignored || {});
@@ -709,8 +951,16 @@
     } catch (e) { fail(e); }
   }
 
+  // the decoded display file of a DXF drawing (GET /render, gzip: the browser decodes it)
+  async function fetchRender(did) {
+    const r = await fetch(`/api/drawings/${did}/render`);
+    if (r.status === 401) { me = null; renderLogin(); throw Object.assign(new Error('signed out'), { status: 401 }); }
+    if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { j = null; } throw new Error((j && j.error) || r.statusText || String(r.status)); }
+    return TV.decodeRender(await r.arrayBuffer());
+  }
   // canLink: a selection can be linked (editable, units confirmed); editable: the measuring tools are shown
-  function viewerCard(d, lt, rows, canLink, refreshList, editable, savedOf) {
+  // cmp: { under: a drawing row, on } draws that version in grey under this one, with a toggle (display only)
+  function viewerCard(d, lt, rows, canLink, refreshList, editable, savedOf, cmp) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id) });
     const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
@@ -734,18 +984,18 @@
       const tok = routeTok;
       openBtn.disabled = true;
       sec.replaceChildren(title(), h('p', { class: 'muted', id: 'tv-loading' }, t('loading')));
-      let R;
+      let R, RU = null, underErr = null;
       try {
-        const r = await fetch(`/api/drawings/${d.id}/render`);   // gzip: the browser decodes it
-        if (r.status === 401) { me = null; renderLogin(); return; }
-        if (!r.ok) { let j = null; try { j = await r.json(); } catch (e) { j = null; } throw new Error((j && j.error) || r.statusText || String(r.status)); }
-        const ab = await r.arrayBuffer();
+        R = await fetchRender(d.id);
         if (tok !== routeTok) return;
-        R = TV.decodeRender(ab);
       } catch (e) {
-        if (tok !== routeTok) return;
+        if (tok !== routeTok || e.status === 401) return;
         return idle(errorBanner(e.message));
       }
+      // the other version: a failure leaves this one shown alone, and says why
+      if (cmp && cmp.under) { try { RU = await fetchRender(cmp.under.id); } catch (e) { if (e.status === 401) return; underErr = e.message; } }
+      if (tok !== routeTok) return;
+      const underCb = RU ? h('input', { type: 'checkbox', id: 'tv-under', checked: !!cmp.on, onchange: () => eng.setUnder(underCb.checked) }) : null;
       const canvas = h('canvas', { id: 'tv-canvas' });
       const layersBox = h('div', { class: 'tv-layer-list' });
       const cursor = h('span', { id: 'tv-cursor' }), selected = h('span', { id: 'tv-selected', 'data-n': '0' }), hover = h('span', { id: 'tv-hover' });
@@ -789,7 +1039,10 @@
           h('button', { id: 'tv-clear', class: 'small secondary', onclick: () => { eng.clear(); highlightTxt.textContent = ''; } }, t('tv_clear')),
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
           h('label', { class: 'tv-check' }, snapCb, ' ' + t('tv_snap')), linkBtn,
+          underCb ? h('label', { class: 'tv-check' }, underCb, ' ' + t('tv_under')) : null,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
+        h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_dxf')) : null,
+          underErr ? h('p', { id: 'tv-under-error', class: 'err small' }, t('tv_under_failed') + ': ' + underErr) : null),
         barBox,
         h('p', { class: 'muted small' }, t('tv_help'), editable ? ' ' + t('tl_help_dxf') : ''),
         h('div', { class: 'tv-body' },
@@ -824,13 +1077,15 @@
         notes.replaceChildren(...[dropped ? h('span', { class: 'tag warn-tag' }, t('dw_dropped', { n: dropped })) : null, noArea ? h('span', { class: 'tag warn-tag' }, t('dw_area_excluded', { n: noArea })) : null].filter(Boolean));
         for (const fn of selListeners) fn();
       };
-      const eng = TVCanvas.create(canvas, R, { alive: () => tok === routeTok, onSelect: showSel, onHover: showHover,
+      const eng = TVCanvas.create(canvas, R, { alive: () => tok === routeTok, onSelect: showSel, onHover: showHover, under: RU, underOn: !!(cmp && cmp.on),
         onCursor: w => { showCursor(w); cur = w; },
         // a measuring tool: the snap point when Snap is on (TV.snap: the exact true vertex, R7), else the cursor
         onClick: (w, e, snap) => { if (mp) mp.tools.pick(snap ? [snap.x, snap.y] : w, e); },
         onDrag: (a, b) => { if (mp) mp.tools.drag(a, b); },
         onDraw: ctx => { if (mp) mp.draw(ctx); } });
-      mp = measurePanel({ d, kind: 'dxf', unit: lt.units || '', editable, rows, savedOf: () => savedOf(d.id), refreshList, alive: () => tok === routeTok,
+      // the drawn measurements of both versions (while a new version waits they are still on the previous one)
+      const savedBoth = () => [...savedOf(d.id), ...(cmp && cmp.under ? savedOf(cmp.under.id) : [])];
+      mp = measurePanel({ d, kind: 'dxf', unit: lt.units || '', editable, rows, savedOf: savedBoth, refreshList, alive: () => tok === routeTok,
         dxfScale: () => f, cursor: () => { const sp = eng.snapPoint(); return sp ? [sp.x, sp.y] : cur; },
         eng: { canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
           setToolMode: on => { eng.setTool(on); if (on && !snapCb.checked) { snapCb.checked = true; eng.setSnap(true); } } } });
@@ -905,7 +1160,9 @@
   }
 
   // ---- PDF page / image viewer (public/viewer/raster.js): the page on a canvas, zoom and pan; display only ----
-  function rasterCard(d, rows, editable, savedOf, refreshList) {
+  // cmp: { under: the row of the other version's page, mix: 0..1, show: d is a new version waiting } shows that page
+  // blended with this one, with a slider (display only)
+  function rasterCard(d, rows, editable, savedOf, refreshList, cmp) {
     const sec = h('section', { class: 'card', id: 'tv-panel', 'data-drawing': String(d.id), 'data-kind': d.kind });
     const title = () => h('h2', null, t('tv_title'), ' — ', h('span', { dir: 'auto' }, d.name || ''));
     const openBtn = h('button', { id: 'tv-open', class: 'secondary', onclick: () => openViewer() }, t('tv_open'));
@@ -931,22 +1188,29 @@
       closeViewer();
       const tok = routeTok;
       openBtn.disabled = true;
-      // the calibrations and the server's unit table come with the drawing
-      const full = await api('GET', 'drawings/' + d.id);
+      // the calibrations and the server's unit table come with the drawing (a new version waiting has none yet: its scale
+      // line shows the previous page's, which accept copies)
+      const full = await api('GET', 'drawings/' + d.id), calsOf = cmp && cmp.show ? await api('GET', 'drawings/' + cmp.under.id) : full;
       if (tok !== routeTok) return;
       const wrap = h('div', { class: 'tv-canvas-wrap' }), cursor = h('span', { id: 'tv-cursor' });
       let mp = null, cur = null;   // the measuring tools; the cursor in page units
       const showCursor = p => { cursor.textContent = p ? iso('X ' + p[0].toFixed(2) + '  Y ' + p[1].toFixed(2) + ' ' + unit) : ''; };
       const barBox = h('div'), infoBox = h('div');
+      const u = cmp && cmp.under, mixIn = u ? h('input', { type: 'range', id: 'tv-under-mix', min: '0', max: '100', step: '1', value: String(Math.round((cmp.mix || 0) * 100)),
+        oninput: () => { eng.setUnderMix(Number(mixIn.value) / 100); mixOut.textContent = mixIn.value + ' %'; } }) : null;
+      const mixOut = h('span', { class: 'small num', id: 'tv-under-pct' }, u ? Math.round((cmp.mix || 0) * 100) + ' %' : '');
       sec.replaceChildren(title(), info,
         h('div', { class: 'row wrap tv-toolbar' },
           h('button', { id: 'tv-fit', class: 'small secondary', onclick: () => eng.fit() }, t('tv_fit')),
+          u ? h('label', { class: 'tv-check tv-mix' }, t('tv_under') + ' ', mixIn, ' ', mixOut) : null,
           h('button', { id: 'tv-close', class: 'small secondary', onclick: () => { closeViewer(); } }, t('tv_close'))),
+        h('div', null, cmp && cmp.show ? h('p', { id: 'tv-compare-note', class: 'small muted' }, t('tv_compare_raster')) : null),
         barBox,
         h('p', { class: 'muted small' }, t('tv_raster_help'), editable ? ' ' + t('tl_help_raster') : ''),
         h('p', { class: 'muted', id: 'tv-loading' }, t('loading')),
         wrap, h('div', { id: 'tv-status', class: 'tv-status small' }, cursor), infoBox);
       const eng = TVRaster.create(wrap, { kind: d.kind, url: `/api/drawings/${d.id}/file`, page: d.page, pageW: d.page_w, pageH: d.page_h, rotation: d.rotation,
+        under: u ? { kind: u.kind, url: `/api/drawings/${u.id}/file`, page: u.page, rotation: u.rotation } : null, underMix: u ? cmp.mix || 0 : 0,
         alive: () => tok === routeTok, onError: e => {   // a render failed: one banner, the latest reason
           if (!sec.isConnected) return;
           const b = errorBanner(why(e)), old = sec.querySelector('#tv-error');
@@ -959,8 +1223,8 @@
       eng.canvas.id = 'tv-canvas';
       window.__tvViewer = eng;   // test hook
       // no snap on a page; Shift keeps a segment horizontal or vertical; a tool takes the left button (pan: middle/right)
-      mp = measurePanel({ d: full, kind: d.kind, unit, editable, rows, savedOf: () => savedOf(d.id), refreshList, alive: () => tok === routeTok,
-        cals: full.calibrations || [], units: Object.keys(full.unit_to_m || {}), cursor: () => cur, axisLock: true,
+      mp = measurePanel({ d: full, kind: d.kind, unit, editable, rows, savedOf: () => [...savedOf(d.id), ...(u ? savedOf(u.id) : [])], refreshList, alive: () => tok === routeTok,
+        cals: calsOf.calibrations || [], units: Object.keys(full.unit_to_m || {}), cursor: () => cur, axisLock: true,
         eng: { canvas: eng.canvas, toScreen: p => eng.toScreen(p[0], p[1]), toPage: (x, y) => eng.toPage(x, y), requestDraw: () => eng.requestDraw(),
           setToolMode: on => eng.setPanOnLeft(!on) } });
       barBox.replaceWith(mp.bar || '');
@@ -1001,13 +1265,17 @@
     [/verify points must lie where this calibration applies/, () => t('vf_one_region')], [/deductions exceed the measured quantity/, () => t('se_deductions')],
     [/^apply needs expect/, () => t('se_apply_expect')], [/^the measured quantities changed: review the changes again$/, () => t('cal_review_again')],
     [/cannot be recomputed at the new scale/, () => t('se_rescale')], [/would be out of range: it must be at most/, () => t('se_rescale_range')],
-    [/kept changing while its quantities were recomputed/, () => t('se_units_retry')]];
+    [/kept changing while its quantities were recomputed/, () => t('se_units_retry')],
+    [/^(a replacement is pending|this drawing already has a pending replacement): accept or cancel it first$/, () => t('se_pending')],
+    [/^this drawing has been replaced by a newer version: it is kept as history only$/, () => t('se_replaced')], [/^could not total the selection/, () => t('se_sel_total')]];
   const srvMsg = m => { const g = geomMsg(m); if (g !== m) return g; for (const [re, f] of SERVER_MSG) if (re.test(m)) return f(); return m; };
   const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
   const fmtPct = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');
   // a calibration's verify %, in the warning colour above 1 %
   const verifiedTag = c => fin(c.verify_pct) ? h('span', { class: Math.abs(c.verify_pct) > 1 ? 'pct-warn' : 'pct-ok' }, t('tl_verified', { pct: fmtPct(c.verify_pct) }))
     : h('span', { class: 'muted' }, t('tl_not_verified'));
+  // R15: a calibration copied from the previous version at accept, until it is verified or replaced on this page
+  const copiedTag = c => c.copied_from !== null && c.copied_from !== undefined ? h('span', { class: 'tag warn-tag tl-copied' }, t('tl_copied')) : '';
   const MEASURE_TOOLS = ['line', 'polyline', 'area', 'rect', 'count'];
 
   // the before/after table of a change that rescales measured quantities (re-calibration, unit change): changes
@@ -1037,8 +1305,8 @@
     function showScale() {
       if (!raster) { const s = c.dxfScale(); scaleEl.replaceChildren(s ? t('tl_scale_dxf', { u: c.unit, s: fmtScale(s) }) : h('span', { class: 'warn' }, t('tl_units_none'))); return; }
       const page = cals.find(x => x.region === null), regs = cals.filter(x => x.region !== null);
-      scaleEl.replaceChildren(...(page ? [t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) }), ' · ', verifiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
-        ...regs.flatMap((x, k) => [' — ', t('tl_scale_region', { n: k + 1, u: c.unit, s: fmtScale(x.scale) }), ' · ', verifiedTag(x)]));
+      scaleEl.replaceChildren(...(page ? [t('tl_scale_page', { u: c.unit, s: fmtScale(page.scale) }), ' · ', verifiedTag(page), copiedTag(page)] : [h('span', { class: 'warn' }, t('tl_scale_none'))]),
+        ...regs.flatMap((x, k) => [' — ', t('tl_scale_region', { n: k + 1, u: c.unit, s: fmtScale(x.scale) }), ' · ', verifiedTag(x), copiedTag(x)]));
     }
     // { scale } or { reason }: as the server resolves it (modules/drawings.js createManual)
     const scaleAt = g => {
@@ -1404,7 +1672,7 @@
     // which calibration a drawn quantity used (page or region, and its verify %), or the DXF units
     const calLine = m => m.tool !== 'manual' || m.metric === 'count' ? null
       : m.calibration ? h('div', { class: 'small muted m-cal' }, !m.calibration.region ? t('m_cal_page') : fin(m.calibration.region_no) ? t('m_cal_region_n', { n: m.calibration.region_no }) : t('m_cal_region'),
-        ' · ', verifiedTag(m.calibration))
+        ' · ', verifiedTag(m.calibration), copiedTag(m.calibration))
       : m.drawing_kind === 'dxf' ? h('div', { class: 'small muted m-cal' }, t('m_cal_units', { u: m.drawing_units || '—' })) : null;
     const how = m => {
       if (m.tool === 'manual') return manualHow(m);
@@ -1418,7 +1686,14 @@
         + (fin(m.depth) ? ' × ' + t('f_depth') + ' ' + fmtQ(m.depth) : '') + (fin(f) && f !== 1 ? ' × ' + t('f_factor') + ' ' + fmtQ(f) : '') + tail;
     };
     const flags = m => [m.incomplete ? h('span', { class: 'tag bad' }, t('m_incomplete')) : null, m.duplicate ? h('span', { class: 'tag bad' }, t('m_duplicate')) : null, m.uom_confirmed ? h('span', { class: 'tag' }, t('m_uom_confirmed')) : null,
-      m.mixed ? h('span', { class: 'tag' }, t('m_mixed')) : null, m.deduct ? h('span', { class: 'tag' }, t('m_deduct')) : null];
+      m.mixed ? h('span', { class: 'tag' }, t('m_mixed')) : null, m.deduct ? h('span', { class: 'tag' }, t('m_deduct')) : null,
+      m.review_needed ? h('span', { class: 'tag warn-tag m-review', title: t('m_check_title') }, t('m_check')) : null];
+    // a drawn measurement carried to a new version of its drawing: checked there, then marked reviewed (clears the badge)
+    const reviewed = m => editable && m.review_needed ? h('button', { class: 'small m-reviewed', onclick: async ev => {
+      ev.target.disabled = true;
+      try { await api('POST', `measurements/${m.id}/reviewed`); if (onChanged) await onChanged(); else rerender(); }
+      catch (e) { ev.target.disabled = false; fail(srvMsg(e.message)); }
+    } }, t('m_mark_reviewed')) : null;
     // a drawn shape: label, row, width, depth, factor and deduction can change (its geometry cannot: delete and draw again)
     const edit = m => editable && m.tool === 'manual' ? h('button', { class: 'small secondary m-edit', onclick: ev => {
       const old = document.getElementById('ed-row');
@@ -1490,7 +1765,7 @@
     };
     const line = (m, last) => h('tr', { 'data-measurement': String(m.id), 'data-row': m.row_id === null ? null : String(m.row_id) },
       h('td', null, h('span', { dir: 'auto' }, m.label || '')), h('td', null, h('span', { dir: 'auto' }, m.drawing_name || '')), h('td', null, src(m)), h('td', { class: 'm-formula', dir: 'auto' }, how(m), calLine(m)),
-      h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, edit(m), ' ', del(m)));
+      h('td', { class: 'num' }, fin(m.qty) ? fmt2(m.qty) : '—'), h('td', null, m.qty_unit || ''), h('td', null, flags(m)), h('td', null, last(m)), h('td', null, reviewed(m), ' ', edit(m), ' ', del(m)));
     const heads = [t('m_label'), t('m_drawing'), t('m_source'), t('m_metric'), t('qty'), t('unit'), '', t('row'), ''];
     return h('section', { class: 'card', id: 'dw-measurements' }, h('h2', null, t('measurements')),
       ms.unlinked.length ? [h('h3', { class: 'err' }, t('m_unlinked') + ' (' + ms.unlinked.length + ')'),

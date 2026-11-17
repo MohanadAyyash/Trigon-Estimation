@@ -27,6 +27,14 @@
 //   engine.setPanOnLeft(on): false gives the left button to the tools (pan stays on the middle/right button)
 //   engine.whenIdle() -> Promise once no render is pending or running (tests)
 //
+// Previous version underneath (batch 4 Task 4, display only): opts.under = { kind, url, page, rotation } is another page
+// (the version this one replaces), its display top-left on this page's, at its own size. It is rendered once onto an
+// opaque white canvas (a PDF page whole at twice the fit resolution, an image as decoded; ≤ 16 MP) and blended with the
+// page: a canvas pixel is (1 − mix) · this page + mix · the previous one (drawn after the page at opacity mix, which is
+// the same blend as the page at 1 − mix over it). engine.setUnderMix(0..1), engine.underMix(); opts.underMix sets the
+// start (default 0: this page only). engine.ready waits for it; a failure to load it calls onError and leaves this page
+// shown alone.
+//
 // Rendering: a PDF is rendered by pdf.js (worker /vendor/pdfjs/pdf.worker.min.mjs). The whole page once at the fit
 // resolution, then the visible part at the current zoom 150 ms after the view stops changing (canvas ≤ 16 MP). A new
 // render cancels the one in flight; between renders the last bitmaps are drawn through the view transform, so zoom and
@@ -70,6 +78,7 @@ function create(container, opts) {
   const tasks = { base: null, detail: null };   // pdf.js render tasks in flight
   let timer = 0, busy = 0, idleWaiters = [];
   let drag = null, mouse = null;
+  let under = null, mix = Math.min(1, Math.max(0, Number(o.underMix) || 0));   // under: { c (opaque canvas), w, h (display size at scale 1) }
 
   // ---- load ----
   async function load() {
@@ -101,6 +110,45 @@ function create(container, opts) {
     } else throw new Error('unknown kind: ' + o.kind);
     fit();
     if (pg) renderBase();
+    schedule();
+  }
+
+  // an opaque white canvas of display size w × h at s device px per unit, drawn by paint(context)
+  const paper = (w, h, s) => {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.ceil(w * s)); c.height = Math.max(1, Math.ceil(h * s));
+    const g = c.getContext('2d');
+    g.fillStyle = PAGE; g.fillRect(0, 0, c.width, c.height);
+    return [c, g];
+  };
+  // the previous version's page, once
+  async function loadUnder() {
+    const u = o.under;
+    const ab = await fetchFile(u.url);
+    if (dead) return;
+    if (u.kind === 'image') {
+      const b = await createImageBitmap(new Blob([ab]));
+      if (dead) { b.close(); return; }
+      const [c, g] = paper(b.width, b.height, capScale(b.width, b.height, 1));
+      g.drawImage(b, 0, 0, c.width, c.height);
+      b.close();
+      under = { c, w: b.width, h: b.height };
+    } else if (u.kind === 'pdf') {
+      const m = await pdfjs();
+      if (dead) return;
+      const loading = m.getDocument({ data: new Uint8Array(ab), isEvalSupported: false });
+      try {
+        const d = await loading.promise;
+        if (dead) return;
+        const p = await d.getPage(u.page || 1);
+        const r = [0, 90, 180, 270].includes(u.rotation) ? u.rotation : p.rotate;
+        const vp1 = p.getViewport({ scale: 1, rotation: r }), s = capScale(vp1.width, vp1.height, Math.max(1, fitScale * dpr * 2));
+        const [c, g] = paper(vp1.width, vp1.height, s);
+        await p.render({ canvasContext: g, viewport: p.getViewport({ scale: s, rotation: r }) }).promise;
+        if (dead) return free(c);
+        under = { c, w: vp1.width, h: vp1.height };
+      } finally { loading.destroy(); }
+    } else throw new Error('unknown kind: ' + u.kind);
     schedule();
   }
 
@@ -184,6 +232,7 @@ function create(container, opts) {
       }
       if (base) blit(base);
       if (detail) blit(detail);
+      if (under && mix > 0) { ctx.globalAlpha = mix; ctx.drawImage(under.c, sx, sy, under.w * s, under.h * s); ctx.globalAlpha = 1; }
       ctx.lineWidth = 1; ctx.strokeStyle = EDGE; ctx.strokeRect(sx - 0.5, sy - 0.5, dw * s + 1, dh * s + 1);
       if (o.onDraw) o.onDraw(ctx, api);
     }
@@ -274,6 +323,7 @@ function create(container, opts) {
     for (const k of ['base', 'detail']) if (tasks[k]) { tasks[k].cancel(); tasks[k] = null; }
     if (doc) { doc.destroy(); doc = null; }   // the loading task: frees the document and its worker
     if (img) { img.close(); img = null; }
+    if (under) { free(under.c); under = null; }
     drop(base); drop(detail);
     base = detail = pg = null;
     canvas.removeEventListener('wheel', onWheel, { passive: false });
@@ -295,11 +345,14 @@ function create(container, opts) {
     fit, toPage, toScreen, destroy,
     requestDraw: schedule,
     setPanOnLeft(on) { panLeft = !!on; },
+    setUnderMix(v) { mix = Math.min(1, Math.max(0, Number(v) || 0)); schedule(); },
+    underMix: () => mix,
+    hasUnder: () => !!under,
     whenIdle: () => new Promise(f => { idleWaiters.push(f); settle(); }),
   };
   resize();
   // ready: the page is loaded and (for a PDF) the whole-page bitmap is drawn
-  api.ready = load().then(() => api.whenIdle()).then(() => { if (dead) throw new Error('viewer closed'); return api; });
+  api.ready = load().then(() => o.under && !dead ? loadUnder().catch(failed) : null).then(() => api.whenIdle()).then(() => { if (dead) throw new Error('viewer closed'); return api; });
   api.ready.catch(() => {});
   return api;
 }

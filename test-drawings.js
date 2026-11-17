@@ -1471,7 +1471,7 @@ server.listen(0, async () => {
       let r = await call('POST', cpath(P1), good, qs);
       assert.strictEqual(r.s, 200, JSON.stringify(r.j));
       const pageId = r.j.calibration.id;
-      assert.deepStrictEqual({ ...r.j.calibration, created: null }, { id: pageId, drawing_id: P1, region: null, p1: [0, 0], p2: [100, 0], real: 5, unit: 'm', scale: 0.05, verify_pct: null, created: null, created_by: 'qs1' });
+      assert.deepStrictEqual({ ...r.j.calibration, created: null }, { id: pageId, drawing_id: P1, region: null, p1: [0, 0], p2: [100, 0], real: 5, unit: 'm', scale: 0.05, verify_pct: null, copied_from: null, created: null, created_by: 'qs1' });
       assert.strictEqual(r.j.replaced, false); assert.deepStrictEqual(r.j.changes, []);
       g = await call('GET', cpath(P1), null, viewer);
       assert.deepStrictEqual(g.j.calibrations, [r.j.calibration]);
@@ -1746,7 +1746,7 @@ server.listen(0, async () => {
       // the list shows the geometry and which calibration was used
       const listed = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements.find(x => x.id === mPoly.id);
       assert.deepStrictEqual(listed.geom, poly);
-      assert.deepStrictEqual(listed.calibration, { id: pageCal.id, region: false, region_no: null, scale: 0.05, verify_pct: null });
+      assert.deepStrictEqual(listed.calibration, { id: pageCal.id, region: false, region_no: null, scale: 0.05, verify_pct: null, copied_from: null });
       // Task 6: the list carries the scale the quantity used and the drawing's kind/units (the formula "350 pt × 0.05 m/pt");
       // a drawing exposes the server's unit table, so the browser never keeps its own copy
       assert.deepStrictEqual([listed.scale, listed.drawing_kind, listed.drawing_units], [0.05, 'pdf', null]);
@@ -1843,7 +1843,7 @@ server.listen(0, async () => {
       assert.strictEqual(mRow(mPoly.id).calibration_id, pageCal.id, 'the polyline stays on the page calibration');
       // final review M3: the list says which region (numbered as the scale line: the drawing's regions by id, from 1)
       { const ls = (await ok(call('GET', `tenders/${T}/measurements`, null, viewer), 'list')).measurements;
-        assert.deepStrictEqual(ls.find(x => x.id === mArea.id).calibration, { id: reg.id, region: true, region_no: 1, scale: 0.025, verify_pct: null });
+        assert.deepStrictEqual(ls.find(x => x.id === mArea.id).calibration, { id: reg.id, region: true, region_no: 1, scale: 0.025, verify_pct: null, copied_from: null });
         assert.strictEqual(ls.find(x => x.id === mPoly.id).calibration.region_no, null); }
       // a new measurement starting in the region uses it
       const mRect = await ok(measure(P1, { row_id: rM2, geom: { tool: 'rect', p1: [160, 160], p2: [200, 180] } }), 'rect in region');
@@ -2188,6 +2188,8 @@ server.listen(0, async () => {
       const PENDING = 'a replacement is pending: accept or cancel it first', IS_PENDING = 'this drawing is a pending replacement: accept or cancel it first';
       // Task 3
       const REPLACED = 'this drawing has been replaced by a newer version: it is kept as history only', REVIEW = 'the measured quantities changed: review the changes again';
+      // batch 4 Task 4, R14: a relink / keep_matched sent with new_qty null is a probe: its own code and message
+      const PREVIEW = 'check what the chosen resolutions give, then accept again';
       const ACCEPT = (did, b, ck = qs) => call('POST', `drawings/${did}/accept`, b, ck);
       // the reviewed table: every item with the qty shown, plus the resolutions by measurement id
       const expOf = (items, o = {}) => items.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty, ...(o[x.measurement_id] || {}) }));
@@ -2539,7 +2541,8 @@ server.listen(0, async () => {
         assert.deepStrictEqual([m3.drawing_id, m3.qty, m3.review_needed], [NP, q3.qty, 1]);
         const calsNP = db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(NP);
         const strip = x => { const { id, drawing_id, ...rest } = x; return rest; };
-        assert.deepStrictEqual(calsNP.map(strip), calsP1.map(x => ({ ...strip(x), verify_pct: null })), 'the old page 1 calibrations are copied to the new page 1, to be verified there');
+        assert.ok(calsP1.every(x => x.copied_from === null), 'R15: a calibration made on its page is not a copy');
+        assert.deepStrictEqual(calsNP.map(strip), calsP1.map(x => ({ ...strip(x), verify_pct: null, copied_from: x.id })), 'the old page 1 calibrations are copied to the new page 1, to be verified there (R15: copied_from)');
         assert.strictEqual(m3.calibration_id, calsNP[calsP1.findIndex(x => x.id === q3.calibration_id)].id, 'calibration_id remapped to the copy');
         assert.deepStrictEqual(db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(P1).map(x => ({ ...x })), calsP1, 'the old page keeps its calibrations (history)');
         assert.deepStrictEqual([dRow(P1).replaced_by, dRow(P2).replaced_by, dRow(NP).pending], [NP, NP, 0]);
@@ -2555,6 +2558,17 @@ server.listen(0, async () => {
         assert.strictEqual((await fetch(base + `drawings/${P1}/file`, { headers: { cookie: viewer } })).status, 200, 'the old file is served');
         const onNew = await mOk({ row_id: rNr, tool: 'manual', geom: { tool: 'count', pts: [[OFFSET_PAGE.x0 + 5, OFFSET_PAGE.y0 + 5]] } }, NP);
         await ok(call('DELETE', `measurements/${onNew.id}`, null, qs), 'tidy');
+        // R15: both reads say where a copy came from, until it is verified or calibrated again on the new page
+        const pageCopy = calsNP.find(x => x.region === null), copiedOf = id => db.prepare('SELECT copied_from FROM calibrations WHERE id=?').get(id).copied_from;
+        assert.deepStrictEqual((await ok(call('GET', `drawings/${NP}/calibrations`, null, viewer), 'cals')).calibrations.map(x => [x.id, x.copied_from]), calsNP.map(x => [x.id, x.copied_from]));
+        assert.deepStrictEqual((await ok(call('GET', `drawings/${NP}`, null, viewer), 'drawing')).calibrations.map(x => x.copied_from), calsNP.map(x => x.copied_from));
+        assert.strictEqual(pageCopy.copied_from, cal1.id);
+        await ok(call('POST', `drawings/${NP}/calibrations/${pageCopy.id}/verify`, { p1: [500, 1200], p2: [600, 1200], real: 5, unit: 'm' }, qs), 'verify the copy');
+        assert.strictEqual(copiedOf(pageCopy.id), null, 'verified on the new page: no longer "copied"');
+        db.prepare('UPDATE calibrations SET copied_from=? WHERE id=?').run(cal1.id, pageCopy.id);
+        await ok(call('POST', `drawings/${NP}/calibrations`, { p1: [500, 1200], p2: [600, 1200], real: 5, unit: 'm' }, qs), 'calibrate the new page again (same scale: no change)');
+        assert.strictEqual(copiedOf(pageCopy.id), null, 'calibrated again: no longer "copied"');
+        db.prepare('UPDATE calibrations SET copied_from=? WHERE id=?').run(cal1.id, pageCopy.id);   // the Rev below keeps the flag
         r = await ACCEPT(NP, { expect: [] });
         assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'this drawing is not a pending replacement');
 
@@ -2617,10 +2631,17 @@ server.listen(0, async () => {
         }
         assert.strictEqual(snap(), s4, 'nothing changed');
         // relink / keep_matched whose qty is not known yet (null): 409 with the fresh table and what each resolution gives
-        r = await ACCEPT(N, { expect: expOf(c.items, { [mArea.id]: { resolution: 'relink', to: 'PAVING', new_qty: null }, [mSel.id]: { resolution: 'keep_matched', new_qty: null } }) });
-        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, REVIEW); assert.deepStrictEqual(r.j.items, c.items);
+        const probe = { [mArea.id]: { resolution: 'relink', to: 'PAVING', new_qty: null }, [mSel.id]: { resolution: 'keep_matched', new_qty: null } };
+        r = await ACCEPT(N, { expect: expOf(c.items, probe) });
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.deepStrictEqual([r.j.code, r.j.error], ['resolution_preview', PREVIEW], 'R14: the probe is not a stale table'); assert.deepStrictEqual(r.j.items, c.items);
         assert.deepStrictEqual(r.j.resolved, [{ measurement_id: mArea.id, resolution: 'relink', to: 'PAVING', new_qty: mArea.qty, gates: [] },
           { measurement_id: mSel.id, resolution: 'keep_matched', new_qty: items.get(mSel.id).keep_matched_qty, gates: [] }]);
+        // a probe sent with another qty that no longer matches is a stale table (REVIEW), not a preview
+        r = await ACCEPT(N, { expect: expOf(c.items, probe).map(x => x.measurement_id === mBlk.id ? { ...x, new_qty: 1 } : x) });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual([r.j.code, r.j.error], [undefined, REVIEW]);
+        // null on an item without relink / keep_matched is never a probe
+        r = await ACCEPT(N, { expect: expOf(c.items, { ...probe, [mBlk.id]: { new_qty: null } }) });
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual([r.j.code, r.j.error], [undefined, REVIEW]);
         const good = expOf(c.items, { [mArea.id]: { resolution: 'relink', to: 'PAVING', new_qty: mArea.qty }, [mSel.id]: { resolution: 'keep_matched', new_qty: items.get(mSel.id).keep_matched_qty } });
         // stale tables: a measurement left out, a qty that differs → 409, nothing changed
         r = await ACCEPT(N, { expect: good.slice(1) });
@@ -2712,6 +2733,11 @@ server.listen(0, async () => {
           assert.deepStrictEqual([cp[0].replaced_by, cp.find(x => x.id === map.get(N)).replaces_id], [map.get(N), map.get(D1)]);
           const cm = db.prepare('SELECT drawing_id, review_needed, label FROM measurements WHERE tender_id=? AND tool=? ORDER BY id').all(rv.id, 'manual').find(x => x.label === 'Fake drawn edge');
           assert.deepStrictEqual([cm.drawing_id, cm.review_needed], [map.get(N), 1]);
+          // R15: a copied calibration stays flagged in the Rev, pointing at the Rev's own copy of its source
+          const revCals = db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? ORDER BY c.id').all(rv.id);
+          const flagged = revCals.filter(x => x.copied_from !== null);
+          assert.ok(flagged.length >= 1, 'a copied calibration stays flagged in the Rev');
+          for (const x of flagged) assert.ok(revCals.some(y => y.id === x.copied_from), 'copied_from remapped into the Rev');
           // the copied old drawing is history in the Rev too
           r = await call('POST', `drawings/${map.get(D1)}/measurements`, { row_id: [...db.prepare('SELECT id FROM tender_rows WHERE tender_id=?').all(rv.id)][0].id, tool: 'manual', geom: { tool: 'line', pts: [[0, 0], [0, 5]] } }, qs);
           assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, REPLACED);
@@ -2745,6 +2771,35 @@ server.listen(0, async () => {
         assert.strictEqual(audits('replace_accept').length, nAcc2);
         assert.strictEqual(mK.qty, 5);
         await ok(call('DELETE', `tenders/${TN}`, null, qs), 'tidy');
+      }
+
+      // Task 4 (Task 3 carry-over): a PDF accept that fails after the calibrations were copied leaves no copy behind. The
+      // imported row (client 50 m) has a 5 m line that is off the new page (deleted) and a −4 m deduction that is kept → −4
+      {
+        const { writeXlsx } = require('./lib/xlsx.js');
+        const TP = (await ok(call('POST', 'tenders', { title: 'Test Revisions PDF Rollback', kind: 'rta' }, qs), 'tender')).id;
+        const BOQ = { file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', 'Fake imported kerb', 'm', 50]] }]).toString('base64'),
+          sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } };
+        await ok(call('POST', `tenders/${TP}/import`, BOQ, qs), 'import');
+        const rI = (await ok(call('GET', `tenders/${TP}/rows`, null, viewer), 'rows')).find(x => x.description === 'Fake imported kerb').id;
+        const pu = await upload(TP, 'Fake sheets R', makePdf(), qs);
+        const [Q1] = (await ok(call('POST', `drawings/${pu.j.id}/pages`, { pages: PDF_PAGES.map(p => ({ ...p })) }, qs), 'pages')).drawings.map(x => x.id);
+        await ok(call('POST', `drawings/${Q1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'calibrate');
+        const off = await mOk({ row_id: rI, tool: 'manual', geom: { tool: 'line', pts: [[10, 10], [10, 110]] } }, Q1);   // 5 m, off the new page
+        await mOk({ row_id: rI, tool: 'manual', deduct: true, geom: { tool: 'line', pts: [[500, 1200], [500, 1280]] } }, Q1);   // −4 m, on both pages
+        const nq = (await replace(Q1, 'Fake sheets R2', makeOffsetPdf())).j.id;
+        await ok(call('POST', `drawings/${nq}/pages`, { pages: [{ ...OFFSET_PAGE }] }, qs), 'pages of v2');
+        const pc = await ok(call('GET', `drawings/${nq}/compare`, null, viewer), 'compare');
+        assert.deepStrictEqual(pc.items.map(x => [x.status, x.reason]), [['blocked', 'off_page'], ['review', 'manual_check']]);
+        const allOf = () => JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TP), db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TP),
+          db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY id').all(TP), db.prepare('SELECT * FROM calibrations ORDER BY id').all()]);
+        const sP = allOf(), nAcc3 = audits('replace_accept').length;
+        r = await ACCEPT(nq, { expect: expOf(pc.items, { [off.id]: { resolution: 'delete', new_qty: null } }) });
+        assert.strictEqual(r.s, 400, JSON.stringify(r.j)); assert.match(r.j.error, /deductions exceed/);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM calibrations WHERE drawing_id=?').get(nq).n, 0, 'no calibration copy left on the new page');
+        assert.strictEqual(allOf(), sP, 'rolled back: measurements, drawings, rows and calibrations');
+        assert.strictEqual(audits('replace_accept').length, nAcc3);
+        await ok(call('DELETE', `tenders/${TP}`, null, qs), 'tidy');
       }
 
       // Task 3: R11 and the gates of a resolution (R7). v1: ASPHALT and PAVING areas, EDGE E1 + E2, TWIN two identical lines.
@@ -2781,19 +2836,20 @@ server.listen(0, async () => {
         const base3 = { [gX.id]: { resolution: 'delete', new_qty: null }, [gW.id]: { resolution: 'confirm' } };
         // the gates of a resolution: relink to ASPH2 brings its duplicate; keep_matched E2 overlaps gS2 on the row
         r = await ACCEPT(g2, { expect: expOf(gc.items, { ...base3, [gA.id]: { resolution: 'relink', to: 'ASPH2', new_qty: null }, [gS.id]: { resolution: 'keep_matched', new_qty: null } }) });
-        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, REVIEW);
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.deepStrictEqual([r.j.code, r.j.error], ['resolution_preview', PREVIEW]);
         assert.deepStrictEqual(r.j.resolved.map(x => [x.measurement_id, x.resolution, x.to, x.gates]), [[gA.id, 'relink', 'ASPH2', ['duplicate']], [gX.id, 'delete', undefined, []],
           [gS.id, 'keep_matched', undefined, ['overlap']], [gW.id, 'confirm', undefined, ['duplicate']]]);
         rel(r.j.resolved[0].new_qty, 8, 'two 4 m2 squares'); assert.strictEqual(r.j.resolved[1].new_qty, null); rel(r.j.resolved[2].new_qty, 2, 'E2');
         // relink to PAVING: gP already measures it on the row → overlap
         r = await ACCEPT(g2, { expect: expOf(gc.items, { ...base3, [gA.id]: { resolution: 'relink', to: 'PAVING', new_qty: null }, [gS.id]: { resolution: 'keep_matched', new_qty: 2 } }) });
-        assert.strictEqual(r.s, 409); assert.deepStrictEqual(r.j.resolved[0], { measurement_id: gA.id, resolution: 'relink', to: 'PAVING', new_qty: gP.qty, gates: ['overlap'] });
+        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.code, 'resolution_preview');
+        assert.deepStrictEqual(r.j.resolved[0], { measurement_id: gA.id, resolution: 'relink', to: 'PAVING', new_qty: gP.qty, gates: ['overlap'] });
         // the right quantities but the gates not confirmed → 409, nothing changed
         const sG = JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TG), db.prepare('SELECT * FROM measurement_handles ORDER BY rowid').all(),
           db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TG)]);
         const exact = { ...base3, [gA.id]: { resolution: 'relink', to: 'PAVING', new_qty: gP.qty }, [gS.id]: { resolution: 'keep_matched', new_qty: r.j.resolved[2].new_qty } };
         r = await ACCEPT(g2, { expect: expOf(gc.items, exact) });
-        assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'confirm the checks of the chosen resolutions');
+        assert.strictEqual(r.s, 409); assert.deepStrictEqual([r.j.code, r.j.error], ['confirm_checks', 'confirm the checks of the chosen resolutions']);
         assert.deepStrictEqual(r.j.resolved.filter(x => x.gates.length).map(x => [x.measurement_id, x.gates]), [[gA.id, ['overlap']], [gS.id, ['overlap']], [gW.id, ['duplicate']]]);
         assert.strictEqual(JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(TG), db.prepare('SELECT * FROM measurement_handles ORDER BY rowid').all(),
           db.prepare('SELECT * FROM drawings WHERE tender_id=? ORDER BY id').all(TG)]), sG, 'nothing changed');

@@ -171,3 +171,10 @@ dl.kv dd { margin: 0; }
 .pct-ok { color: var(--green); }
 .m-cal { margin-top: 2px; }
 @media (max-width: 800px) { .tv-body { grid-template-columns: 1fr; } .tv-layers { max-height: 200px; } }
+/* drawing revisions (batch 4): the before/after table and the comparison controls */
+table.rv-table tr.rv-blocked td { background: #fff8f7; }
+table.rv-table td.rv-res-cell select { display: block; margin-bottom: 4px; max-width: 280px; }
+table.rv-table td.rv-after.rv-resolved { font-weight: 700; }
+.rv-checks .field.check { margin: 2px 0; }
+.rv-actions { margin-top: 10px; }
+.tv-mix input[type=range] { width: 140px; vertical-align: middle; }

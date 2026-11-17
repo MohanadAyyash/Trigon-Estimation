@@ -55,4 +55,4 @@ function jpegHeader(w, h, sof = 0xc2) {
   return Buffer.concat([Buffer.from([0xff, 0xd8]), app0, dqt, seg(sof, f), Buffer.from([0xff, 0xd9])]);
 }
 
-module.exports = { makePdf, PDF_PAGES, PDF_RECTS, makeOffsetPdf, OFFSET_PAGE, OFFSET_RECT, makePng, pngHeader, jpegHeader };
+module.exports = { buildPdf, makePdf, PDF_PAGES, PDF_RECTS, makeOffsetPdf, OFFSET_PAGE, OFFSET_RECT, makePng, pngHeader, jpegHeader };
