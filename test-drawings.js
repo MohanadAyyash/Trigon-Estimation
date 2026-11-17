@@ -1765,25 +1765,42 @@ server.listen(0, async () => {
       const mRect = await ok(measure(P1, { row_id: rM2, geom: { tool: 'rect', p1: [160, 160], p2: [200, 180] } }), 'rect in region');
       assert.strictEqual(mRect.calibration_id, reg.id); near(mRect.qty, 0.5, 'rect 40×20 × 0.025²'); near(qtyOf(rM2), 6.5, 'm2 row');
       assert.strictEqual((await call('DELETE', `drawings/${P1}/calibrations/${reg.id}`, null, qs)).s, 409, 'a used region cannot be deleted');
+      // R14: a count on an uncalibrated PDF page saves with no calibration; a later calibration lists nothing for it
+      const mP2Count = await ok(measure(P2, { row_id: rNr, geom: { tool: 'count', pts: [[50, 50], [60, 60]] } }), 'count on an uncalibrated page');
+      assert.strictEqual(mP2Count.qty, 2); assert.strictEqual(mP2Count.calibration_id, null); assert.strictEqual(qtyOf(rNr), 2);
+      assert.strictEqual((await measure(P2, { row_id: rM, geom: poly })).j.error, 'calibrate this page first', 'a length still needs a calibration');
+      const p2cal = await ok(call('POST', `drawings/${P2}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'page 2');
+      assert.deepStrictEqual(p2cal.changes, [], 'the count is not listed'); assert.strictEqual(mRow(mP2Count.id).calibration_id, null);
       // the same geometry on page 2 of the same file is not an overlap
-      await ok(call('POST', `drawings/${P2}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'page 2');
       const mP2 = await ok(measure(P2, { row_id: rM, geom: poly }), 'page 2 polyline');
       near(mP2.qty, 5.5, 'page 2'); near(qtyOf(rM), 25.5, 'row m');
 
-      // an image: calibrated in pixels; a count onto an nr row (bounds 2 × 640 by 2 × 480)
+      // an image: a count onto an nr row needs no calibration (bounds 2 × 640 by 2 × 480)
       const img = await upload(T, 'Fake photo', makePng(640, 480), qs);
-      r = await measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[10, 10]] } });
-      assert.strictEqual(r.s, 409); assert.strictEqual(r.j.error, 'calibrate this page first');
-      await ok(call('POST', `drawings/${img.j.id}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'image calibration');
       assert.match((await measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[10, 10], [1281, 10]] } })).j.error, /outside the page/);
+      // R15: the same count point twice (even apart) counts one item twice → refused
+      r = await measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[1, 1], [2, 2], [1, 1]] } });
+      assert.strictEqual(r.s, 400); assert.match(r.j.error, /repeated point/);
       const mCount = await ok(measure(img.j.id, { row_id: rNr, geom: { tool: 'count', pts: [[10, 10], [20, 20], [30, 10]] } }), 'count');
-      assert.strictEqual(mCount.qty, 3); assert.strictEqual(mCount.qty_unit, 'nr'); assert.strictEqual(qtyOf(rNr), 3);
-      // a count does not depend on the scale: re-calibrating lists nothing and keeps its calibration link
+      assert.strictEqual(mCount.qty, 3); assert.strictEqual(mCount.qty_unit, 'nr'); assert.strictEqual(mCount.calibration_id, null); assert.strictEqual(qtyOf(rNr), 5);
+      const ical = (await ok(call('POST', `drawings/${img.j.id}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'image calibration'));
+      assert.deepStrictEqual(ical.changes, []);
+      // re-calibrating lists nothing for a count
       assert.deepStrictEqual((await ok(call('POST', `drawings/${img.j.id}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 7, unit: 'm' }, qs), 'image re-calibration')).changes, []);
-      assert.strictEqual(mRow(mCount.id).qty, 3); assert.strictEqual(mRow(mCount.id).calibration_id, mCount.calibration_id);
+      assert.strictEqual(mRow(mCount.id).qty, 3); assert.strictEqual(mRow(mCount.id).calibration_id, null);
       // R12 on the verify line too
-      const iv = await call('POST', `drawings/${img.j.id}/calibrations/${mCount.calibration_id}/verify`, { p1: [0, 0], p2: [0, 961], real: 5, unit: 'm' }, qs);
+      const iv = await call('POST', `drawings/${img.j.id}/calibrations/${ical.calibration.id}/verify`, { p1: [0, 0], p2: [0, 961], real: 5, unit: 'm' }, qs);
       assert.strictEqual(iv.s, 400); assert.match(iv.j.error, /p2 is outside the page/);
+      // only counts on it: the calibration can be deleted, the count stays
+      await ok(call('DELETE', `drawings/${img.j.id}/calibrations/${ical.calibration.id}`, null, qs), 'delete a calibration only counts are on');
+      assert.strictEqual(mRow(mCount.id).qty, 3); assert.strictEqual(qtyOf(rNr), 5);
+      // R13: at most 10000 points in a manual shape
+      const n1 = nM();
+      r = await measure(P1, { row_id: rM, geom: { tool: 'polyline', pts: Array.from({ length: 10001 }, (_, i) => [i % 500, Math.floor(i / 500)]) } });
+      assert.strictEqual(r.s, 400); assert.match(r.j.error, /at most 10000/); assert.strictEqual(nM(), n1);
+      // R15: an outline that doubles back (a spike) is refused
+      r = await measure(P1, { row_id: rM, geom: { tool: 'area', outer: [[0, 0], [10, 0], [10, 10], [6, 10], [6, 20], [6, 10], [0, 10]], holes: [] }, metric: 'perimeter' });
+      assert.strictEqual(r.s, 400); assert.match(r.j.error, /self-intersect/);
 
       // DXF: units first; then scale = UNIT_TO_M[units] (mm), no calibration, georeferenced coordinates exact
       const dx = await upload(T, 'Fake site', FIXTURE, qs);
@@ -1819,7 +1836,7 @@ server.listen(0, async () => {
       const dmap = new Map(od.map((x, i) => [x.id, nd[i].id]));
       const calsOf = tid => db.prepare('SELECT c.* FROM calibrations c JOIN drawings d ON d.id=c.drawing_id WHERE d.tender_id=? ORDER BY c.id').all(tid);
       const oc = calsOf(T), nc = calsOf(rv);
-      assert.strictEqual(nc.length, oc.length); assert.ok(oc.length >= 4);
+      assert.strictEqual(nc.length, oc.length); assert.strictEqual(oc.length, 3);
       const cmap = new Map();
       oc.forEach((c, i) => {
         const n = nc[i];
@@ -1830,7 +1847,7 @@ server.listen(0, async () => {
       const oRows = db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(T), nRows = db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(rv);
       const rmap = new Map(oRows.map((x, i) => [x.id, nRows[i].id]));
       const om = db.prepare("SELECT * FROM measurements WHERE tender_id=? AND tool='manual' ORDER BY id").all(T), nm = db.prepare("SELECT * FROM measurements WHERE tender_id=? AND tool='manual' ORDER BY id").all(rv);
-      assert.strictEqual(nm.length, om.length); assert.strictEqual(om.length, 8);
+      assert.strictEqual(nm.length, om.length); assert.strictEqual(om.length, 9);
       om.forEach((o, i) => {
         const n = nm[i];
         assert.strictEqual(n.drawing_id, dmap.get(o.drawing_id)); assert.strictEqual(n.row_id, rmap.get(o.row_id));

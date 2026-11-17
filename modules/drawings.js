@@ -477,7 +477,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // The manual measurements of this drawing whose qty or calibration changes when `next` ({ region, scale }: the
   // calibration about to be stored) replaces `replaced` (the stored calibration row, or null when `next` is new), each
   // with the qty and base it would get: [{ measurement_id, row_id, old_qty, new_qty, base }]. Runs inside the tx.
-  // - saved with the replaced calibration: listed when their qty changes (a count never does);
+  // - a count never (R14: it does not depend on scale and keeps calibration_id NULL);
+  // - saved with the replaced calibration: listed when their qty changes;
   // - any other: listed when its first point would resolve to `next` (a new region over measurements that used the page
   //   calibration). The apply path sets calibration_id to the stored calibration's id for every one listed.
   function calibrationChanges(d, replaced, next) {
@@ -486,6 +487,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     const after = replaced ? cals.map(c => c.id === replaced.id ? nextCal : c) : [...cals, nextCal];
     const out = [];
     for (const m of db.prepare("SELECT * FROM measurements WHERE drawing_id=? AND (tool='manual' OR calibration_id IS NOT NULL) ORDER BY id").all(d.id)) {
+      if (m.tool === 'manual' && m.metric === 'count') continue;
       const kept = replaced !== null && m.calibration_id === replaced.id;
       if (!kept) {
         let fp = null;
@@ -501,12 +503,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   }
   const cannotRescale = m => bad(`measurement ${m.id} cannot be recomputed with another calibration`, 409);
   // { qty, base } of a stored manual measurement under the calibration `cal`: manualQty on its stored geometry with its
-  // own width/depth/factor/deduct. Anything that cannot be recomputed exactly the same way stops the change (409).
+  // own width/depth/factor/deduct. The geometry was validated when it was saved, so it is not validated again (R13);
+  // anything that cannot be recomputed exactly the same way stops the change (409).
   function manualRescale(m, cal) {
     const g = m.tool === 'manual' ? parseGeom(m.geom) : null;
     if (!g) cannotRescale(m);
     let q;
-    try { q = manual.manualQty(g, manualOpts(g, m, cal.scale)); } catch (e) { cannotRescale(m); }
+    try { q = manual.manualQty(g, manualOpts(g, m, cal.scale), true); } catch (e) { cannotRescale(m); }
     if (q.qty_unit !== m.qty_unit || !(Math.abs(q.qty) <= MAX_QTY)) cannotRescale(m);
     return { qty: q.qty, base: q.base };
   }
@@ -814,12 +817,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     m.metric = b.metric === undefined ? null : b.metric;   // checked by manualQty below
     m.label = optText(b, 'label', 200); m.color = optText(b, 'color', 32);
     m.confirm_uom = optBool(b, 'confirm_uom'); m.confirm_overlap = optBool(b, 'confirm_overlap');
-    // every option is checked before the calibration lookup: the shape at scale 1 (its units and combinations)
-    m.metric = calc(() => manual.manualQty(m.geom, { ...manualOpts(m.geom, m, 1), metric: m.metric })).metric;
+    // every option is checked before the calibration lookup: the shape at scale 1 (its units and combinations); the
+    // geometry was validated just above, once for the whole request (R13)
+    m.metric = calc(() => manual.manualQty(m.geom, { ...manualOpts(m.geom, m, 1), metric: m.metric }, true)).metric;
     return m;
   }
-  // the scale a stored manual measurement was computed with: the drawing units (DXF) or its calibration (PDF/image)
+  // the scale a stored manual measurement was computed with: the drawing units (DXF) or its calibration (PDF/image);
+  // null for a count (R14: no scale)
   function storedScale(cur, d) {
+    if (cur.metric === 'count') return null;
     if (d.kind === 'dxf') { if (!hasUnit(d.units)) bad('the drawing units are not confirmed', 409); return UNIT_TO_M[d.units]; }
     const c = cur.calibration_id === null ? null : db.prepare('SELECT scale FROM calibrations WHERE id=? AND drawing_id=?').get(cur.calibration_id, d.id);
     if (!c) bad(`measurement ${cur.id} has no calibration: delete it and measure again`, 409);
@@ -847,14 +853,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       mustDraft(tenderRow(t.id));
       const cur = drawingRow(d.id);
       if (!cur || cur.status !== 'ready' || cur.units !== d.units || cur.sha256 !== d.sha256) bad('the drawing changed: try again', 409);
-      let scale, cal = null;
-      if (d.kind === 'dxf') scale = UNIT_TO_M[d.units];
+      // R14: a count does not depend on scale, so it needs no calibration (calibration_id NULL)
+      let scale = null, cal = null;
+      if (m.metric === 'count') { /* no scale */ }
+      else if (d.kind === 'dxf') scale = UNIT_TO_M[d.units];
       else {
         cal = calib.calibrationFor(db.prepare('SELECT * FROM calibrations WHERE drawing_id=? ORDER BY id').all(d.id), manual.firstPoint(m.geom));
         if (!cal) bad('calibrate this page first', 409);
         scale = cal.scale;
       }
-      const q = calc(() => manual.manualQty(m.geom, manualOpts(m.geom, m, scale)));
+      const q = calc(() => manual.manualQty(m.geom, manualOpts(m.geom, m, scale), true));
       if (!(Math.abs(q.qty) <= MAX_QTY)) bad(`the quantity ${q.qty} is out of range: it must be at most ${MAX_QTY}`);
       Object.assign(m, { qty: q.qty, qty_unit: q.qty_unit, base: q.base, metric: q.metric, calibration_id: cal ? cal.id : null });
       const ch = checkRow(me, m, d.sha256, t.id, -1, m.confirm_uom, m.confirm_overlap, {}, manualOverlaps(m, d, t.id, -1));
@@ -893,7 +901,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       const g = parseGeom(cur.geom);
       if (!g) bad(`the shape of measurement ${cur.id} cannot be read: delete it and measure again`, 409);
       const next = { ...cur, ...set };
-      const q = calc(() => manual.manualQty(g, manualOpts(g, next, storedScale(cur, d))));
+      const q = calc(() => manual.manualQty(g, manualOpts(g, next, storedScale(cur, d)), true));   // validated when saved
       if (!(Math.abs(q.qty) <= MAX_QTY)) bad(`the quantity ${q.qty} is out of range: it must be at most ${MAX_QTY}`);
       Object.assign(next, { qty: q.qty, qty_unit: q.qty_unit, base: q.base, geom: g });
       const moved = next.row_id !== cur.row_id;

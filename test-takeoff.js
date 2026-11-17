@@ -182,7 +182,7 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
     throwsMsg(() => M.manualQty(outer([[0, 0], [10, 10], [10, 0], [0, 10]]), { scale: 1 }), /self-intersect/, 'manualQty validates');
     // touching at one vertex without crossing (batch-1 rule: not a crossing) → the two lobes' area
     near(q(outer([[0, 0], [4, 0], [5, 5], [6, 0], [10, 0], [10, 10], [6, 10], [5, 5], [4, 10], [0, 10]]), { scale: 1 }).qty, 90, 'pinched outline');
-    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 0], [20, 0]])), /no area/, 'a flat outline');
+    throwsMsg(() => M.validateGeom(outer([[0, 0], [10, 0], [20, 0]])), /self-intersect/, 'a flat outline (it doubles back)');
     // holes: strictly inside, never touching the outline or each other, never nested, never self-intersecting
     const withHoles = holes => ({ tool: 'area', outer: sq(0, 0, 100), holes });
     throwsMsg(() => M.validateGeom(withHoles([sq(200, 200, 10)])), /hole 1 lies outside the outline/, 'a hole outside');
@@ -207,17 +207,34 @@ assert.throws(() => imageSize(makePdf()), notImage, 'a PDF is not an image');
     throwsMsg(() => M.validateGeom(outer([[0, 0], [1, 0]])), /at least 3/, 'outer of 2 points');
     throwsMsg(() => M.validateGeom(withHoles([[[10, 10], [20, 10]]])), /at least 3/, 'hole of 2 points');
     throwsMsg(() => M.validateGeom({ tool: 'count', pts: [] }), /at least 1/, 'no count point');
-    throwsMsg(() => M.validateGeom({ tool: 'polyline', pts: Array.from({ length: 100001 }, (_, i) => [i, i % 2]) }), /100000/, 'too many points');
+    throwsMsg(() => M.validateGeom({ tool: 'polyline', pts: Array.from({ length: 10001 }, (_, i) => [i, i % 2]) }), /at most 10000/, 'too many points (R13)');
+    throwsMsg(() => M.validateGeom({ tool: 'area', outer: sq(0, 0, 1000), holes: Array.from({ length: 2500 }, (_, i) => sq(10 + (i % 50) * 19, 10 + Math.floor(i / 50) * 19, 5)) }), /at most 10000/, 'outer + holes over 10000');
+    // R15: count points all distinct; rings never double back along themselves (a polyline may)
+    throwsMsg(() => M.validateGeom({ tool: 'count', pts: [[1, 1], [2, 2], [1, 1]] }), /repeated point/, 'a count point repeated later');
+    for (const ring of [[[0, 0], [10, 0], [10, 10], [6, 10], [6, 20], [6, 10], [0, 10]], [[0, 0], [10, 0], [10, 10], [6, 10], [6, 15], [6, 11], [0, 10]], [[0, 0], [10, 0], [5, 0], [5, 5]]]) {
+      throwsMsg(() => M.validateGeom(outer(ring)), /self-intersect/, 'spike ' + JSON.stringify(ring));
+      throwsMsg(() => M.validateGeom(withHoles([ring.map(([x, y]) => [x + 40, y + 40])])), /hole 1 must not self-intersect/, 'spike hole ' + JSON.stringify(ring));
+    }
+    throwsMsg(() => M.validateGeom(outer([[5, 0], [10, 0], [10, 10], [0, 10], [0, 0], [8, 0]])), /self-intersect/, 'a spike on the closing edge');
+    near(q({ tool: 'polyline', pts: [[0, 0], [10, 0], [5, 0]] }, { scale: 1 }).qty, 15, 'a polyline may double back');
     for (const g of [null, [], 'x', { tool: 'circle' }, { tool: 'polyline' }, { tool: 'polyline', pts: [[0, 0], [1, 1]], extra: 1 }, { tool: 'area', outer: sq(0, 0, 1), holes: 'x' }])
       throwsMsg(() => M.validateGeom(g), /geom|tool|pts|outer|holes|unknown/, 'bad geom ' + JSON.stringify(g));
-    // a large hand-drawn outline (a 20000-gon) validates and measures as a circle
+    // a large hand-drawn outline (a 10000-gon) validates and measures as a circle; a 10000-point comb (long teeth: the
+    // worst case for a sweep along x) validates quickly (R13)
     {
-      const n = 20000, R = 1000, ring = Array.from({ length: n }, (_, i) => [R * Math.cos(2 * Math.PI * i / n), R * Math.sin(2 * Math.PI * i / n)]);
+      const comb = []; for (let k = 0; k < 2500; k++) comb.push([1, 2 * k], [1000, 2 * k], [1000, 2 * k + 1], [1, 2 * k + 1]);
+      comb[0] = [0, 0]; comb[comb.length - 1] = [0, 4999];
+      const t1 = Date.now(); M.validateGeom({ tool: 'area', outer: comb, holes: [] });
+      assert.ok(Date.now() - t1 < 1500, `${where} 10000-point comb validated in ${Date.now() - t1} ms`);
+      const n = 10000, R = 1000, ring = Array.from({ length: n }, (_, i) => [R * Math.cos(2 * Math.PI * i / n), R * Math.sin(2 * Math.PI * i / n)]);
       const t0 = Date.now(), a = q({ tool: 'area', outer: ring, holes: [] }, { scale: 1 }).qty;
-      assert.ok(Math.abs(a - Math.PI * R * R) / (Math.PI * R * R) < 1e-6, `${where} 20000-gon area ${a}`);
-      assert.ok(Date.now() - t0 < 5000, `${where} 20000-gon validated in ${Date.now() - t0} ms`);
+      assert.ok(Math.abs(a - Math.PI * R * R) / (Math.PI * R * R) < 1e-6, `${where} 10000-gon area ${a}`);
+      assert.ok(Date.now() - t0 < 1500, `${where} 10000-gon validated in ${Date.now() - t0} ms`);
     }
 
+    // the validated path (R13): same result, no second validation
+    assert.strictEqual(JSON.stringify(M.manualQty(area, { scale: 0.05 }, true)), JSON.stringify(M.manualQty(area, { scale: 0.05 })), `${where} validated path`);
+    throwsMsg(() => M.manualQty(outer([[0, 0], [10, 10], [10, 0], [0, 10]]), { scale: 1 }, 'yes'), /self-intersect/, 'only true skips validation');
     // geomKey: identical geometry whatever the start point, direction, rect/area form or noise below 1e-6
     const k = g => M.geomKey(g);
     const ring = [[0, 0], [100, 0], [100, 50], [0, 50]];
