@@ -186,7 +186,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     drawings: Number(db.prepare('DELETE FROM drawings WHERE tender_id=?').run(tid).changes),
   });
   const workers = { alive: 0, peak: 0, started: 0 };   // test hook: parse workers alive now / at most / ever started
-  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, _workers: workers, _summaries: () => summaries };   // _ = test hooks
+  // test hook: hooks.beforeUnitTx(attempt), when a test sets it, runs (awaited) between a unit change's async recomputation
+  // and its tx, so a test can change measurements inside that window. null (nothing runs) unless a test sets it.
+  const hooks = { beforeUnitTx: null };
+  ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
 
   // ---- upload: stream to a temp file while hashing; 413 the moment the limit is passed -----------------------
   // a received file is held until its drawing row is written; a file that ends with no drawing row (the tender was
@@ -705,13 +708,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
       if (before.status !== 'ready') bad(`drawing is ${before.status}: units can be set once it is ready`, 409);
       const seen = unitInputs(d.id);
       const changes = before.units === b.units ? [] : await unitChanges(before, b.units);
+      if (hooks.beforeUnitTx) await hooks.beforeUnitTx(attempt);
       const out = tx(() => {
         mustDraft(tenderRow(t.id));
         const cur = drawingRow(d.id);
         if (!cur || cur.status !== 'ready') bad(`drawing is ${cur ? cur.status : 'gone'}: units can be set once it is ready`, 409);
         if (cur.units !== before.units || cur.sha256 !== before.sha256 || unitInputs(d.id) !== seen) return null;
-        if (changes.length && !apply) conflictBody({ error: 'unit change changes measured quantities', changes: listed(changes) });
-        if (apply && !reviewed(expect, changes)) conflictBody({ error: 'the measured quantities changed: review the changes again', changes: listed(changes) });
+        const body = error => ({ error, from: cur.units, to: b.units, changes: listed(changes) });
+        if (changes.length && !apply) conflictBody(body('unit change changes measured quantities'));
+        if (apply && !reviewed(expect, changes)) conflictBody(body('the measured quantities changed: review the changes again'));
+        if (cur.units === b.units) return { ...cur, changes: [] };   // the same units: nothing to store or audit
         db.prepare('UPDATE drawings SET units=? WHERE id=?').run(b.units, d.id);
         const upd = db.prepare('UPDATE measurements SET qty=?, base=? WHERE id=?');
         for (const c of changes) upd.run(c.new_qty, c.base, c.measurement_id);

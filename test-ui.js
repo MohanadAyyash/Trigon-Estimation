@@ -686,11 +686,20 @@ server.listen(0, async () => {
         if (Date.now() - t0 > 10000) throw new Error('still parsing'); await new Promise(f => setTimeout(f, 20));
       }
       await ok(call('PUT', `drawings/${uid}/units`, { units: 'mm' }, admin), 'units mm');
-      await ok(call('POST', `drawings/${uid}/measurements`, { row_id: rowU, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', label: 'Fake kerb layer' }, admin), 'measure');
       const DU = `#drawings[data-tender="${ut}"]`;
       const rq = async () => (await call('GET', `tenders/${ut}/rows`, null, admin)).j.find(x => x.id === rowU).qty;
       const took409 = msg => { const i = errors.findIndex(x => x.startsWith('Failed to load resource') && x.includes('409 (Conflict)')); assert.ok(i >= 0, msg); errors.splice(i, 1); };
+      // the page drawn before anyone measured (Confirm units), then someone measures: the server's list is shown, not an error
       await page.goto(`${origin}/#/tender/${ut}/drawings/${uid}`);
+      await page.waitForSelector(DU + ' #dw-confirm-units');
+      const mk = await ok(call('POST', `drawings/${uid}/measurements`, { row_id: rowU, tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', label: 'Fake kerb layer' }, admin), 'measure');
+      await page.selectOption('#dw-unit-select', 'm');
+      await page.click('#dw-confirm-units');
+      await page.waitForSelector(DU + ' #units-changes');
+      assert.ok((await page.textContent('#units-changes')).includes('Fake kerb layer'), 'stale page: the before/after list');
+      assert.ok((await page.textContent('#dw-units-msg')).includes('from mm to m'), 'from: the server\'s units');
+      took409('stale-page 409 logged');
+      await page.reload();
       await page.waitForSelector(DU + ' #dw-change-units');
       assert.strictEqual(await page.$(DU + ' #dw-confirm-units'), null, 'measured: Change units, not Confirm');
       await page.selectOption('#dw-unit-select', 'm');
@@ -714,6 +723,14 @@ server.listen(0, async () => {
       await page.waitForSelector(DU + ' #dw-layers[data-units="m"]');
       assert.strictEqual(await rq(), 6000, 'Apply changed the row');
       assert.strictEqual(db.prepare('SELECT units FROM drawings WHERE id=?').get(uid).units, 'm');
+      // a refusal in the user's words (srvMsg): a measurement that can no longer be recomputed (its layer is gone)
+      db.prepare("UPDATE measurements SET layer='GONE' WHERE id=?").run(mk.id);
+      await page.selectOption('#dw-unit-select', 'mm');
+      await page.click('#dw-change-units');
+      await page.waitForFunction(() => /cannot be recomputed at the new scale: delete it and measure it again/.test(document.querySelector('#flash').textContent));
+      took409('refusal 409 logged');
+      db.prepare("UPDATE measurements SET layer='KERB' WHERE id=?").run(mk.id);
+      assert.strictEqual(db.prepare('SELECT units FROM drawings WHERE id=?').get(uid).units, 'm', 'nothing changed');
     }
 
     // ---- PDF and image viewer (batch 3 Task 5): pages read by the browser, rendered by the vendored pdf.js ----------

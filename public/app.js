@@ -614,7 +614,8 @@
     // a fresh list from the server, e.g. someone measured meanwhile, is shown to be reviewed again)
     const unitMsg = h('div', { id: 'dw-units-msg' });
     unitSel.addEventListener('change', () => unitMsg.replaceChildren());
-    const unitsTable = async (changes, units, again) => {
+    // from: the units the server computed the list from (its 409 body)
+    const unitsTable = async (changes, units, from, again) => {
       let byId = new Map();
       try { const all = await api('GET', `tenders/${d.tender_id}/measurements`); byId = new Map([...all.measurements, ...all.unlinked].map(m => [m.id, m])); } catch (e) { /* shown by id */ }
       const apply = h('button', { id: 'units-apply', onclick: async () => {
@@ -622,11 +623,11 @@
         try { await api('PUT', `drawings/${d.id}/units`, { units, apply: true, expect: changes.map(x => ({ measurement_id: x.measurement_id, new_qty: x.new_qty })) }); rerender(); }
         catch (e) {
           apply.disabled = false;
-          if (e.status === 409 && e.body && Array.isArray(e.body.changes)) await unitsTable(e.body.changes, units, true);
+          if (e.status === 409 && e.body && Array.isArray(e.body.changes)) await unitsTable(e.body.changes, units, e.body.from, true);
           else unitMsg.replaceChildren(h('p', { class: 'err' }, t('error') + ': ' + srvMsg(e.message)));
         }
       } }, t('cal_apply'));
-      unitMsg.replaceChildren(...(again ? [h('p', { id: 'units-again', class: 'err' }, t('cal_review_again'))] : []), h('p', { class: 'warn' }, t('dw_units_changes', { from: lt.units, to: units })),
+      unitMsg.replaceChildren(...(again ? [h('p', { id: 'units-again', class: 'err' }, t('cal_review_again'))] : []), h('p', { class: 'warn' }, t('dw_units_changes', { from: from || '—', to: units })),
         changesGrid(changes, byId, rows, 'units-changes'),
         h('div', { class: 'row' }, apply, h('button', { id: 'units-cancel', class: 'secondary', onclick: () => { unitSel.value = lt.units; unitMsg.replaceChildren(); } }, t('cancel'))));
     };
@@ -639,8 +640,9 @@
         try { await api('PUT', `drawings/${d.id}/units`, { units }); rerender(); }
         catch (e) {
           ev.target.disabled = false;
-          if (measured && e.status === 409 && e.body && Array.isArray(e.body.changes)) await unitsTable(e.body.changes, units, false);
-          else fail(e);
+          // a list even when this page showed no measurement (someone measured since it was drawn)
+          if (e.status === 409 && e.body && Array.isArray(e.body.changes)) await unitsTable(e.body.changes, units, e.body.from, false);
+          else flash(t('error') + ': ' + srvMsg(e.message));
         }
       } }, measured ? t('dw_change_units') : t('dw_confirm_units')) : null),
       unitMsg,
@@ -997,7 +999,9 @@
   const SERVER_MSG = [[/overlaps another calibrated region/, () => t('se_overlap')], [/^calibrate this page first$/, () => t('vf_no_cal')],
     [/ is outside the page /, () => t('se_outside_page')], [/calibration points must lie inside the region/, () => t('cal_inside_region')],
     [/verify points must lie where this calibration applies/, () => t('vf_one_region')], [/deductions exceed the measured quantity/, () => t('se_deductions')],
-    [/^apply needs expect/, () => t('se_apply_expect')], [/^the measured quantities changed: review the changes again$/, () => t('cal_review_again')]];
+    [/^apply needs expect/, () => t('se_apply_expect')], [/^the measured quantities changed: review the changes again$/, () => t('cal_review_again')],
+    [/cannot be recomputed at the new scale/, () => t('se_rescale')], [/would be out of range: it must be at most/, () => t('se_rescale_range')],
+    [/kept changing while its quantities were recomputed/, () => t('se_units_retry')]];
   const srvMsg = m => { const g = geomMsg(m); if (g !== m) return g; for (const [re, f] of SERVER_MSG) if (re.test(m)) return f(); return m; };
   const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
   const fmtPct = v => iso((v > 0 ? '+' : '') + v.toFixed(2) + ' %');

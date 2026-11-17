@@ -2056,12 +2056,18 @@ server.listen(0, async () => {
       const mSelA = await measure({ row_id: rM2, tool: 'dxf_selection', metric: 'area', handles: ['UA'] });
       const mPoly = await measure({ row_id: rM, tool: 'manual', geom: { tool: 'polyline', pts: [[0, 0], [1000, 0], [1000, 1000]] } });
       const mRect = await measure({ row_id: rM2, tool: 'manual', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } });
+      const mPer = await measure({ row_id: rM, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'closed_perimeter' });     // closed perimeter: k
+      const mFac = await measure({ row_id: rM, ...kerb, factor: 2 });                                                  // factor ≠ 1: k
+      const mMPer = await measure({ row_id: rM, tool: 'manual', metric: 'perimeter', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } });   // manual perimeter: k
+      const mMVol = await measure({ row_id: rM3, tool: 'manual', width: 0.5, depth: 0.2, geom: { tool: 'polyline', pts: [[0, 0], [1000, 0], [1000, 1000]] } });   // manual × width × depth: k
+      const mDed = await measure({ row_id: rM, tool: 'manual', deduct: true, geom: { tool: 'line', pts: [[0, 2000], [500, 2000]] } });   // a deduction: k, stays negative
       // counts: never listed (a count does not depend on the units)
       const mBlk = await measure({ row_id: rNr, tool: 'dxf_blocks', layer: 'MH', block: 'MH1', metric: 'count' });
       const mSelC = await measure({ row_id: rNr, tool: 'dxf_selection', metric: 'count', handles: ['UM'] });
       const mCnt = await measure({ row_id: rNr, tool: 'manual', geom: { tool: 'count', pts: [[5, 5], [6, 6]] } });
       rel(mLayer.qty, 5, 'KERB 5000 mm = 5 m'); rel(mVolL.qty, 0.5, 'm3 from a length'); rel(mArea.qty, 100, 'ASPHALT 100 m2'); rel(mVolA.qty, 10, 'm3 from an area');
       rel(mSelL.qty, 5, 'selection length'); rel(mSelA.qty, 100, 'selection area'); rel(mPoly.qty, 2, 'polyline'); rel(mRect.qty, 2, 'rect');
+      rel(mPer.qty, 40, 'closed perimeter'); rel(mFac.qty, 10, 'factor 2'); rel(mMPer.qty, 6, 'manual perimeter'); rel(mMVol.qty, 0.2, 'manual m3'); rel(mDed.qty, -0.5, 'deduction');
       const mRow = id => db.prepare('SELECT * FROM measurements WHERE id=?').get(id);
       const qtyOf = id => db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(id).qty;
       const snap = () => JSON.stringify([db.prepare('SELECT * FROM measurements WHERE tender_id=? ORDER BY id').all(T), db.prepare('SELECT id, qty FROM tender_rows WHERE tender_id=? ORDER BY id').all(T),
@@ -2071,7 +2077,9 @@ server.listen(0, async () => {
       //    (lengths × 1000, areas × 1000², volumes from a length × 1000, from an area × 1000²); nothing changed
       let r = await call('PUT', `drawings/${D}/units`, { units: 'm' }, qs);
       assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'unit change changes measured quantities');
-      const k = 1000, want = [[mLayer, rM, k], [mVolL, rM3, k], [mArea, rI, k * k], [mVolA, rM3, k * k], [mSelL, rM, k], [mSelA, rM2, k * k], [mPoly, rM, k], [mRect, rM2, k * k]];
+      assert.strictEqual(r.j.from, 'mm'); assert.strictEqual(r.j.to, 'm');
+      const k = 1000, want = [[mLayer, rM, k], [mVolL, rM3, k], [mArea, rI, k * k], [mVolA, rM3, k * k], [mSelL, rM, k], [mSelA, rM2, k * k], [mPoly, rM, k], [mRect, rM2, k * k],
+        [mPer, rM, k], [mFac, rM, k], [mMPer, rM, k], [mMVol, rM3, k], [mDed, rM, k]];
       assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), want.map(([m]) => m.id), 'every non-count measurement, counts excluded');
       for (const [i, [m, row, f]] of want.entries()) {
         const c = r.j.changes[i];
@@ -2099,34 +2107,56 @@ server.listen(0, async () => {
       const fresh = expectOf(r.j.changes);
       r = await call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: fresh.map((x, i) => i ? x : { ...x, new_qty: x.new_qty * 2 }) }, qs);
       assert.strictEqual(r.s, 409); assert.strictEqual(snap(), s1, 'nothing changed');
+      // 4b. the race guard: a measurement saved inside the async window (after the recomputation, before the tx) is caught:
+      //     409 with the fresh list that includes it, nothing changed (without the in-tx check the reviewed list would apply)
+      let mWin = null, sWin = null;
+      ctx.drawings._hooks.beforeUnitTx = async attempt => {
+        if (attempt !== 0) return;
+        mWin = await measure({ row_id: rM, tool: 'manual', geom: { tool: 'line', pts: [[0, 3000], [300, 3000]] } });
+        sWin = snap();
+      };
+      try { r = await call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: fresh }, qs); }
+      finally { ctx.drawings._hooks.beforeUnitTx = null; }
+      assert.ok(mWin, 'the hook ran inside the window');
+      assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, 'the measured quantities changed: review the changes again');
+      assert.deepStrictEqual(r.j.changes.map(c => c.measurement_id), [...fresh.map(x => x.measurement_id), mWin.id], 'the fresh list has the one saved in the window');
+      rel(r.j.changes.at(-1).new_qty, mWin.qty * k, 'its new qty');
+      assert.strictEqual(snap(), sWin, 'nothing changed by the refused apply');
+      const finalChanges = r.j.changes, fresh2 = expectOf(finalChanges);
       // 2. apply with the reviewed list: units, measurements and rows in one go; 6. the rows are recomputed (the imported
       //    row too: its client qty stays, its measured total is checked)
       const real = ctx.tenders.recomputeTakeoffQty, seen = [];
       ctx.tenders.recomputeTakeoffQty = id => { seen.push(id); return real(id); };
       let applied;
-      try { applied = await ok(call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: fresh }, qs), 'apply'); }
+      try { applied = await ok(call('PUT', `drawings/${D}/units`, { units: 'm', apply: true, expect: fresh2 }, qs), 'apply'); }
       finally { ctx.tenders.recomputeTakeoffQty = real; }
-      assert.strictEqual(applied.units, 'm'); assert.strictEqual(applied.changes.length, 9);
+      assert.strictEqual(applied.units, 'm'); assert.strictEqual(applied.changes.length, 15);
       assert.deepStrictEqual([...new Set(seen)].sort((a, b) => a - b), [rI, rM, rM2, rM3].sort((a, b) => a - b), 'every row of a changed measurement recomputed');
-      for (const c of fresh) { const m = mRow(c.measurement_id); assert.strictEqual(m.qty, c.new_qty, 'stored as reviewed'); }
-      rel(mRow(mLayer.id).base, 5000, 'layer base in m'); rel(mRow(mSelA.id).base, 1e8, 'selection base m2');
-      rel(qtyOf(rM), 5000 + 5000 + 2000 + 400, 'm row'); rel(qtyOf(rM2), 1e8 + 2e6, 'm2 row'); rel(qtyOf(rM3), 500 + 1e7, 'm3 row');
+      for (const c of fresh2) { const m = mRow(c.measurement_id); assert.strictEqual(m.qty, c.new_qty, 'stored as reviewed'); }
+      rel(mRow(mLayer.id).base, 5000, 'layer base in m'); rel(mRow(mSelA.id).base, 1e8, 'selection base m2'); rel(mRow(mDed.id).qty, -500, 'deduction × 1000, still negative');
+      const rowSum = row => finalChanges.filter(c => c.row_id === row).reduce((a, c) => a + c.new_qty, 0);
+      for (const row of [rM, rM2, rM3]) rel(qtyOf(row), rowSum(row), 'take-off row ' + row + ' = Σ its new quantities');
+      rel(qtyOf(rM), 5000 + 5000 + 2000 + 40000 + 10000 + 6000 - 500 + 400 + 300, 'm row'); rel(qtyOf(rM2), 1e8 + 2e6, 'm2 row'); rel(qtyOf(rM3), 500 + 1e7 + 200, 'm3 row');
       assert.strictEqual(qtyOf(rI), 95, 'the client qty never changes');
       rel((await rowsOf()).find(x => x.id === rI).measured_qty, 1e8, 'imported row measured total');
       for (const m of [mBlk, mSelC, mCnt]) assert.strictEqual(mRow(m.id).qty, m.qty, 'counts unchanged');
       assert.strictEqual(qtyOf(rNr), mBlk.qty + mSelC.qty + mCnt.qty);
-      assert.deepStrictEqual(audits('units').at(-1), { from: 'mm', to: 'm', changed: 9, rows: 4 }, 'audit: a summary only');
+      assert.deepStrictEqual(audits('units').at(-1), { from: 'mm', to: 'm', changed: 15, rows: 4 }, 'audit: a summary only');
       // the same numbers as measuring again in the new units (the creation code)
       for (const [m, b] of [[mLayer, { row_id: rM, ...kerb }], [mVolL, { row_id: rM3, ...kerb, width: 0.5, depth: 0.2 }], [mArea, { row_id: rM2, ...asph }], [mVolA, { row_id: rM3, ...asph, depth: 0.1 }],
-        [mSelA, { row_id: rM2, tool: 'dxf_selection', metric: 'area', handles: ['UA'] }], [mRect, { row_id: rM2, tool: 'manual', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } }]]) {
+        [mSelA, { row_id: rM2, tool: 'dxf_selection', metric: 'area', handles: ['UA'] }], [mRect, { row_id: rM2, tool: 'manual', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } }],
+        [mPer, { row_id: rM, tool: 'dxf_layer', layer: 'ASPHALT', metric: 'closed_perimeter' }], [mFac, { row_id: rM, ...kerb, factor: 2 }],
+        [mMPer, { row_id: rM, tool: 'manual', metric: 'perimeter', geom: { tool: 'rect', p1: [0, 0], p2: [2000, 1000] } }],
+        [mMVol, { row_id: rM3, tool: 'manual', width: 0.5, depth: 0.2, geom: { tool: 'polyline', pts: [[0, 0], [1000, 0], [1000, 1000]] } }],
+        [mDed, { row_id: rM, tool: 'manual', deduct: true, geom: { tool: 'line', pts: [[0, 2000], [500, 2000]] } }]]) {
         const again = await measure(b);
         assert.strictEqual(again.qty, mRow(m.id).qty, 'measured again in m: ' + JSON.stringify(b).slice(0, 60));
         await ok(call('DELETE', 'measurements/' + again.id, null, qs), 'tidy');
       }
-      // the same units again: nothing to review, nothing changes
-      const s2 = snap();
+      // the same units again: a no-op (nothing to review, nothing stored, no audit)
+      const s2 = snap(), nU2 = audits('units').length;
       assert.strictEqual((await ok(call('PUT', `drawings/${D}/units`, { units: 'm' }, qs), 'same units')).changes.length, 0);
-      assert.strictEqual(snap(), s2);
+      assert.strictEqual(snap(), s2); assert.strictEqual(audits('units').length, nU2, 'no audit for the same units');
       // a drawing with counts only: nothing to review, the units change at once (5. counts are never listed)
       const up2 = await upload(T, 'Fake count plan', Buffer.from(FIXU), qs);
       assert.strictEqual((await waitDone(up2.j.id, qs)).status, 'ready');
