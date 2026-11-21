@@ -115,12 +115,17 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
 // estimation.db (TRUNCATE) and closes the database, so a restore that replaces estimation.db never meets a stale -wal.
 (async () => {
   const { spawn } = require('child_process'), net = require('net');
+  // a clean stop: a signal where the OS can deliver one to another process; on Windows (where kill() terminates the
+  // process) the 'shutdown' IPC message runs the same stop handler
+  const WIN = process.platform === 'win32';
+  const stopServer = (child, sig) => WIN ? child.send('shutdown') : child.kill(sig);
+  const startOpts = (dir, port) => ({ env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', ERP_SYNC_DISABLED: '1' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   const freePort = () => new Promise(ok => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => ok(p)); }); });
-  for (const sig of ['SIGTERM', 'SIGINT']) {
+  for (const sig of WIN ? ['shutdown message'] : ['SIGTERM', 'SIGINT']) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-backup-wal-'));
     const port = await freePort();
     const child = spawn(process.execPath, ['--no-warnings', path.join(__dirname, 'server.js')],
-      { env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', ERP_SYNC_DISABLED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      startOpts(dir, port));
     let out = '';
     child.stdout.on('data', c => { out += c; }); child.stderr.on('data', c => { out += c; });
     const exited = new Promise(ok => child.on('exit', (code, signal) => ok({ code, signal })));
@@ -133,8 +138,9 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
     assert.strictEqual(r.status, 200, sig + ' setup');
     const wal = path.join(dir, 'estimation.db-wal');
     assert.ok(fs.existsSync(wal) && fs.statSync(wal).size > 0, sig + ': the WAL has frames while the server runs');
-    child.kill(sig);
-    const ex = await exited;
+    stopServer(child, sig);
+    const ex = await Promise.race([exited, new Promise(f => setTimeout(() => f({ timeout: true }), 15000))]);
+    if (ex.timeout) { child.kill('SIGKILL'); await exited; }
     assert.strictEqual(ex.code, 0, sig + ': clean exit ' + JSON.stringify(ex) + ' ' + out);
     assert.ok(!fs.existsSync(wal) || fs.statSync(wal).size === 0, sig + ': WAL checkpointed (size ' + (fs.existsSync(wal) ? fs.statSync(wal).size : 'absent') + ')');
     // estimation.db alone (no -wal, no -shm) has the data
@@ -150,7 +156,7 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-backup-pdf-'));
     const port = await freePort();
     const child = spawn(process.execPath, ['--no-warnings', path.join(__dirname, 'server.js')],
-      { env: { ...process.env, DATA_DIR: dir, PORT: String(port), HOST: '127.0.0.1', ERP_SYNC_DISABLED: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      startOpts(dir, port));
     let out = '';
     child.stdout.on('data', c => { out += c; }); child.stderr.on('data', c => { out += c; });
     const exited = new Promise(ok => child.on('exit', ok));
@@ -171,7 +177,7 @@ assert.ok(/new DatabaseSync\(src, \{ readOnly: true \}\)/.test(fs.readFileSync(s
         const u = await fetch(api + `tenders/${tid}/drawings?name=plan${ext}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie }, body });
         assert.strictEqual(u.status, 202, ext + ' upload: ' + await u.text());
       }
-      child.kill('SIGTERM');
+      stopServer(child, 'SIGTERM');
       await exited;
       const r = run(dir);
       assert.strictEqual(r.status, 0, r.stderr);

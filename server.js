@@ -226,5 +226,8 @@ if (require.main === module) {
     process.exit(0);
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, stop);
+  // Windows cannot deliver a catchable signal to another process (Node's kill() terminates it), so a parent that started
+  // the server with an IPC channel (the tests) asks for the same clean stop with a 'shutdown' message.
+  if (typeof process.send === 'function') process.on('message', m => { if (m === 'shutdown') stop(); });
 }
 module.exports = { server, db, ctx };

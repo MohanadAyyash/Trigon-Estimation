@@ -39,14 +39,14 @@ Get-NetTCPConnection -LocalPort 3100 -State Listen -ErrorAction SilentlyContinue
 ```
 
 **Node.js:**
-- Needs **22.5 or newer, in the 22.x line** (Node 22 LTS). Node 23 or newer is untested: **ASK** before using it.
+- Needs **22.5 or newer**. Node 22 LTS and Node 24 LTS both work. Do not use odd-numbered (non-LTS) versions such as 23 or 25.
 - If Node is missing or older than 22.5, install Node 22 LTS:
 
   ```powershell
   winget install -e --id OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements
   ```
 
-- If winget installs a version other than 22.x, uninstall it and install 22.x from https://nodejs.org (the "22.x LTS" Windows installer).
+- If an odd-numbered version is installed, replace it with the current LTS from https://nodejs.org.
 - Open a **new** PowerShell window afterwards and check `node -v` again.
 
 **Git:**
