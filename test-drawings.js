@@ -2968,7 +2968,7 @@ server.listen(0, async () => {
         [db.prepare('SELECT name FROM drawings WHERE id=?').get(P1).name, 1, 'Fake kerb north', '2.1', 'Fake kerb']);
       assert.deepStrictEqual([byId(mK.id).Drawing, byId(mK.id).Rev, byId(mK.id).Tool, byId(mK.id).Measure, byId(mK.id)['Calibration / units']],
         ['Fake report plan', 2, 'DXF layer: KERB', 'open length', 'drawing units mm']);
-      assert.strictEqual(byId(mL.id)['Calibration / units'], 'page calibration');
+      assert.strictEqual(byId(mL.id)['Calibration / units'], 'page calibration · not verified', 'as the list: the calibration and its check');
       assert.deepStrictEqual([byId(mL.id)['Review needed'], byId(mK.id)['Review needed'], byId(mD.id).Deduction, byId(mL.id).Deduction], ['Yes', null, 'Yes', null]);
       assert.strictEqual(byId(mR.id).Tool, 'drawn: Rectangle');
       // Rows: the tender API's row qty and measured qty, never recomputed
@@ -2988,7 +2988,7 @@ server.listen(0, async () => {
       assert.deepStrictEqual([xd.Kind, xd.Rev, xd['Units / scale'], xd['SHA-256 (short)'], xd['Uploaded by'], xd['Replaced by']], ['dxf', 2, 'mm', dRow(dx.j.id).sha256.slice(0, 12), 'qs1', null]);
       assert.strictEqual(xd['Uploaded at'], dRow(dx.j.id).created);
       assert.strictEqual(xo['Replaced by'], 'Fake report plan (Rev 2)');
-      assert.deepStrictEqual([xp.Kind, xp['Units / scale']], ['pdf', 'Page: 1 pt = 0.05 m']);
+      assert.deepStrictEqual([xp.Kind, xp['Units / scale']], ['pdf', 'Page: 1 pt = 0.05 m · not verified']);
       // Arabic: right-to-left sheets, Arabic headings, the formula in Arabic as the Arabic list shows it
       const ar = readXlsx((await get('?lang=ar')).b);
       assert.deepStrictEqual(ar.sheets.map(x => [x.name, x.rtl]), [['القياسات', true], ['البنود', true], ['المخططات', true]]);
@@ -2998,7 +2998,7 @@ server.listen(0, async () => {
       assert.ok(TF.formulaText(all.find(m => m.id === mK.id), tr('ar')).startsWith('طول مفتوح'), 'Arabic words');
       // the calibration cell in Arabic: plain text, no direction marks (batch 4 Task 6 fix round 2)
       const axp = tableOf(ar.sheets[2], I18N.ar.rp_drawing).find(x => x[I18N.ar.rp_drawing] === dRow(P1).name && x[I18N.ar.rp_page] === 1);
-      assert.strictEqual(axp[I18N.ar.rp_units_scale], 'الصفحة: 1 نقطة = 0.05 م', 'AR calibration cell: ' + JSON.stringify(axp[I18N.ar.rp_units_scale]));
+      assert.strictEqual(axp[I18N.ar.rp_units_scale], 'الصفحة: 1 نقطة = 0.05 م · لم يُتحقق منه', 'AR calibration cell: ' + JSON.stringify(axp[I18N.ar.rp_units_scale]));
       // not a draft once approved: no label, no -DRAFT in the name
       db.prepare("UPDATE tenders SET status='approved' WHERE id=?").run(T);
       const ap = await get('?lang=en');
@@ -3007,6 +3007,226 @@ server.listen(0, async () => {
       assert.strictEqual(readXlsx((await get('')).b).sheets[0].name, 'Measurements', 'English by default');
     }
 
+    // ---- batch 4 final review: version chains (DXF and PDF), report calibration, re-import guard, cancel releases the file,
+    // a tender deleted inside the accept window, the mixed-units note -------------------------------------------------------
+    {
+      const { writeXlsx, readXlsx } = require('./lib/xlsx.js');
+      const I18N = require('./public/i18n.js');
+      const ok = async (p, msg) => { const r = await p; assert.strictEqual(r.s, 200, `${msg}: ${r.s} ${JSON.stringify(r.j)}`); return r.j; };
+      const dRow = id => db.prepare('SELECT * FROM drawings WHERE id=?').get(id);
+      const replaceUp = async (id, name, body) => {
+        const r = await fetch(base + `drawings/${id}/replace?name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: qs }, body });
+        return { s: r.status, j: await r.json().catch(() => null) };
+      };
+      const expOf = items => items.map(i => ({ measurement_id: i.measurement_id, new_qty: i.new_qty }));
+      const tableOf = (sh, first) => {
+        const hi = sh.rows.findIndex(r => r[0] === first);
+        assert.ok(hi >= 0, sh.name + ': heading row');
+        const heads = sh.rows[hi];
+        return sh.rows.slice(hi + 1).filter(r => r.length).map(r => Object.fromEntries(heads.map((h, i) => [h, r[i] ?? null])));
+      };
+      const report = async T => { const r = await fetch(base + `tenders/${T}/takeoff.xlsx?lang=en`, { headers: { cookie: viewer } }); assert.strictEqual(r.status, 200); return readXlsx(Buffer.from(await r.arrayBuffer())).sheets; };
+      const BOQ = (desc, unit, q) => ({ file_b64: writeXlsx([{ name: 'BOQ', rows: [['No', 'Description', 'Unit', 'Qty'], ['1', desc, unit, q]] }]).toString('base64'),
+        sheet: 'BOQ', header_row: 1, cols: { no: 'A', desc: 'B', unit: 'C', qty: 'D' } });
+      const PENDING = 'a drawing replacement is pending';
+
+      // M7: a DXF chain v1 → v2 → v3 (units mm, mm, m): replaced_by / replaces_id link every version; older ones are history
+      const chainDxf = (kerb, extra) => dxf([...sec('HEADER', [[9, '$INSUNITS'], [70, 4]]), ...tables([layerRec('KERB'), layerRec('X')]),
+        ...sec('ENTITIES', [...line('K1', 'KERB', 0, 0, kerb, 0), ...line('X1', 'X', 0, 0, extra, 0)])]);
+      const T = (await ok(call('POST', 'tenders', { title: 'Test Chain', kind: 'rta' }, qs), 'tender')).id;
+      const row = (await ok(call('POST', `tenders/${T}/rows`, { description: 'Fake kerb', unit: 'm' }, qs), 'row')).id;
+      const v1 = (await upload(T, 'Fake chain v1', Buffer.from(chainDxf(5000, 10)), qs)).j.id;
+      assert.strictEqual((await waitDone(v1, qs)).status, 'ready');
+      await ok(call('PUT', `drawings/${v1}/units`, { units: 'mm' }, qs), 'units v1');
+      const mL = await ok(call('POST', `drawings/${v1}/measurements`, { tool: 'dxf_layer', layer: 'KERB', metric: 'open_length', row_id: row }, qs), 'layer');
+      const mM = await ok(call('POST', `drawings/${v1}/measurements`, { tool: 'manual', geom: { tool: 'line', pts: [[0, 0], [2000, 0]] }, row_id: row, confirm_overlap: true }, qs), 'manual');
+      // M5: a cancelled new version whose file no other drawing uses: its stored file (and parse files) are removed
+      {
+        const c = await replaceUp(v1, 'Fake chain cancelled', Buffer.from(chainDxf(5500, 10.5)));
+        assert.strictEqual(c.s, 202, JSON.stringify(c.j)); await waitDone(c.j.id, qs);
+        const sha = dRow(c.j.id).sha256, files = () => dirFiles().filter(f => f.startsWith(sha));
+        assert.ok(files().includes(sha + '.dxf') && files().includes(sha + '.summary.json.gz'), 'stored and parsed: ' + files());
+        await ok(call('DELETE', `drawings/${c.j.id}`, null, qs), 'cancel');
+        assert.deepStrictEqual(files(), [], 'the cancelled version\'s files are released');
+        assert.ok(fs.existsSync(path.join(DDIR, dRow(v1).sha256 + '.dxf')), 'the current drawing\'s file stays');
+        // the same content as the current drawing: the file is still used, so it stays
+        const s = await replaceUp(v1, 'Fake chain same file', Buffer.from(chainDxf(5000, 10)));
+        await waitDone(s.j.id, qs);
+        await ok(call('DELETE', `drawings/${s.j.id}`, null, qs), 'cancel same file');
+        assert.ok(fs.existsSync(path.join(DDIR, dRow(v1).sha256 + '.dxf')), 'a file another drawing uses stays');
+      }
+      const step = async (from, kerb, extra, units, between) => {
+        const r = await replaceUp(from, 'Fake chain v', Buffer.from(chainDxf(kerb, extra)));
+        assert.strictEqual(r.s, 202, JSON.stringify(r.j)); const v = r.j.id; await waitDone(v, qs);
+        await ok(call('PUT', `drawings/${v}/units`, { units }, qs), 'units pending');
+        const c = await ok(call('GET', `drawings/${v}/compare`, null, qs), 'compare');
+        if (between) await between(v, c);
+        await ok(call('POST', `drawings/${v}/accept`, { expect: expOf(c.items) }, qs), 'accept');
+        return { v, c };
+      };
+      // M3: a BOQ re-import is refused while a replacement is pending (rows unchanged), allowed again after accept
+      const s2 = await step(v1, 6000, 11, 'mm', async () => {
+        const before = JSON.stringify(db.prepare('SELECT * FROM tender_rows WHERE tender_id=?').all(T));
+        const r = await call('POST', `tenders/${T}/import`, BOQ('Fake imported paving', 'm2', 100), qs);
+        assert.strictEqual(r.s, 409, JSON.stringify(r.j)); assert.strictEqual(r.j.error, PENDING);
+        assert.strictEqual(JSON.stringify(db.prepare('SELECT * FROM tender_rows WHERE tender_id=?').all(T)), before, 'nothing imported');
+      });
+      const v2 = s2.v;
+      assert.deepStrictEqual(s2.c.items.map(i => [i.measurement_id, i.status, i.old_qty, i.new_qty]), [[mL.id, 'changed', 5, 6], [mM.id, 'review', 2, 2]]);
+      const s3 = await step(v2, 7, 12, 'm');
+      const v3 = s3.v;
+      assert.deepStrictEqual(s3.c.items.map(i => [i.measurement_id, i.status, i.old_qty, i.new_qty]), [[mL.id, 'changed', 6, 7], [mM.id, 'review', 2, 2000]], 'm: the drawn line in metres');
+      assert.deepStrictEqual([v1, v2, v3].map(id => { const d = dRow(id); return [d.rev, d.pending, d.replaces_id, d.replaced_by, d.units]; }),
+        [[1, 0, null, v2, 'mm'], [2, 0, v1, v3, 'mm'], [3, 0, v2, null, 'm']], 'the chain');
+      assert.deepStrictEqual(db.prepare('SELECT id, drawing_id, qty, review_needed FROM measurements WHERE tender_id=? ORDER BY id').all(T).map(x => ({ ...x })),
+        [{ id: mL.id, drawing_id: v3, qty: 7, review_needed: 0 }, { id: mM.id, drawing_id: v3, qty: 2000, review_needed: 1 }]);
+      assert.strictEqual(db.prepare('SELECT qty FROM tender_rows WHERE id=?').get(row).qty, 2007);
+      // history is read only: units, a new version, measuring
+      for (const old of [v1, v2]) {
+        assert.strictEqual((await call('PUT', `drawings/${old}/units`, { units: 'm' }, qs)).s, 409, 'units of history ' + old);
+        assert.strictEqual((await replaceUp(old, 'x', Buffer.from(chainDxf(1, 1)))).s, 409, 'a new version of history ' + old);
+        assert.strictEqual((await call('POST', `drawings/${old}/measurements`, { tool: 'dxf_layer', layer: 'X', metric: 'open_length', row_id: row }, qs)).s, 409, 'measuring history ' + old);
+      }
+      // the report lists every version, each replaced by the next
+      const rd = tableOf((await report(T))[2], 'Drawing');
+      assert.deepStrictEqual(rd.map(x => [x.Rev, x['Replaced by']]), [[1, 'Fake chain v (Rev 2)'], [2, 'Fake chain v (Rev 3)'], [3, null]]);
+      // M4: the tender deleted between the async comparison and the accept tx → 404, not a 500
+      {
+        const r = await replaceUp(v3, 'Fake chain v4', Buffer.from(chainDxf(8, 13)));
+        const v4 = r.j.id; await waitDone(v4, qs);
+        await ok(call('PUT', `drawings/${v4}/units`, { units: 'm' }, qs), 'units v4');
+        const c = await ok(call('GET', `drawings/${v4}/compare`, null, qs), 'compare v4');
+        let gone = null;
+        ctx.drawings._hooks.beforeAcceptTx = async () => { if (!gone) gone = await call('DELETE', `tenders/${T}`, null, qs); };
+        let a;
+        try { a = await call('POST', `drawings/${v4}/accept`, { expect: expOf(c.items) }, qs); }
+        finally { ctx.drawings._hooks.beforeAcceptTx = null; }
+        assert.ok(gone, 'the hook ran'); assert.strictEqual(gone.s, 200, JSON.stringify(gone.j));
+        assert.deepStrictEqual([a.s, a.j.error], [404, 'tender not found']);
+        assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM drawings WHERE tender_id=?').get(T).n, 0);
+      }
+
+      // M7 + I2: a PDF chain (2 pages → 2 pages → 1 page): the page calibration copied at each accept, copied_from chaining
+      // back; the report's calibration cells say "copied … verify" as the list does, and the % once verified
+      const fakePdf = tag => Buffer.from('%PDF-1.4\n% fake ' + tag + '\n');
+      const pages = n => ({ pages: Array.from({ length: n }, (_, i) => ({ page: i + 1, width: 600, height: 400, rotation: 0 })) });
+      const TP = (await ok(call('POST', 'tenders', { title: 'Test PDF Chain', kind: 'rta' }, qs), 'tender')).id;
+      const prow = (await ok(call('POST', `tenders/${TP}/rows`, { description: 'Fake edging', unit: 'm' }, qs), 'row')).id;
+      const p1 = (await upload(TP, 'Fake sheet', fakePdf('a'), qs)).j.id;
+      await ok(call('POST', `drawings/${p1}/pages`, pages(2), qs), 'pages');
+      const cal1 = (await ok(call('POST', `drawings/${p1}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 1, unit: 'm' }, qs), 'calibrate')).calibration.id;
+      const pm = await ok(call('POST', `drawings/${p1}/measurements`, { tool: 'manual', geom: { tool: 'line', pts: [[0, 10], [200, 10]] }, row_id: prow }, qs), 'drawn');
+      // M5 for a PDF: a cancelled new version (its pages registered) releases its file
+      {
+        const c = await replaceUp(p1, 'Fake sheet cancelled', fakePdf('cancelled'));
+        await ok(call('POST', `drawings/${c.j.id}/pages`, pages(2), qs), 'pages');
+        const f = path.join(DDIR, dRow(c.j.id).sha256 + '.pdf');
+        assert.ok(fs.existsSync(f));
+        await ok(call('DELETE', `drawings/${c.j.id}`, null, qs), 'cancel');
+        assert.ok(!fs.existsSync(f), 'the cancelled PDF is released');
+      }
+      let prev = p1;
+      const chainP = [p1];
+      for (const [tag, n] of [['b', 2], ['c', 1]]) {
+        const v = (await replaceUp(prev, 'Fake sheet ' + tag, fakePdf(tag))).j.id;
+        await ok(call('POST', `drawings/${v}/pages`, pages(n), qs), 'pages ' + tag);
+        const c = await ok(call('GET', `drawings/${v}/compare`, null, qs), 'compare ' + tag);
+        assert.deepStrictEqual(c.items.map(i => [i.measurement_id, i.status]), [[pm.id, 'review']]);
+        await ok(call('POST', `drawings/${v}/accept`, { expect: expOf(c.items) }, qs), 'accept ' + tag);
+        chainP.push(v); prev = v;
+      }
+      const [, pB, pC] = chainP;
+      assert.deepStrictEqual(chainP.map(id => { const d = dRow(id); return [d.rev, d.page, d.replaces_id, d.replaced_by]; }), [[1, 1, null, pB], [2, 1, p1, pC], [3, 1, pB, null]]);
+      const cals = db.prepare('SELECT id, drawing_id, scale, copied_from FROM calibrations WHERE drawing_id IN (?, ?, ?) ORDER BY id').all(p1, pB, pC).map(x => ({ ...x }));
+      assert.deepStrictEqual(cals.map(x => [x.drawing_id, x.scale]), [[p1, 0.01], [pB, 0.01], [pC, 0.01]]);
+      assert.deepStrictEqual(cals.map(x => x.copied_from), [null, cal1, cals[1].id], 'copied_from chains back to the first calibration');
+      const pmRow = db.prepare('SELECT drawing_id, calibration_id, qty, review_needed FROM measurements WHERE id=?').get(pm.id);
+      assert.deepStrictEqual({ ...pmRow }, { drawing_id: pC, calibration_id: cals[2].id, qty: 2, review_needed: 1 });
+      // history is read only: verify / calibrate an older page
+      assert.strictEqual((await call('POST', `drawings/${pB}/calibrations/${cals[1].id}/verify`, { p1: [0, 0], p2: [100, 0], real: 1, unit: 'm' }, qs)).s, 409);
+      // I2: the calibration cells of the report
+      const COPIED = I18N.en.tl_copied;
+      let [SM, , SD] = await report(TP);
+      assert.strictEqual(tableOf(SM, 'ID').find(x => x.ID === pm.id)['Calibration / units'], `page calibration · not verified · ${COPIED}`, 'measurement: copied, to verify');
+      assert.strictEqual(tableOf(SD, 'Drawing').find(x => x.Rev === 3)['Units / scale'], `Page: 1 pt = 0.01 m · not verified · ${COPIED}`, 'drawing: copied, to verify');
+      assert.strictEqual(tableOf(SD, 'Drawing').find(x => x.Rev === 1 && x.Page === 1)['Units / scale'], 'Page: 1 pt = 0.01 m · not verified', 'the first one was not copied');
+      const vf = await ok(call('POST', `drawings/${pC}/calibrations/${cals[2].id}/verify`, { p1: [0, 0], p2: [100, 0], real: 0.995, unit: 'm' }, qs), 'verify');
+      const pctText = (vf.pct > 0 ? '+' : '') + vf.pct.toFixed(2) + ' %';
+      assert.strictEqual(pctText, '+0.50 %', 'the fixture: ' + vf.pct);
+      [SM, , SD] = await report(TP);
+      assert.strictEqual(tableOf(SM, 'ID').find(x => x.ID === pm.id)['Calibration / units'], 'page calibration · verified +0.50 %', 'measurement: verified, the % as the list shows it');
+      assert.strictEqual(tableOf(SD, 'Drawing').find(x => x.Rev === 3)['Units / scale'], 'Page: 1 pt = 0.01 m · verified +0.50 %');
+      const ar = await (async () => { const r = await fetch(base + `tenders/${TP}/takeoff.xlsx?lang=ar`, { headers: { cookie: viewer } }); return readXlsx(Buffer.from(await r.arrayBuffer())).sheets; })();
+      assert.strictEqual(tableOf(ar[0], I18N.ar.rp_id).find(x => x[I18N.ar.rp_id] === pm.id)[I18N.ar.rp_cal], 'معايرة الصفحة · تم التحقق +0.50 %', 'Arabic: plain text, no direction marks');
+
+      // M1: the mixed-units note of an imported row: numbers as the screen formats them (at most 3 decimals)
+      {
+        const TM = (await ok(call('POST', 'tenders', { title: 'Test Mixed Units', kind: 'rta' }, qs), 'tender')).id;
+        await ok(call('POST', `tenders/${TM}/import`, BOQ('Fake imported kerb', 'm', 10), qs), 'import');
+        const ri = (await ok(call('GET', `tenders/${TM}/rows`, null, qs), 'rows')).find(r => r.description === 'Fake imported kerb').id;
+        const pp = (await upload(TM, 'Fake mixed sheet', fakePdf('mixed'), qs)).j.id;
+        await ok(call('POST', `drawings/${pp}/pages`, pages(1), qs), 'pages');
+        await ok(call('POST', `drawings/${pp}/calibrations`, { p1: [0, 0], p2: [100, 0], real: 5, unit: 'm' }, qs), 'calibrate');
+        await ok(call('POST', `drawings/${pp}/measurements`, { tool: 'manual', geom: { tool: 'line', pts: [[0, 100], [100 / 3, 100]] }, row_id: ri }, qs), 'line');
+        // one unit per row is enforced now: older data can still hold two (as in the rowMeasuredQty test above)
+        db.prepare("INSERT INTO measurements(drawing_id,tender_id,row_id,tool,metric,qty,qty_unit,created,created_by) VALUES(?,?,?,'manual','area',25,'m2','x','qs1')").run(pp, TM, ri);
+        const x = tableOf((await report(TM))[1], 'No.').find(r => r.Description === 'Fake imported kerb');
+        assert.strictEqual(x.Note, 'mixed units: 1.667 m; 25 m2');
+      }
+    }
+
+    // ---- final review M7: a database made by the batch-3 schema (no pending / replaces_id / copied_from) opens, upgrades
+    // itself (additive columns only) and reads as before -----------------------------------------------------------------
+    {
+      const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-migrate-')); TMP_DIRS.push(dir4);
+      const m = spawnSync(process.execPath, ['--no-warnings', '-e', `
+        const path = require('path'), { DatabaseSync } = require('node:sqlite');
+        // the batch-3 CREATE statements of these tables (modules/drawings.js at 51d5bb1, its added columns folded in)
+        const old = new DatabaseSync(path.join(process.env.DATA_DIR, 'estimation.db'));
+        old.exec(\`
+CREATE TABLE drawings(id INTEGER PRIMARY KEY AUTOINCREMENT, tender_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'dxf', name TEXT, sha256 TEXT, bytes INTEGER,
+  units TEXT, suggested_units TEXT, status TEXT, error TEXT, rev INTEGER DEFAULT 1, replaced_by INTEGER, created TEXT, created_by TEXT,
+  failed_version INTEGER, page INTEGER, page_w REAL, page_h REAL, rotation INTEGER, parent_id INTEGER, page_x0 REAL NOT NULL DEFAULT 0, page_y0 REAL NOT NULL DEFAULT 0);
+CREATE TABLE measurements(id INTEGER PRIMARY KEY AUTOINCREMENT, drawing_id INTEGER NOT NULL, tender_id INTEGER NOT NULL, row_id INTEGER,
+  tool TEXT, layer TEXT, block TEXT, metric TEXT, nested INTEGER DEFAULT 0, width REAL, depth REAL, factor REAL NOT NULL DEFAULT 1, label TEXT, color TEXT,
+  qty REAL, qty_unit TEXT, handles_count INTEGER, review_needed INTEGER DEFAULT 0, created TEXT, created_by TEXT,
+  uom_confirmed INTEGER NOT NULL DEFAULT 0, incomplete INTEGER NOT NULL DEFAULT 0, duplicate INTEGER NOT NULL DEFAULT 0, base REAL, selection_summary TEXT,
+  mixed INTEGER NOT NULL DEFAULT 0, calibration_id INTEGER, geom TEXT, deduct INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE calibrations(id INTEGER PRIMARY KEY AUTOINCREMENT, drawing_id INTEGER NOT NULL, region TEXT, p1x REAL NOT NULL, p1y REAL NOT NULL,
+  p2x REAL NOT NULL, p2y REAL NOT NULL, real REAL NOT NULL, unit TEXT NOT NULL, scale REAL NOT NULL, verify_pct REAL, created TEXT, created_by TEXT);
+CREATE TABLE measurement_handles(measurement_id INTEGER NOT NULL, handle TEXT NOT NULL, geom_key TEXT, PRIMARY KEY(measurement_id, handle));
+INSERT INTO drawings(tender_id,kind,name,sha256,status,units,created) VALUES(1,'dxf','Fake old plan','${'b'.repeat(64)}','ready','mm','x');
+INSERT INTO drawings(tender_id,kind,name,sha256,status,page,page_w,page_h,rotation,created) VALUES(1,'pdf','Fake old sheet — p1','${'c'.repeat(64)}','ready',1,600,400,0,'x');
+INSERT INTO calibrations(drawing_id,p1x,p1y,p2x,p2y,real,unit,scale,created) VALUES(2,0,0,100,0,10,'m',0.1,'x');
+INSERT INTO measurements(drawing_id,tender_id,tool,layer,metric,qty,qty_unit,base,created,created_by) VALUES(1,1,'dxf_layer','KERB','open_length',5,'m',5,'x','qs1');
+INSERT INTO measurements(drawing_id,tender_id,tool,metric,qty,qty_unit,calibration_id,geom,created,created_by) VALUES(2,1,'manual','length',20,'m',1,'{"tool":"line","pts":[[0,10],[200,10]]}','x','qs1');\`);
+        old.close();
+        const { server, db, ctx } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
+        const cols = t => db.prepare('PRAGMA table_info(' + t + ')').all().map(c => c.name);
+        db.prepare("INSERT INTO tenders(title,kind,status,created) VALUES('Fake old tender','rta','draft','x')").run();
+        server.listen(0, async () => {
+          const base = 'http://localhost:' + server.address().port + '/api/';
+          const r = await fetch(base + 'setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'admin', password: 'secret12' }) });
+          const ck = r.headers.get('set-cookie').split(';')[0];
+          const list = await (await fetch(base + 'tenders/1/measurements', { headers: { cookie: ck } })).json();
+          const x = await fetch(base + 'tenders/1/takeoff.xlsx?lang=en', { headers: { cookie: ck } });
+          const { readXlsx } = require(${JSON.stringify(path.join(__dirname, 'lib', 'xlsx.js'))});
+          const sheets = x.status === 200 ? readXlsx(Buffer.from(await x.arrayBuffer())).sheets : null;
+          console.log(JSON.stringify({
+            drawings: ['pending', 'replaces_id'].map(c => cols('drawings').includes(c)), calibrations: cols('calibrations').includes('copied_from'),
+            rows: db.prepare('SELECT id, pending, replaces_id, replaced_by FROM drawings ORDER BY id').all().map(d => ({ ...d })),
+            copied: db.prepare('SELECT copied_from FROM calibrations').all().map(c => c.copied_from), pendingTender: ctx.drawings.hasPendingReplacement(1),
+            list: list.measurements.concat(list.unlinked).map(m => [m.id, m.qty, m.calibration && m.calibration.copied_from]),
+            report: x.status, cal: sheets && sheets[0].rows.find(r => r[0] === 2)[13] }));
+          server.close(); process.exit(0);
+        });`], { env: { ...process.env, DATA_DIR: dir4, ERP_SYNC_DISABLED: '1' }, encoding: 'utf8' });
+      assert.strictEqual(m.status, 0, m.stderr);
+      assert.deepStrictEqual(JSON.parse(m.stdout.trim().split('\n').at(-1)), {
+        drawings: [true, true], calibrations: true,
+        rows: [{ id: 1, pending: 0, replaces_id: null, replaced_by: null }, { id: 2, pending: 0, replaces_id: null, replaced_by: null }],
+        copied: [null], pendingTender: false, list: [[1, 5, null], [2, 20, null]], report: 200, cal: 'page calibration · not verified',
+      }, 'the batch-3 database upgrades and reads as before: ' + m.stdout);
+    }
     // ---- restart while parsing: a drawing left 'parsing' is parsed again on start --------------------------
     {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-restart-'));

@@ -122,7 +122,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const tx = fn => { db.exec('BEGIN'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
   const tenderRow = id => id === null ? null : db.prepare('SELECT * FROM tenders WHERE id=?').get(id);
   const drawingRow = id => id === null ? null : db.prepare('SELECT * FROM drawings WHERE id=?').get(id);
-  const mustDraft = t => { if (t.status !== 'draft') bad(`tender is ${t.status}: only a draft can be changed`, 409); };
+  // t may be a fresh lookup inside a tx: the tender can have been deleted during the async work before it → 404
+  const mustDraft = t => { if (!t) bad('tender not found', 404); if (t.status !== 'draft') bad(`tender is ${t.status}: only a draft can be changed`, 409); };
   const hasUnit = u => typeof u === 'string' && Object.hasOwn(UNIT_TO_M, u);
   // Review Focus 3: while a new version of a drawing waits to be accepted or cancelled, nothing on the old one (any page of
   // it) is measured, edited, deleted, relinked, calibrated or changed in units, so the compare it was reviewed against
@@ -132,7 +133,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   const notPending = d => { if (d.pending) bad('this drawing is a pending replacement: accept or cancel it first', 409); };
   // an accepted replacement keeps the old drawing (every page row of it) as read-only history
   const notReplaced = d => { if (d.replaced_by !== null) bad('this drawing has been replaced by a newer version: it is kept as history only', 409); };
-  const canMeasure = d => { notPending(d); notReplacing(d); notReplaced(d); };
+  const canMeasure = d => { if (!d) bad('drawing not found', 404); notPending(d); notReplacing(d); notReplaced(d); };
 
   // ---- hooks for tenders.js (R1). Callers run them inside their own transaction. ------------------------------
   const hasMeasurements = rowId => !!db.prepare('SELECT 1 FROM measurements WHERE row_id=? LIMIT 1').get(rowId);
@@ -215,11 +216,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // R8: a tender with a drawing replacement waiting for accept or cancel is not submitted or approved (tenders.js)
   const hasPendingReplacement = tid => !!db.prepare('SELECT 1 FROM drawings WHERE tender_id=? AND pending=1 LIMIT 1').get(tid);
   // the Excel take-off report (tenders.js): the measurement list as GET /tenders/:id/measurements returns it, and the
-  // tender's drawings (not a pending replacement) with their page calibration scale and number of calibrated regions
+  // tender's drawings (not a pending replacement) with their page calibration (scale, verify %, copied_from) and number of
+  // calibrated regions (and how many of them were copied from a previous version, R15)
   const reportData = t => ({
     list: tenderMeasurements(t),
     drawings: db.prepare(`SELECT d.*, (SELECT c.scale FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NULL) AS page_scale,
-      (SELECT COUNT(*) FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NOT NULL) AS regions FROM drawings d WHERE d.tender_id=? AND d.pending=0 ORDER BY d.id`).all(t.id),
+      (SELECT c.verify_pct FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NULL) AS page_verify_pct,
+      (SELECT c.copied_from FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NULL) AS page_copied_from,
+      (SELECT COUNT(*) FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NOT NULL) AS regions,
+      (SELECT COUNT(*) FROM calibrations c WHERE c.drawing_id=d.id AND c.region IS NOT NULL AND c.copied_from IS NOT NULL) AS regions_copied
+      FROM drawings d WHERE d.tender_id=? AND d.pending=0 ORDER BY d.id`).all(t.id),
   });
   ctx.drawings = { hasMeasurements, rowMeasuredQty, rowMeasurements, unlinkRows, cloneForTender, deleteForTender, hasPendingReplacement, reportData, _workers: workers, _summaries: () => summaries, _hooks: hooks };   // _ = test hooks
 
@@ -233,6 +239,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     if (n > 0) holds.set(sha, n); else holds.delete(sha);
     if (used || n > 0 || inflight.has(sha) || db.prepare('SELECT 1 FROM drawings WHERE sha256=? LIMIT 1').get(sha)) return;
     try { fs.unlinkSync(storedFile(sha, ext)); } catch (e) { /* gone already */ }
+  }
+  // a cancelled new version (batch 4 M5): its file, and for a DXF its parse files, are removed when nothing else uses them
+  // (the rule of release: no drawing row, no upload holding it, no parse running)
+  function dropUnused(sha, ext) {
+    if (holds.has(sha) || inflight.has(sha) || db.prepare('SELECT 1 FROM drawings WHERE sha256=? LIMIT 1').get(sha)) return;
+    const files = ext === 'dxf' ? [storedFile(sha, ext), cacheFile(sha), summaryFile(sha), renderFile(sha)] : [storedFile(sha, ext)];
+    for (const f of files) { try { fs.unlinkSync(f); } catch (e) { /* gone already */ } }
+    summaries.delete(sha);
   }
   const httpErr = (msg, status) => Object.assign(new Error(msg), { status });
   // expect: the type the name says (NAME_EXT) or null. Resolves { sha, bytes, ext, size } (size: an image's pixels).
@@ -1106,11 +1120,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   }
 
   // DELETE /drawings/:newId while pending = cancel the replacement: that row and its page rows go (nothing is measured or
-  // calibrated on them); the old drawing is measurable again. Files stay (shared by sha256, as on tender delete).
+  // calibrated on them); the old drawing is measurable again. Its file is removed unless another drawing uses it (dropUnused).
   function cancelReplacement(res, d, t, me) {
     need(me, 'admin', 'qs'); mustDraft(t);
     if (!d.pending) bad('only a pending new version can be cancelled', 409);
     if (d.parent_id !== null) bad('cancel the whole new version: use its first page');
+    let file = null;
     tx(() => {
       mustDraft(tenderRow(t.id));
       const cur = drawingRow(d.id);
@@ -1121,7 +1136,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
         bad('the new version has measurements or calibrations: it cannot be cancelled', 409);
       db.prepare(`DELETE FROM drawings WHERE id IN (${marks})`).run(...ids);
       audit(me, 'replace_cancel', 'drawings', cur.id, { replaces: cur.replaces_id, pages: ids.length });
+      file = { sha: cur.sha256, ext: extOf(cur) };
     });
+    dropUnused(file.sha, file.ext);
     return reply(res, 200, { ok: 1 });
   }
 

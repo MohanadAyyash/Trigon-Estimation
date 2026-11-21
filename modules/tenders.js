@@ -433,6 +433,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       });
       if (!out.length) bad(`no rows found after header row ${b.header_row} in sheet "${sheet.name}"`);   // a wrong header_row must not wipe the BOQ
       const done = tx(() => {
+        // a drawing replacement waiting for accept or cancel was compared against these rows: no re-import before it is settled
+        if (ctx.drawings && ctx.drawings.hasPendingReplacement(t.id)) conflict('a drawing replacement is pending');
         // measurements of the replaced rows are kept, unlinked: the user relinks them to the new rows
         const unlinked = ctx.drawings ? ctx.drawings.unlinkRows(db.prepare("SELECT id FROM tender_rows WHERE tender_id=? AND source='import'").all(t.id).map(r => r.id)) : 0;
         const removed = Number(db.prepare("DELETE FROM row_links WHERE row_id IN (SELECT id FROM tender_rows WHERE tender_id=? AND source='import')").run(t.id).changes);
@@ -527,6 +529,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
   // text is the measurement list's (lib/takeoff/formula.js). Before approval every sheet carries the draft label.
   const TOOL_KEYS = { line: 'tl_line', polyline: 'tl_polyline', area: 'tl_area', rect: 'tl_rect', count: 'tl_count' };
   const fmtScale = v => v.toLocaleString('en-US', { maximumSignificantDigits: 6 });
+  const fmtQ = v => v.toLocaleString('en-US', { maximumFractionDigits: 3 });   // as the screen's mixed-units title (app.js fmtQ)
   function takeoffReport(res, url, t, me) {
     need(me, 'admin', 'qs', 'viewer');
     const lang = url.searchParams.get('lang') || 'en';
@@ -548,9 +551,13 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
       : m.tool === 'dxf_selection' ? tr('m_selection', { n: m.handles_count || 0 })
       : m.tool === 'dxf_blocks' ? tr('rp_tool_blocks') + ': ' + m.layer + ' / ' + m.block + (m.nested ? ' (' + tr('lk_nested') + ')' : '')
       : tr('rp_tool_layer') + ': ' + m.layer;
+    // a calibration's check, as the list shows it: verified ±x.xx % (or not verified), and "copied … verify" (R15)
+    const fmtPct = v => (v > 0 ? '+' : '') + v.toFixed(2) + ' %';
+    const checkText = (pct, copied) => [finNum(pct) ? tr('tl_verified', { pct: fmtPct(pct) }) : tr('tl_not_verified'), ...(copied ? [tr('tl_copied')] : [])];
     // what a quantity's scale came from (as the list's line under the formula): a calibration, or the DXF units
     const calText = m => m.metric === 'count' ? null
-      : m.calibration ? (!m.calibration.region ? tr('m_cal_page') : finNum(m.calibration.region_no) ? tr('m_cal_region_n', { n: m.calibration.region_no }) : tr('m_cal_region'))
+      : m.calibration ? [!m.calibration.region ? tr('m_cal_page') : finNum(m.calibration.region_no) ? tr('m_cal_region_n', { n: m.calibration.region_no }) : tr('m_cal_region'),
+        ...checkText(m.calibration.verify_pct, m.calibration.copied_from !== null && m.calibration.copied_from !== undefined)].join(' · ')
       : m.drawing_kind === 'dxf' ? tr('m_cal_units', { u: m.drawing_units || '—' }) : null;
     const mRows = [...list.measurements, ...list.unlinked].map(m => {
       const d = dById.get(m.drawing_id) || {};
@@ -560,7 +567,7 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     });
 
     const lineQ = db.prepare('SELECT * FROM takeoff_lines WHERE row_id=?');
-    const note = v => [v.measured_qty === null && v.measured_units.length > 1 ? tr('mixed_units') + ': ' + v.measured_units.map(u => u.qty + ' ' + u.unit).join('; ') : null,
+    const note = v => [v.measured_qty === null && v.measured_units.length > 1 ? tr('mixed_units') + ': ' + v.measured_units.map(u => fmtQ(u.qty) + ' ' + u.unit).join('; ') : null,
       v.measured_incomplete ? tr('measured_incomplete') : null, v.measured_duplicate ? tr('measured_duplicate') : null].filter(Boolean).join(' · ') || null;
     const rRows = db.prepare('SELECT * FROM tender_rows WHERE tender_id=? ORDER BY seq, id').all(t.id).map(r => {
       if (r.is_heading) return [r.no, r.description];
@@ -573,8 +580,8 @@ CREATE INDEX IF NOT EXISTS tender_hidden_tender ON tender_hidden(tender_id);
     const scaleText = d => {
       if (d.kind === 'dxf') return d.units;
       const parts = [];
-      if (finNum(d.page_scale)) parts.push(tr('tl_scale_page', { u: tr(d.kind === 'pdf' ? 'tv_unit_pt' : 'tv_unit_px'), s: fmtScale(d.page_scale) }));
-      if (d.regions) parts.push(tr('rp_regions', { n: d.regions }));
+      if (finNum(d.page_scale)) parts.push(tr('tl_scale_page', { u: tr(d.kind === 'pdf' ? 'tv_unit_pt' : 'tv_unit_px'), s: fmtScale(d.page_scale) }), ...checkText(d.page_verify_pct, d.page_copied_from !== null));
+      if (d.regions) parts.push(tr('rp_regions', { n: d.regions }), ...(d.regions_copied ? [tr('tl_copied')] : []));
       return parts.join(' · ') || null;
     };
     const dRows = drawings.map(d => {

@@ -1048,6 +1048,29 @@ server.listen(0, async () => {
         assert.deepStrictEqual([after(gM.id).block, after(gW.id).duplicate], ['MH2', 1]);
       }
 
+      // ---- final review M6: a review item (drawn by hand) whose qty changes (other units) is highlighted "qty changed" ----
+      {
+        const qt = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision Qty' }, admin), 'qty tender')).id;
+        const rowQ = (await ok(call('POST', `tenders/${qt}/rows`, { no: '1', description: 'Fake edging', unit: 'm' }, admin), 'row')).id;
+        const q1 = await upDxf(qt, 'plan', planR(false));
+        await ok(call('PUT', `drawings/${q1}/units`, { units: 'mm' }, admin), 'units');
+        const mQ = await ok(call('POST', `drawings/${q1}/measurements`, { row_id: rowQ, tool: 'manual', label: 'Fake drawn edge', geom: { tool: 'line', pts: [[0, 500], [0, 1500]] } }, admin), 'manual');
+        const mE = await ok(call('POST', `drawings/${q1}/measurements`, { row_id: rowQ, tool: 'dxf_selection', metric: 'open_length', handles: ['E1'], confirm_overlap: true }, admin), 'selection');
+        const qr = await fetch(`${base}drawings/${q1}/replace?name=plan`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: admin }, body: Buffer.from(planR(true)) });
+        const q2 = (await qr.json()).id; await parsed(q2);
+        await ok(call('PUT', `drawings/${q2}/units`, { units: 'm' }, admin), 'units v2 in metres');
+        const DQQ = `#drawings[data-tender="${qt}"]`, qRow = id => `${DQQ} #rv-table tr[data-measurement="${id}"]`;
+        await page.goto(`${origin}/#/tender/${qt}/drawings/${q1}`);
+        await page.waitForSelector(DQQ + ' #rv-table');
+        assert.strictEqual(await page.getAttribute(qRow(mQ.id), 'data-status'), 'review');
+        assert.deepStrictEqual([(await page.textContent(qRow(mQ.id) + ' td.rv-before')).trim(), (await page.textContent(qRow(mQ.id) + ' td.rv-after')).trim()], [f2(1), f2(1000)]);
+        assert.ok(await page.$(qRow(mQ.id) + '.rv-qty-changed'), 'the row is highlighted');
+        assert.strictEqual((await page.textContent(qRow(mQ.id) + ' .rv-qty-changed-tag')).trim(), 'qty changed');
+        assert.strictEqual(await page.$(qRow(mE.id) + ' .rv-qty-changed-tag'), null, 'a DXF quantity that changed is already "changed"');
+        assert.strictEqual(I18N.ar.rv_qty_changed, 'تغيّرت الكمية');
+        await ok(call('DELETE', `drawings/${q2}`, null, admin), 'cancel');
+      }
+
       // ---- read only (an approved tender holding a pending version: older data): the table, no action ----
       const ro = (await ok(call('POST', 'tenders', { ...info, title: 'Test UI Revision Read-only' }, admin), 'ro tender')).id;
       const rowR = (await ok(call('POST', `tenders/${ro}/rows`, { no: '1', description: 'Fake paving', unit: 'm2' }, admin), 'row')).id;
@@ -1824,6 +1847,7 @@ server.listen(0, async () => {
       const corner = exd.hook.drawn.filter(x => [5, 8, 9].includes(x.no)).map(x => x.badge);
       assert.ok(corner.every(b => Math.abs(b.y - corner[0].y) < 1e-9), 'the badges sharing a point form a row');
       assert.deepStrictEqual(exd.hook.notDrawn, [10], 'the measurement with nothing on the drawing is noted in the legend');
+      assert.strictEqual(I18N.en.xp_not_drawn, 'not shown on this drawing', 'the legend note (final review M2)');
       // every DXF measurement carries its list number on the image; the legend is the list
       assert.deepStrictEqual(exd.hook.drawn.map(x => x.no).sort((a, b) => a - b), xs2.map(x => x.no).filter(n => n !== 10), 'DXF: the numbers drawn = the list numbers');
       assert.deepStrictEqual(exd.hook.legend, xs2.map(({ id, ...x }) => x), 'DXF legend = list');

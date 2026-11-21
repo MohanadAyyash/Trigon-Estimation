@@ -760,10 +760,13 @@
         // keep_matched what the server answered, R14)
         const after = it.status !== 'blocked' ? it.new_qty : !ch ? null : ch.res === 'delete' ? 0 : ch.res === 'confirm' ? it.new_qty : p ? p.new_qty : null;
         const diff = fin(after) && fin(it.old_qty) ? after - it.old_qty : null;
+        // a review item (drawn by hand) keeps its shape, but its qty can still change (other units): said so, not only in the numbers
+        const qtyChanged = it.status === 'review' && it.new_qty !== it.old_qty;
         const counts = it.gate_counts ? Object.entries(it.gate_counts).map(([g, n]) => h('div', { class: 'small muted' }, t('rv_gate_count', { gate: rvGate(g), old: fmtQ(n.old), new: fmtQ(n.new) }))) : null;
         const status = h('td', { class: 'rv-status' }, h('span', { class: 'tag ' + (it.status === 'blocked' ? 'bad' : it.status === 'review' ? 'warn-tag' : it.status === 'changed' ? '' : 'good') }, rvStatus(it.status)),
           it.reason ? h('div', { class: 'small rv-reason' }, rvReason(it.reason)) : null,
-          Array.isArray(it.gates) && it.gates.length ? h('div', { class: 'small' }, it.gates.map(rvGate).join(' · ')) : null, counts);
+          Array.isArray(it.gates) && it.gates.length ? h('div', { class: 'small' }, it.gates.map(rvGate).join(' · ')) : null, counts,
+          qtyChanged ? h('div', null, h('span', { class: 'tag warn-tag rv-qty-changed-tag' }, t('rv_qty_changed'))) : null);
         let res = null;
         if (it.status === 'blocked' && editable) {
           const opts = [['', t('rv_o_choose')], ...it.options.map(o => [o, o === 'delete' ? t('rv_o_delete') : o === 'relink' ? t('rv_o_relink')
@@ -781,7 +784,7 @@
           res = [rs, to, checks];
         } else if (it.status === 'blocked') res = h('span', { class: 'muted small' }, it.options.map(o => ({ delete: t('rv_o_delete'), relink: t('rv_o_relink'), keep_matched: t('rv_o_keep_matched', { qty: q(it, it.keep_matched_qty), unit: it.qty_unit || '' }), confirm: t('rv_o_confirm') })[o] || o).join(' / '));
         else if (it.status === 'review') res = h('span', { class: 'muted small' }, t('rv_mark_after'));
-        return h('tr', { 'data-measurement': String(id), 'data-status': it.status, class: 'rv-' + it.status },
+        return h('tr', { 'data-measurement': String(id), 'data-status': it.status, class: 'rv-' + it.status + (qtyChanged ? ' rv-qty-changed' : '') },
           h('td', null, h('span', { dir: 'auto' }, it.label || (byM.get(id) || {}).label || '#' + id)), h('td', null, h('span', { dir: 'auto' }, it.row_id === null ? '—' : rowName(it.row_id))),
           h('td', null, src(it)), status, h('td', { class: 'num rv-before' }, q(it, it.old_qty)),
           h('td', { class: 'num rv-after' + (p ? ' rv-resolved' : '') }, ch && ch.res === 'delete' ? t('rv_deleted') : q(it, after)),
