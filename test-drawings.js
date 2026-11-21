@@ -56,6 +56,18 @@ server.listen(0, async () => {
     const r = await fetch(base + `tenders/${tid}/drawings?name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie: ck }, body, ...extra });
     return { s: r.status, j: await r.json().catch(() => null) };
   };
+  // An upload refused while the client is still sending: on Windows a peer that closes with data still arriving can reset
+  // the connection before the client reads the reply (fetch failed, ECONNRESET). There the refusal may show as a reset;
+  // what the server must do (stop reading, keep no file and no row) is checked the same way on every platform.
+  const WIN = process.platform === 'win32';
+  const refused = async (p, status, what) => {
+    try { const r = await p; assert.strictEqual(r.s, status, what); return r; }
+    catch (e) {
+      const code = e && e.cause && e.cause.code;
+      if (WIN && /^(ECONNRESET|EPIPE|ECONNABORTED|UND_ERR_SOCKET)$/.test(code || '')) return { s: 'reset', j: null };
+      throw e;
+    }
+  };
   const waitDone = async (id, ck) => {
     const t0 = Date.now();
     for (;;) {
@@ -83,9 +95,8 @@ server.listen(0, async () => {
       let sent = 0;
       // the client would send 300 MiB; the server must answer 413 and drop the connection long before that
       const stream = new ReadableStream({ pull(c) { if (sent >= 300 * 1024 * 1024) return c.close(); sent += chunk.length; c.enqueue(chunk); } });
-      const r = await upload(tid, 'huge', stream, qs, { duplex: 'half' });
-      assert.strictEqual(r.s, 413, 'over 100 MB → 413');
-      console.log('413 after the client sent ' + Math.round(sent / 1048576) + ' MiB of 300');
+      const r = await refused(upload(tid, 'huge', stream, qs, { duplex: 'half' }), 413, 'over 100 MB → 413');
+      console.log(r.s + ' after the client sent ' + Math.round(sent / 1048576) + ' MiB of 300');
       assert.ok(sent < 300 * 1024 * 1024, 'the client was stopped before sending everything (sent ' + sent + ')');
       assert.deepStrictEqual(dirFiles(), before, 'no file left in DATA_DIR/drawings');
       assert.strictEqual(nDrawings(), 0);
@@ -115,8 +126,7 @@ server.listen(0, async () => {
       for (const [what, tenderId, name, ck, status] of [['no session', tid, 'x', '', 401], ['viewer', tid, 'x', viewer, 403], ['missing tender', 99999, 'x', qs, 404],
         ['approved tender', t2, 'x', qs, 409], ['no name', tid, '', qs, 400]]) {
         const b = bigStream();
-        const r = await upload(tenderId, name, b.stream, ck, { duplex: 'half' });
-        assert.strictEqual(r.s, status, what);
+        await refused(upload(tenderId, name, b.stream, ck, { duplex: 'half' }), status, what);
         assert.ok(b.sent < 300 * 1024 * 1024, what + ': the client was stopped (sent ' + b.sent + ')');
       }
       assert.strictEqual(nDrawings(), 0);
@@ -1386,8 +1396,8 @@ server.listen(0, async () => {
       // an image over 50 MB → 413 while streaming (a PDF may be up to 100 MB)
       {
         const big = Buffer.concat([PNG, Buffer.alloc(50 * 1024 * 1024 + 1 - PNG.length)]);
-        const r = await upload(T, 'big', big, qs);
-        assert.strictEqual(r.s, 413); assert.match(r.j.error, /50 MB/);
+        const r = await refused(upload(T, 'big', big, qs), 413, 'image over 50 MB → 413');
+        if (r.s !== 'reset') assert.match(r.j.error, /50 MB/);
         assert.ok(!dirFiles().some(x => x.startsWith('tmp-')), 'no temp file');
       }
 
