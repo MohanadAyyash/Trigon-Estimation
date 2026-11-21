@@ -1,1 +1,3 @@
 *.bat text eol=crlf
+# vendored files are kept byte for byte (their sha256 is checked); never convert their line endings
+public/vendor/** -text
