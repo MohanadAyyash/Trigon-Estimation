@@ -1,4 +1,4 @@
-// Drawings: raw DXF upload into a sha256 file store, parse in a worker thread into a gzipped JSON cache,
+// Drawings: raw DXF upload into a sha256 file store, parse in a child process into a gzipped JSON cache,
 // units confirmation and the per-layer table. Spec 5.1-5.2; plan Task 4.
 // PDF and image drawings (batch 3): stored as <sha256>.pdf / .png / .jpg, never parsed on the server; the browser reads a
 // PDF's pages with pdf.js and registers them (POST /drawings/:id/pages).
@@ -6,7 +6,7 @@
 // <sha256>.summary.json.gz (what the GET routes read) and <sha256>.render.bin.gz (the viewer's display file, lib/dxf/render.js),
 // never in the database.
 const fs = require('fs'), fsp = require('fs/promises'), path = require('path'), crypto = require('crypto'), zlib = require('zlib');
-const { Worker } = require('worker_threads');
+const { fork } = require('child_process');
 const { UNIT_TO_M, normUom } = require('../lib/units');
 const { PARSER_VERSION } = require('../lib/dxf/summary.js');
 const { imageSize } = require('../lib/takeoff/imagesize.js');
@@ -30,7 +30,12 @@ const MAX_NAME = 200;                          // a drawing name (also a generat
 const BINARY = Buffer.from('AutoCAD Binary DXF', 'latin1');
 const BINARY_MSG = 'binary DXF is not supported — save as ASCII DXF';
 const PARSE_TIMEOUT_MS = 10 * 60e3;
-const HEAP_MB = Number(process.env.DRAWINGS_PARSE_HEAP_MB) || 4096;   // worker heap cap (override only for tests)
+const HEAP_MB = Number(process.env.DRAWINGS_PARSE_HEAP_MB) || 4096;   // job process heap cap, MB (override only for tests)
+// tests only: DRAWINGS_STAGE_HEAP_CHECK=0 turns off the jobs' own between-stage heap check, so a test sees the process cap alone
+const STAGE_HEAP_MB = process.env.DRAWINGS_STAGE_HEAP_CHECK === '0' ? 0 : HEAP_MB;
+// V8 aborts the process when its heap is exhausted and says so on stderr (the exit code differs between platforms)
+const OOM_STDERR = /heap out of memory|allocation failed|out of memory/i;
+const STDERR_KEEP = 16384;                     // bytes of a job's stderr kept (its tail), only to recognise the above
 const TOO_LARGE = 'drawing too large to parse — PURGE unused objects or split the drawing in AutoCAD, then save as DXF again';
 const SUMMARY_LRU = 8;
 const WORKER = path.join(__dirname, '..', 'lib', 'dxf', 'worker.js');
@@ -207,7 +212,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     calibrations: Number(db.prepare('DELETE FROM calibrations WHERE drawing_id IN (SELECT id FROM drawings WHERE tender_id=?)').run(tid).changes),
     drawings: Number(db.prepare('DELETE FROM drawings WHERE tender_id=?').run(tid).changes),
   });
-  const workers = { alive: 0, peak: 0, started: 0 };   // test hook: parse workers alive now / at most / ever started
+  const workers = { alive: 0, peak: 0, started: 0 };   // test hook: job processes (parse or selection) alive now / at most / ever started; heapLimitMb = the last one's V8 heap limit
   // test hook: hooks.beforeUnitTx(attempt), when a test sets it, runs (awaited) between a unit change's async recomputation
   // and its tx, so a test can change measurements inside that window. null (nothing runs) unless a test sets it.
   // hooks.beforeMeasureTx (same idea): runs between a layer/block measurement's summary read and its tx.
@@ -327,18 +332,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
   // every worker (parse or selection total) goes through this one queue
   const enqueueJob = run => new Promise(resolve => { queue.push({ run, resolve }); pump(); });
   const enqueue = sha => enqueueJob(() => runWorker(sha));
-  // settles only after the worker has exited, so the next one never overlaps it. `msg` names what failed in plain words.
+  // Each job runs in its own child process (lib/dxf/child.js) started with --max-old-space-size=HEAP_MB: a real heap cap
+  // on every Node version (Worker resourceLimits are ignored on some, seen on 22.23.4). A process that dies without a reply
+  // (V8 'heap out of memory', or any abnormal exit) is reported with msg.oom; the job's own between-stage heap check
+  // ({ oom: true }) is the second line of defence and ends cleanly before that.
+  // Settles only after the process has exited, so the next one never overlaps it. `msg` names what failed in plain words.
+  const children = new Set();   // live job processes, killed when the server process exits (Ctrl+C, SIGTERM, ...)
+  process.on('exit', () => { for (const c of children) { try { c.kill('SIGKILL'); } catch {} } });
   function spawnWorker(file, workerData, accept, msg) {
     return new Promise(resolve => {
-      let result = null;
+      let result = null, replied = false, stderr = '', done = false;
       const set = r => { if (!result) result = r; };
-      const w = new Worker(file, { workerData: { ...workerData, heapMb: HEAP_MB }, resourceLimits: { maxOldGenerationSizeMb: HEAP_MB } });
+      let c;
+      try {
+        c = fork(file, [], { execArgv: ['--max-old-space-size=' + HEAP_MB], serialization: 'advanced', stdio: ['ignore', 'ignore', 'pipe', 'ipc'], windowsHide: true });
+      } catch (e) { resolve({ ok: false, transient: true, error: msg.stopped + ': ' + (e && e.message || e) }); return; }
+      children.add(c);
       workers.alive++; workers.started++; workers.peak = Math.max(workers.peak, workers.alive);
-      const timer = setTimeout(() => { set({ ok: false, transient: true, error: msg.timeout }); w.terminate(); }, PARSE_TIMEOUT_MS);
-      // m.oom: the worker's own heap check (Node may ignore resourceLimits), reported like ERR_WORKER_OUT_OF_MEMORY
-      w.on('message', m => { set(m && typeof m === 'object' ? (m.oom === true ? { ok: false, transient: true, error: msg.oom } : accept(m)) : { ok: false, transient: true, error: msg.bad }); w.terminate(); });
-      w.on('error', e => set({ ok: false, transient: true, error: e && e.code === 'ERR_WORKER_OUT_OF_MEMORY' ? msg.oom : msg.stopped + ': ' + (e && e.message || e) }));
-      w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, transient: true, error: msg.stopped + ' (exit code ' + code + ')' }); });
+      const finish = r => {
+        if (done) return; done = true;
+        clearTimeout(timer); children.delete(c); workers.alive--; resolve(r);
+      };
+      const timer = setTimeout(() => { set({ ok: false, transient: true, error: msg.timeout }); c.kill('SIGKILL'); }, PARSE_TIMEOUT_MS);
+      c.stderr.setEncoding('utf8');
+      c.stderr.on('data', d => { stderr = (stderr + d).slice(-STDERR_KEEP); });
+      c.on('message', m => {
+        // { started }: sent once before the reply (child.js); its heap limit is a test hook for the cap
+        if (m && typeof m === 'object' && m.started && typeof m.started === 'object' && Object.keys(m).length === 1) { workers.heapLimitMb = m.started.heap_limit_mb; return; }
+        if (replied) return; replied = true;
+        set(m && typeof m === 'object' ? (m.oom === true ? { ok: false, transient: true, error: msg.oom } : accept(m)) : { ok: false, transient: true, error: msg.bad });
+      });
+      c.on('error', e => {
+        set({ ok: false, transient: true, error: msg.stopped + ': ' + (e && e.message || e) });
+        if (c.pid === undefined) finish(result);   // never started: no 'close' follows
+        else { try { c.kill('SIGKILL'); } catch {} }
+      });
+      // 'close': exited and stderr fully read
+      c.on('close', (code, signal) => {
+        if (!result) {
+          const oom = OOM_STDERR.test(stderr) || code !== 0;
+          set(oom ? { ok: false, transient: true, error: msg.oom } : { ok: false, transient: true, error: msg.stopped + ' (exit code ' + code + (signal ? ', ' + signal : '') + ')' });
+        }
+        finish(result);
+      });
+      c.send({ ...workerData, heapMb: STAGE_HEAP_MB }, e => { if (e) { set({ ok: false, transient: true, error: msg.stopped + ': ' + (e.message || e) }); try { c.kill('SIGKILL'); } catch {} } });
     });
   }
   // the worker says whether its failure is transient (the file could not be read) or about the file itself

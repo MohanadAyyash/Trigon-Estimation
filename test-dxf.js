@@ -855,9 +855,18 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
 // final review item 11: the parse worker says whether a failure is transient (the file could not be read) or about the
 // file itself, instead of the server matching its message
 (async () => {
-  const { Worker } = require('worker_threads'), fs = require('fs'), os = require('os'), path = require('path');
+  const { fork } = require('child_process'), fs = require('fs'), os = require('os'), path = require('path');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'est-dxf-worker-'));
-  const run = file => new Promise((ok, no) => { const w = new Worker(path.join(__dirname, 'lib', 'dxf', 'worker.js'), { workerData: { file } }); w.once('message', m => { w.terminate(); ok(m); }); w.once('error', no); });
+  // the jobs run as child processes (modules/drawings.js): input = the first IPC message, then { started } and one reply;
+  // resolves { started, msg, code, signal, stderr } once the process has closed
+  const job = (f, input, heapMb) => new Promise((ok, no) => {
+    const c = fork(path.join(__dirname, 'lib', 'dxf', f), [], { execArgv: heapMb ? ['--max-old-space-size=' + heapMb] : [], serialization: 'advanced', stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    let msg, started, stderr = ''; c.stderr.on('data', d => { stderr += d; });
+    c.on('message', m => { if (m.started) started = m.started; else msg = m; }); c.on('error', no);
+    c.on('close', (code, signal) => ok({ started, msg, code, signal, stderr }));
+    c.send(input);
+  });
+  const run = async file => (await job('worker.js', { file })).msg;
   try {
     assert.deepStrictEqual(await run(path.join(dir, 'missing.dxf')), { ok: false, transient: true, error: 'the stored drawing file is missing' });
     fs.mkdirSync(path.join(dir, 'a-folder.dxf'));
@@ -866,12 +875,22 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     fs.writeFileSync(path.join(dir, 'bad.dxf'), '0\nSECTION\n2\nENTITIES\n0\nLINE\n5\nA\n');
     const b = await run(path.join(dir, 'bad.dxf'));
     assert.strictEqual(b.ok, false); assert.strictEqual(b.transient, false, 'a file that cannot be parsed is not transient'); assert.match(b.error, /truncated/);
-    // the workers' own heap cap (Node may ignore Worker resourceLimits): over workerData.heapMb → { ok: false, oom: true }
-    const tiny = (f, wd) => new Promise((ok, no) => { const w = new Worker(path.join(__dirname, 'lib', 'dxf', f), { workerData: wd }); w.once('message', m => { w.terminate(); ok(m); }); w.once('error', no); });
+    // the jobs' own between-stage heap check (second line of defence): over input.heapMb → { ok: false, oom: true }
+    const tiny = async (f, wd) => (await job(f, wd)).msg;
     assert.deepStrictEqual(await tiny('worker.js', { file: (fs.writeFileSync(path.join(dir, 'ok.dxf'), dxf([...sec('ENTITIES', line('A1', '0', 0, 0, 5, 0))])), path.join(dir, 'ok.dxf')), heapMb: 0.001 }), { ok: false, oom: true }, 'parse worker stops over its heap cap');
     const cacheFile = path.join(dir, 'c.json.gz');
     fs.writeFileSync(cacheFile, require('zlib').gzipSync(JSON.stringify({ version: require('./lib/dxf/summary.js').PARSER_VERSION, flat: [] })));
     assert.deepStrictEqual(await tiny('select-worker.js', { file: cacheFile, handles: [], metric: 'count', heapMb: 0.001 }), { ok: false, oom: true }, 'selection worker stops over its heap cap');
+    // the process cap itself (--max-old-space-size, stage check off): V8 stops a parse that outgrows it, no reply
+    const big = ['0\nSECTION\n2\nENTITIES']; for (let i = 0; i < 100000; i++) big.push('0\nLINE\n5\nH' + i + '\n8\nL' + (i % 20) + '\n10\n' + i + '\n20\n0\n11\n' + (i + 3) + '\n21\n4');
+    big.push('0\nENDSEC\n0\nEOF\n'); fs.writeFileSync(path.join(dir, 'big.dxf'), big.join('\n'));
+    const dead = await job('worker.js', { file: path.join(dir, 'big.dxf'), heapMb: 0 }, 16);
+    assert.strictEqual(dead.started.heap_limit_mb, Number(require('child_process').spawnSync(process.execPath, ['--max-old-space-size=16', '-e', 'console.log(require("v8").getHeapStatistics().heap_size_limit / 1048576)'], { encoding: 'utf8' }).stdout.trim()), 'the cap applies');
+    assert.strictEqual(dead.msg, undefined, 'no reply'); assert.ok(dead.code !== 0, 'abnormal exit: ' + dead.code + ' ' + dead.signal);
+    assert.match(dead.stderr, /heap out of memory/i);
+    // the same parse under a normal cap: a reply, and the process ends by itself after it
+    const fine = await job('worker.js', { file: path.join(dir, 'big.dxf'), heapMb: 0 }, 512);
+    assert.strictEqual(fine.msg.ok, true); assert.ok(fine.msg.cache instanceof ArrayBuffer); assert.strictEqual(fine.code, 0);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   console.log('ok test-dxf');
 })().catch(e => { console.error(e); process.exit(1); });

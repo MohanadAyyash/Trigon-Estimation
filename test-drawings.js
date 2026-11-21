@@ -3258,6 +3258,8 @@ INSERT INTO measurements(drawing_id,tender_id,tool,metric,qty,qty_unit,calibrati
     }
     // a parse that runs out of memory fails with a clear message (small heap for the test)
     {
+      // put the drawing back to 'parsing' (the server is not running between the runs)
+      const db3Reset = dir => { const d = new (require('node:sqlite').DatabaseSync)(path.join(dir, 'estimation.db')); d.prepare("UPDATE drawings SET status='parsing', error=NULL WHERE id=1").run(); d.close(); };
       const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'est-drawings-oom-')); TMP_DIRS.push(dir3);
       const src = path.join(dir3, 'big.dxf'); fs.writeFileSync(src, BIG);
       const c = spawnSync(process.execPath, ['--no-warnings', '-e', `
@@ -3268,14 +3270,25 @@ INSERT INTO measurements(drawing_id,tender_id,tool,metric,qty,qty_unit,calibrati
         db.prepare("INSERT INTO drawings(tender_id,name,sha256,bytes,status,created) VALUES(1,'p',?,1,'parsing','x')").run('${'a'.repeat(64)}');
         process.exit(0);`], { env: { ...process.env, DATA_DIR: dir3 }, encoding: 'utf8' });
       assert.strictEqual(c.status, 0, c.stderr);
-      const e = spawnSync(process.execPath, ['--no-warnings', '-e', `
-        const { db } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
-        const t0 = Date.now();
-        const tick = () => { const r = db.prepare('SELECT status, error FROM drawings WHERE id=1').get();
-          if (r.status !== 'parsing' || Date.now() - t0 > ${2 * WAIT_MS}) { console.log(JSON.stringify(r)); process.exit(0); } setTimeout(tick, 50); };
-        tick();`], { env: { ...process.env, DATA_DIR: dir3, DRAWINGS_PARSE_HEAP_MB: '16' }, encoding: 'utf8' });
-      assert.strictEqual(e.status, 0, e.stderr);
-      assert.deepStrictEqual(JSON.parse(e.stdout.trim()), { status: 'failed', error: 'drawing too large to parse — PURGE unused objects or split the drawing in AutoCAD, then save as DXF again' });
+      // the V8 heap limit of a plain `node --max-old-space-size=16` (old space 16 MB + the young generation)
+      const cap16 = Number(spawnSync(process.execPath, ['--max-old-space-size=16', '-e', 'console.log(require("v8").getHeapStatistics().heap_size_limit / 1048576)'], { encoding: 'utf8' }).stdout.trim());
+      assert.ok(cap16 >= 16 && cap16 < 128, 'reference heap limit ' + cap16);
+      // stageCheck '0': the jobs' own between-stage heap check is off, so only the process cap stops the parse (V8 aborts
+      // the child process with 'heap out of memory') and the server still reports the same message
+      for (const stageCheck of ['1', '0']) {
+        if (stageCheck === '0') db3Reset(dir3);
+        const e = spawnSync(process.execPath, ['--no-warnings', '-e', `
+          const { db, ctx } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
+          const t0 = Date.now();
+          const tick = () => { const r = db.prepare('SELECT status, error FROM drawings WHERE id=1').get();
+            if (r.status !== 'parsing' || Date.now() - t0 > ${2 * WAIT_MS}) { console.log(JSON.stringify({ ...r, w: ctx.drawings._workers })); process.exit(0); } setTimeout(tick, 50); };
+          tick();`], { env: { ...process.env, DATA_DIR: dir3, DRAWINGS_PARSE_HEAP_MB: '16', DRAWINGS_STAGE_HEAP_CHECK: stageCheck }, encoding: 'utf8' });
+        assert.strictEqual(e.status, 0, e.stderr);
+        const { w, ...row } = JSON.parse(e.stdout.trim());
+        assert.deepStrictEqual(row, { status: 'failed', error: 'drawing too large to parse — PURGE unused objects or split the drawing in AutoCAD, then save as DXF again' }, 'stage check ' + stageCheck);
+        assert.deepStrictEqual({ started: w.started, alive: w.alive }, { started: 1, alive: 0 }, 'one job process, gone');
+        assert.strictEqual(w.heapLimitMb, cap16, 'the parse process runs with the configured heap cap (DRAWINGS_PARSE_HEAP_MB=16)');
+      }
     }
 
     console.log('drawings ok'); done(0);
