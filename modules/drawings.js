@@ -332,10 +332,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS calibrations_page ON calibrations(drawing_id) 
     return new Promise(resolve => {
       let result = null;
       const set = r => { if (!result) result = r; };
-      const w = new Worker(file, { workerData, resourceLimits: { maxOldGenerationSizeMb: HEAP_MB } });
+      const w = new Worker(file, { workerData: { ...workerData, heapMb: HEAP_MB }, resourceLimits: { maxOldGenerationSizeMb: HEAP_MB } });
       workers.alive++; workers.started++; workers.peak = Math.max(workers.peak, workers.alive);
       const timer = setTimeout(() => { set({ ok: false, transient: true, error: msg.timeout }); w.terminate(); }, PARSE_TIMEOUT_MS);
-      w.on('message', m => { set(m && typeof m === 'object' ? accept(m) : { ok: false, transient: true, error: msg.bad }); w.terminate(); });
+      // m.oom: the worker's own heap check (Node may ignore resourceLimits), reported like ERR_WORKER_OUT_OF_MEMORY
+      w.on('message', m => { set(m && typeof m === 'object' ? (m.oom === true ? { ok: false, transient: true, error: msg.oom } : accept(m)) : { ok: false, transient: true, error: msg.bad }); w.terminate(); });
       w.on('error', e => set({ ok: false, transient: true, error: e && e.code === 'ERR_WORKER_OUT_OF_MEMORY' ? msg.oom : msg.stopped + ': ' + (e && e.message || e) }));
       w.on('exit', code => { clearTimeout(timer); workers.alive--; resolve(result || { ok: false, transient: true, error: msg.stopped + ' (exit code ' + code + ')' }); });
     });

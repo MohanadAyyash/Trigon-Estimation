@@ -866,6 +866,12 @@ assert.deepStrictEqual(stk2.warnings, []); assert.strictEqual(byL(stk2, 'MH').bl
     fs.writeFileSync(path.join(dir, 'bad.dxf'), '0\nSECTION\n2\nENTITIES\n0\nLINE\n5\nA\n');
     const b = await run(path.join(dir, 'bad.dxf'));
     assert.strictEqual(b.ok, false); assert.strictEqual(b.transient, false, 'a file that cannot be parsed is not transient'); assert.match(b.error, /truncated/);
+    // the workers' own heap cap (Node may ignore Worker resourceLimits): over workerData.heapMb → { ok: false, oom: true }
+    const tiny = (f, wd) => new Promise((ok, no) => { const w = new Worker(path.join(__dirname, 'lib', 'dxf', f), { workerData: wd }); w.once('message', m => { w.terminate(); ok(m); }); w.once('error', no); });
+    assert.deepStrictEqual(await tiny('worker.js', { file: (fs.writeFileSync(path.join(dir, 'ok.dxf'), dxf([...sec('ENTITIES', line('A1', '0', 0, 0, 5, 0))])), path.join(dir, 'ok.dxf')), heapMb: 0.001 }), { ok: false, oom: true }, 'parse worker stops over its heap cap');
+    const cacheFile = path.join(dir, 'c.json.gz');
+    fs.writeFileSync(cacheFile, require('zlib').gzipSync(JSON.stringify({ version: require('./lib/dxf/summary.js').PARSER_VERSION, flat: [] })));
+    assert.deepStrictEqual(await tiny('select-worker.js', { file: cacheFile, handles: [], metric: 'count', heapMb: 0.001 }), { ok: false, oom: true }, 'selection worker stops over its heap cap');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   console.log('ok test-dxf');
 })().catch(e => { console.error(e); process.exit(1); });
