@@ -91,7 +91,13 @@ npm test
 - **Expected:** the last line says `all 17 test file(s) passed` (the number can be higher in newer versions).
 - It takes a few minutes.
 - The browser tests are skipped automatically, with the message `playwright not installed, browser smoke skipped`. That is fine: **do not install Playwright** or any npm package.
-- If anything fails, **stop** and report the failing file name and the error lines.
+- **Timing checks:** some tests time the server while it parses or totals large drawings (message like `took 574 ms … (cap 500 ms)`). On a slower or busy PC these can miss their cap by a little. If the **only** failures are such timing caps, run the suite again with wider caps; that is expected and fine:
+
+  ```powershell
+  $env:TEST_LATENCY_MS = "1500"; $env:TEST_WAIT_MS = "30000"; npm test
+  ```
+
+- If anything else fails, or a timing check is far over its cap (more than 3×), **stop** and report the failing file name and the error lines.
 
 **Port conflict:**
 - If port 3100 was taken in step 2, **ASK** the owner.
