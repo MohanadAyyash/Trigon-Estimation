@@ -4,7 +4,13 @@ const fs = require('fs'), os = require('os'), path = require('path'), assert = r
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'est-ui-'));
 process.env.ERP_SYNC_DISABLED = '1';
 // every exit removes the temp DATA_DIR
-const done = code => { fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true }); process.exit(code); };
+// close the database and the server first: Windows cannot delete files that are still open (EPERM)
+const done = code => {
+  try { server.close(); } catch (e) { /* not listening */ }
+  try { db.close(); } catch (e) { /* closed already */ }
+  try { fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch (e) { console.error('could not remove the test folder: ' + e.code); }
+  process.exit(code);
+};
 
 // ---- i18n key coverage (no server needed) -------------------------------------------------------------------
 const app = fs.readFileSync(path.join(__dirname, 'public', 'app.js'), 'utf8');

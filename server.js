@@ -35,7 +35,25 @@ const readBody = (req, max = 20e6) => req._body !== undefined ? Promise.resolve(
 });
 // a reply sent before the request body has fully arrived (a refusal): close the connection once it is sent, so a
 // large upload stops instead of being read and thrown away
-const closeEarly = (req, res) => { if (req.complete) return {}; res.once('finish', () => setImmediate(() => req.destroy())); return { Connection: 'close' }; };
+// Lingering close: once the reply is sent, close our side and read (and drop) what the client still sends for a short
+// while before cutting the connection. Destroying a socket with unread data makes Windows send a reset, and the client
+// can then lose the reply it was about to read (fetch failed / ECONNRESET instead of the 413).
+const LINGER_MS = 2000, LINGER_BYTES = 16 * 1024 * 1024;
+const closeEarly = (req, res) => {
+  if (req.complete) return {};
+  res.once('finish', () => setImmediate(() => {
+    const sock = req.socket;
+    if (!sock || sock.destroyed) return;
+    let drained = 0;
+    const cut = () => { clearTimeout(timer); if (!sock.destroyed) sock.destroy(); };
+    const timer = setTimeout(cut, LINGER_MS);
+    req.on('data', c => { drained += c.length; if (drained > LINGER_BYTES) cut(); });
+    req.on('end', cut); sock.once('close', () => clearTimeout(timer));
+    try { sock.end(); } catch (e) { cut(); }
+    req.resume();
+  }));
+  return { Connection: 'close' };
+};
 const tx = fn => { db.exec('BEGIN'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 const audit = (user, action, entity, id, detail) => db.prepare('INSERT INTO audit_log(at,user,action,entity,entity_id,detail) VALUES(?,?,?,?,?,?)')
   .run(new Date().toISOString(), user && user.username || (typeof user === 'string' ? user : null), action, entity || null, id == null ? null : String(id), detail == null ? null : (typeof detail === 'string' ? detail : JSON.stringify(detail)));

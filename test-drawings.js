@@ -6,7 +6,13 @@ const { server, db, ctx } = require('./server.js');
 const { layerTable } = require('./lib/dxf/summary.js');
 const http = require('http'), zlib = require('zlib');
 const TMP_DIRS = [process.env.DATA_DIR];
-const done = code => { for (const d of TMP_DIRS) fs.rmSync(d, { recursive: true, force: true }); process.exit(code); };
+// close the database and the server before removing the folders: Windows cannot delete files that are still open (EPERM)
+const done = code => {
+  try { server.close(); } catch (e) { /* not listening */ }
+  try { db.close(); } catch (e) { /* closed already */ }
+  for (const d of TMP_DIRS) { try { fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch (e) { console.error('could not remove ' + d + ': ' + e.code); } }
+  process.exit(code);
+};
 const DDIR = path.join(process.env.DATA_DIR, 'drawings');
 
 // DXF fixtures are built as strings (same builders as test-dxf.js)
